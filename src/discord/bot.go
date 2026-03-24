@@ -961,7 +961,7 @@ func sendNotLinked(s *discordgo.Session, channelID, username, lang string) {
 // ── Helpers de tienda ──
 func fetchShopItems(lang string) []shopItem {
 	shopLang := "es-419"; if lang == "en" { shopLang = "en" }
-	resp, err := http.Get(fmt.Sprintf("http://localhost:8081/store/shop?lang=%s", shopLang))
+	resp, err := http.Get(fmt.Sprintf("https://backend-discord-bot-kidstore-production.up.railway.app/store/shop?lang=%s", shopLang))
 	if err != nil { return nil }
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
