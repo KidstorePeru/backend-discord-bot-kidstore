@@ -83,6 +83,8 @@ func HandlerGetShop(c *gin.Context) {
 
 // ==================== CREAR PEDIDO ====================
 
+const maxPendingOrdersPerCustomer = 10
+
 func HandlerCreateOrder(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		customerIDStr, ok := middleware.GetCustomerID(c)
@@ -102,6 +104,7 @@ func HandlerCreateOrder(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
+		// ── Verificar horario ──
 		inSchedule, scheduleReason := db.IsWithinSchedule(database)
 		if !inSchedule {
 			schedule, _ := db.GetBotSchedule(database)
@@ -120,8 +123,24 @@ func HandlerCreateOrder(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
+		// ── Verificar saldo ──
 		if customer.KCBalance < req.PriceKC {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": fmt.Sprintf("KC insuficientes: tienes %d KC, necesitas %d KC", customer.KCBalance, req.PriceKC)})
+			return
+		}
+
+		// ── Límite de pedidos pendientes por cliente (máx. 10) ──
+		pendingCount, err := db.CountPendingOrdersByCustomer(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error verificando pedidos"})
+			return
+		}
+		if pendingCount >= maxPendingOrdersPerCustomer {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"success": false,
+				"error":   fmt.Sprintf("Tienes %d pedidos pendientes. Espera a que se procesen antes de crear nuevos (máximo %d).", pendingCount, maxPendingOrdersPerCustomer),
+				"code":    "TOO_MANY_ORDERS",
+			})
 			return
 		}
 
@@ -168,15 +187,12 @@ func HandlerGetMyOrders(database *sql.DB) gin.HandlerFunc {
 
 // ==================== WORKER ====================
 
-// notifyDiscord es inyectada desde main.go para evitar importación circular
 var notifyDiscord func(discordID, status, itemName string, priceKC int, lang string)
 
-// SetDiscordNotifier inyecta la función de notificación desde main.go
 func SetDiscordNotifier(fn func(discordID, status, itemName string, priceKC int, lang string)) {
 	notifyDiscord = fn
 }
 
-// StartOrderWorker procesa pedidos pendientes cada 30 segundos
 func StartOrderWorker(ctx context.Context, database *sql.DB) {
 	fmt.Println("[Worker] Iniciando cola de envíos...")
 	go func() {
@@ -312,7 +328,6 @@ func processOrders(database *sql.DB) {
 	}
 }
 
-// sendDiscordNotification envía un DM al cliente si tiene Discord vinculado
 func sendDiscordNotification(database *sql.DB, order types.Order, status string) {
 	if notifyDiscord == nil { return }
 	customer, err := db.GetCustomerByID(database, order.CustomerID)
@@ -340,5 +355,4 @@ func ParseShopEntry(data []byte, offerID string) (int, error) {
 	return 0, fmt.Errorf("offer %s not found in shop", offerID)
 }
 
-// ── Import requerido por discordgo (usado indirectamente) ──
 var _ = (*discordgo.Session)(nil)

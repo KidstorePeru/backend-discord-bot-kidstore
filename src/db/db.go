@@ -678,3 +678,14 @@ func UnlinkDiscord(db *sql.DB, customerID uuid.UUID) error {
 	_, err := db.Exec(`UPDATE customers SET discord_id=NULL, discord_username=NULL, discord_lang='es', updated_at=NOW() WHERE id=$1`, customerID)
 	return err
 }
+
+// CountPendingOrdersByCustomer cuenta los pedidos pending/processing de un cliente
+func CountPendingOrdersByCustomer(db *sql.DB, customerID uuid.UUID) (int, error) {
+    var count int
+    err := db.QueryRow(`
+        SELECT COUNT(*) FROM orders 
+        WHERE customer_id = $1 
+        AND status IN ('pending', 'processing')
+    `, customerID).Scan(&count)
+    return count, err
+}
