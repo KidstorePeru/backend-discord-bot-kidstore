@@ -21,7 +21,7 @@ import (
 const (
 	kcCoin   = "<a:kc_coin:1485952905302507670>"
 	kcKid    = "<a:kc_kid:1486005001783607399>"
-	storeURL = "https://frontend-discord-bot-kidstore-production.up.railway.app"
+	storeURL = "https://www.kidstoreperu.net"
 
 	ratesAPIKey   = "b3b1e1bf6a9c0a14fd80e3fd"
 	ratesAPIURL   = "https://v6.exchangerate-api.com/v6/" + ratesAPIKey + "/latest/PEN"
