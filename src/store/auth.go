@@ -18,8 +18,10 @@ import (
 )
 
 // ==================== REGISTER ====================
+// La cuenta NO se crea hasta que el cliente verifica su correo.
+// Se guarda un registro pendiente con los datos encriptados.
 
-func HandlerRegister(database *sql.DB, secretKey string) gin.HandlerFunc {
+func HandlerRegister(database *sql.DB, secretKey string, cfg types.EnvConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req types.RegisterRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -30,44 +32,200 @@ func HandlerRegister(database *sql.DB, secretKey string) gin.HandlerFunc {
 		req.EpicUsername = strings.TrimSpace(req.EpicUsername)
 		req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
+		// Verificar si ya existe una cuenta activa con ese email o usuario
+		if db.EmailExists(database, req.Email) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "error": "email o usuario Epic ya registrado"})
+			return
+		}
+		if db.EpicUsernameExists(database, req.EpicUsername) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "error": "email o usuario Epic ya registrado"})
+			return
+		}
+
 		hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error interno"})
 			return
 		}
 
-		customer := types.Customer{
-			ID:           uuid.New(),
-			EpicUsername: req.EpicUsername,
-			Email:        &req.Email,
-			PasswordHash: string(hash),
-		}
+		// Generar token de verificación
+		tokenBytes := make([]byte, 32)
+		rand.Read(tokenBytes)
+		verificationToken := hex.EncodeToString(tokenBytes)
 
-		if err := db.CreateCustomer(database, customer); err != nil {
+		// Guardar registro pendiente (no crea la cuenta real)
+		lang := c.GetHeader("X-Lang")
+		if lang == "" { lang = "es" }
+		if err := db.CreatePendingRegistration(database, req.EpicUsername, req.Email, string(hash), verificationToken, lang); err != nil {
 			if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
-				c.JSON(http.StatusConflict, gin.H{"success": false, "error": "email o usuario Epic ya registrado"})
+				// Ya hay un registro pendiente — reenviar el email
+				db.UpdatePendingRegistrationToken(database, req.Email, verificationToken)
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error al iniciar registro"})
 				return
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error al crear cuenta"})
+		}
+
+		go sendVerificationEmail(cfg, req.Email, verificationToken, req.EpicUsername, lang)
+
+		c.JSON(http.StatusOK, gin.H{
+			"success":               true,
+			"requires_verification": true,
+			"message":               "Te enviamos un enlace de verificación. Activa tu cuenta para continuar.",
+		})
+	}
+}
+
+// ==================== VERIFY EMAIL ====================
+// Cuando el cliente verifica, SE CREA la cuenta real.
+
+func HandlerVerifyEmail(database *sql.DB, secretKey string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.Query("token")
+		if token == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "token requerido"})
 			return
 		}
 
-		token, err := middleware.GenerateCustomerToken(customer, secretKey)
+		// Buscar registro pendiente con ese token
+		pending, err := db.GetPendingRegistration(database, token)
+		if err != nil {
+			// Puede ser que ya se verificó antes — buscar cuenta ya creada
+			verToken, err2 := db.GetEmailVerificationToken(database, token)
+			if err2 != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "token inválido o expirado"})
+				return
+			}
+			// Token de cuenta existente (reenvío) — solo marcar como verificado
+			db.VerifyCustomerEmail(database, verToken.CustomerID)
+			db.MarkVerificationTokenUsed(database, token)
+			customer, err3 := db.GetCustomerByID(database, verToken.CustomerID)
+			if err3 != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
+				return
+			}
+			jwtToken, _ := middleware.GenerateCustomerToken(customer, secretKey)
+			db.AddAuditLog(database, &verToken.CustomerID, "EMAIL_VERIFIED", "email verificado", c.ClientIP())
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"message": "¡Cuenta verificada correctamente!",
+				"token":   jwtToken,
+				"customer": types.CustomerPublic{
+					ID: customer.ID, EpicUsername: customer.EpicUsername,
+					Email: customer.Email, KCBalance: customer.KCBalance,
+					IsVerified: true, CreatedAt: customer.CreatedAt,
+				},
+			})
+			return
+		}
+
+		// Crear la cuenta real ahora que el email fue verificado
+		customerID := uuid.New()
+		customer := types.Customer{
+			ID:           customerID,
+			EpicUsername: pending.EpicUsername,
+			Email:        &pending.Email,
+			PasswordHash: pending.PasswordHash,
+			IsVerified:   true,
+		}
+
+		if err := db.CreateVerifiedCustomer(database, customer); err != nil {
+			if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+				// La cuenta ya fue creada (doble clic en enlace) — buscar y devolver token
+				existing, err2 := db.GetCustomerByEmail(database, pending.Email)
+				if err2 != nil {
+					c.JSON(http.StatusConflict, gin.H{"success": false, "error": "esta cuenta ya fue verificada. Inicia sesión."})
+					return
+				}
+				jwtToken, _ := middleware.GenerateCustomerToken(existing, secretKey)
+				db.DeletePendingRegistration(database, token)
+				c.JSON(http.StatusOK, gin.H{
+					"success": true,
+					"message": "¡Cuenta ya verificada! Iniciando sesión...",
+					"token":   jwtToken,
+					"customer": types.CustomerPublic{
+						ID: existing.ID, EpicUsername: existing.EpicUsername,
+						Email: existing.Email, KCBalance: existing.KCBalance,
+						IsVerified: true, CreatedAt: existing.CreatedAt,
+					},
+				})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error creando cuenta"})
+			return
+		}
+
+		// Limpiar registro pendiente
+		db.DeletePendingRegistration(database, token)
+		db.AddAuditLog(database, &customerID, "REGISTER", "cuenta creada via verificación: "+pending.EpicUsername, c.ClientIP())
+		db.AddAuditLog(database, &customerID, "EMAIL_VERIFIED", "email verificado en registro", c.ClientIP())
+
+		jwtToken, err := middleware.GenerateCustomerToken(customer, secretKey)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error generando token"})
 			return
 		}
 
-		db.AddAuditLog(database, &customer.ID, "REGISTER", "nuevo cliente: "+req.EpicUsername, c.ClientIP())
-
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
-			"token":   token,
+			"message": "¡Cuenta creada y verificada! Bienvenido a KidStorePeru 🎮",
+			"token":   jwtToken,
 			"customer": types.CustomerPublic{
-				ID: customer.ID, EpicUsername: customer.EpicUsername,
-				Email: customer.Email, KCBalance: 0, CreatedAt: customer.CreatedAt,
+				ID: customerID, EpicUsername: pending.EpicUsername,
+				Email: &pending.Email, KCBalance: 0,
+				IsVerified: true, CreatedAt: customer.CreatedAt,
 			},
 		})
+	}
+}
+
+// ==================== RESEND VERIFICATION ====================
+
+func HandlerResendVerification(database *sql.DB, cfg types.EnvConfig) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var body struct {
+			Email string `json:"email" binding:"required,email"`
+			Lang  string `json:"lang"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+		body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+		if body.Lang == "" { body.Lang = "es" }
+
+		// Buscar registro pendiente primero
+		pending, err := db.GetPendingRegistrationByEmail(database, body.Email)
+		if err == nil {
+			// Generar nuevo token
+			tokenBytes := make([]byte, 32)
+			rand.Read(tokenBytes)
+			newToken := hex.EncodeToString(tokenBytes)
+			db.UpdatePendingRegistrationToken(database, body.Email, newToken)
+			go sendVerificationEmail(cfg, body.Email, newToken, pending.EpicUsername, body.Lang)
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Se envió un nuevo enlace de verificación."})
+			return
+		}
+
+		// Buscar cuenta ya existente no verificada
+		customer, err := db.GetCustomerByEmail(database, body.Email)
+		if err != nil {
+			// Siempre OK para no revelar si el email existe
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un nuevo enlace."})
+			return
+		}
+		if customer.IsVerified {
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Este correo ya está verificado. Puedes iniciar sesión."})
+			return
+		}
+
+		tokenBytes := make([]byte, 32)
+		rand.Read(tokenBytes)
+		verificationToken := hex.EncodeToString(tokenBytes)
+		db.CreateEmailVerificationToken(database, customer.ID, verificationToken)
+		go sendVerificationEmail(cfg, body.Email, verificationToken, customer.EpicUsername, body.Lang)
+
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Se envió un nuevo enlace de verificación."})
 	}
 }
 
@@ -84,6 +242,16 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 
 		customer, err := db.GetCustomerByEmail(database, req.Email)
 		if err != nil {
+			// Verificar si hay un registro pendiente con ese email
+			if db.PendingRegistrationExists(database, req.Email) {
+				c.JSON(http.StatusForbidden, gin.H{
+					"success":               false,
+					"error":                 "Debes verificar tu correo electrónico antes de iniciar sesión. Revisa tu bandeja de entrada.",
+					"code":                  "EMAIL_NOT_VERIFIED",
+					"requires_verification": true,
+				})
+				return
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "credenciales inválidas"})
 			return
 		}
@@ -91,6 +259,16 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 		if err := bcrypt.CompareHashAndPassword([]byte(customer.PasswordHash), []byte(req.Password)); err != nil {
 			db.AddAuditLog(database, &customer.ID, "LOGIN_FAILED", "intento fallido", c.ClientIP())
 			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "credenciales inválidas"})
+			return
+		}
+
+		if !customer.IsVerified {
+			c.JSON(http.StatusForbidden, gin.H{
+				"success":               false,
+				"error":                 "Debes verificar tu correo electrónico antes de iniciar sesión.",
+				"code":                  "EMAIL_NOT_VERIFIED",
+				"requires_verification": true,
+			})
 			return
 		}
 
@@ -109,7 +287,7 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 				ID: customer.ID, EpicUsername: customer.EpicUsername,
 				Email: customer.Email, KCBalance: customer.KCBalance,
 				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
-				CreatedAt: customer.CreatedAt,
+				IsVerified: customer.IsVerified, CreatedAt: customer.CreatedAt,
 			},
 		})
 	}
@@ -140,7 +318,7 @@ func HandlerMe(database *sql.DB) gin.HandlerFunc {
 				ID: customer.ID, EpicUsername: customer.EpicUsername,
 				Email: customer.Email, KCBalance: customer.KCBalance,
 				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
-				CreatedAt: customer.CreatedAt,
+				IsVerified: customer.IsVerified, CreatedAt: customer.CreatedAt,
 			},
 		})
 	}
@@ -148,7 +326,6 @@ func HandlerMe(database *sql.DB) gin.HandlerFunc {
 
 // ==================== UPDATE PROFILE ====================
 
-// HandlerUpdateProfile permite al cliente actualizar su epic_username, email y/o contraseña.
 func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		customerIDStr, ok := middleware.GetCustomerID(c)
@@ -170,7 +347,6 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 			return
 		}
 
-		// Si quiere cambiar email o contraseña, validar la contraseña actual
 		if req.Email != "" || req.NewPassword != "" {
 			if req.CurrentPassword == "" {
 				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "se requiere la contraseña actual para cambiar email o contraseña"})
@@ -204,10 +380,8 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 			return
 		}
 
-		// Generar nuevo token con datos actualizados
 		updatedCustomer, _ := db.GetCustomerByID(database, customerID)
 		token, _ := middleware.GenerateCustomerToken(updatedCustomer, secretKey)
-
 		db.AddAuditLog(database, &customerID, "PROFILE_UPDATED", "perfil actualizado", c.ClientIP())
 
 		c.JSON(http.StatusOK, gin.H{
@@ -218,7 +392,7 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 				ID: updatedCustomer.ID, EpicUsername: updatedCustomer.EpicUsername,
 				Email: updatedCustomer.Email, KCBalance: updatedCustomer.KCBalance,
 				DiscordID: updatedCustomer.DiscordID, DiscordUsername: updatedCustomer.DiscordUsername,
-				CreatedAt: updatedCustomer.CreatedAt,
+				IsVerified: updatedCustomer.IsVerified, CreatedAt: updatedCustomer.CreatedAt,
 			},
 		})
 	}
@@ -235,25 +409,28 @@ func HandlerForgotPassword(database *sql.DB, cfg types.EnvConfig) gin.HandlerFun
 		}
 		req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
-		// Siempre responder OK para no revelar si el email existe
+		lang := c.GetHeader("X-Lang")
+		if lang == "" { lang = "es" }
+
 		customer, err := db.GetCustomerByEmail(database, req.Email)
 		if err != nil {
-			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un enlace"})
-			return
-		}
+    		fmt.Printf("[Debug] GetCustomerByEmail error para %s: %v\n", req.Email, err)
+    		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un enlace"})
+    		return
+}
 
-		// Generar token aleatorio
 		tokenBytes := make([]byte, 32)
 		rand.Read(tokenBytes)
 		token := hex.EncodeToString(tokenBytes)
 
-		if err := db.CreatePasswordResetToken(database, customer.ID, token); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error interno"})
-			return
-		}
-
-		// Enviar email (fire and forget)
-		go sendResetEmail(cfg, req.Email, token, customer.EpicUsername)
+		fmt.Printf("[Debug] Creando token para customerID: %s, token: %s\n", customer.ID, token)
+if err := db.CreatePasswordResetToken(database, customer.ID, token); err != nil {
+    fmt.Printf("[Debug] Error creando token: %v\n", err)
+    c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error interno"})
+    return
+}
+fmt.Printf("[Debug] Token creado exitosamente\n")
+go sendResetEmail(cfg, req.Email, token, customer.EpicUsername, lang)
 
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un enlace de recuperación"})
 	}
@@ -323,25 +500,6 @@ func HandlerLinkDiscord(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
-// ==================== HELPERS ====================
-
-func sendResetEmail(cfg types.EnvConfig, toEmail, token, username string) {
-	if cfg.SMTPHost == "" {
-		fmt.Printf("[Email] Reset token para %s: %s\n", toEmail, token)
-		return
-	}
-	resetURL := fmt.Sprintf("%s/reset-password?token=%s", cfg.FrontendURL, token)
-	body := fmt.Sprintf(
-		"Hola %s,\r\n\r\nRecibimos una solicitud para restablecer tu contraseña en KidStorePeru.\r\n\r\nHaz clic aquí para resetear tu contraseña (válido por 1 hora):\r\n%s\r\n\r\nSi no solicitaste esto, ignora este email.\r\n\r\n— KidStorePeru",
-		username, resetURL,
-	)
-	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: Recuperar contraseña - KidStorePeru\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%s",
-		cfg.SMTPFrom, toEmail, body)
-
-	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
-	smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg))
-}
-
 // ==================== UNLINK DISCORD ====================
 
 func HandlerUnlinkDiscord(database *sql.DB) gin.HandlerFunc {
@@ -361,4 +519,177 @@ func HandlerUnlinkDiscord(database *sql.DB) gin.HandlerFunc {
 		db.AddAuditLog(database, &customerID, "DISCORD_UNLINKED", "discord desvinculado por el usuario", c.ClientIP())
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Discord desvinculado correctamente"})
 	}
+}
+
+// ==================== HELPERS ====================
+
+func sendVerificationEmail(cfg types.EnvConfig, toEmail, token, username, lang string) {
+	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", cfg.FrontendURL, token)
+
+	if cfg.SMTPHost == "" {
+		fmt.Printf("[Email] Verification URL para %s: %s\n", toEmail, verifyURL)
+		return
+	}
+
+	es := lang != "en"
+
+	subject := "Verifica tu cuenta — KidStorePeru"
+	if !es { subject = "Verify your account — KidStorePeru" }
+
+	var htmlBody string
+	if es {
+		htmlBody = buildVerificationEmailES(username, verifyURL)
+	} else {
+		htmlBody = buildVerificationEmailEN(username, verifyURL)
+	}
+
+	msg := fmt.Sprintf("From: KidStorePeru <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n%s",
+		cfg.SMTPFrom, toEmail, subject, htmlBody)
+
+	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
+	if err := smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg)); err != nil {
+		fmt.Printf("[Email] Error enviando verificación a %s: %v\n", toEmail, err)
+	} else {
+		fmt.Printf("[Email] Verificación enviada a %s\n", toEmail)
+	}
+}
+
+func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) {
+	if cfg.SMTPHost == "" {
+		fmt.Printf("[Email] Reset token para %s: %s\n", toEmail, token)
+		return
+	}
+
+	es := lang != "en"
+	resetURL := fmt.Sprintf("%s/reset-password?token=%s", cfg.FrontendURL, token)
+
+	subject := "Recuperar contraseña — KidStorePeru"
+	if !es { subject = "Reset your password — KidStorePeru" }
+
+	var htmlBody string
+	if es {
+		htmlBody = buildResetEmailES(username, resetURL)
+	} else {
+		htmlBody = buildResetEmailEN(username, resetURL)
+	}
+
+	msg := fmt.Sprintf("From: KidStorePeru <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n%s",
+		cfg.SMTPFrom, toEmail, subject, htmlBody)
+
+	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
+	smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg))
+}
+
+// ── Templates HTML de emails ──
+
+func emailBase(title, preheader, content string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>%s</title>
+</head>
+<body style="margin:0;padding:0;background:#0a0a0f;font-family:'Segoe UI',Arial,sans-serif;">
+<span style="display:none;max-height:0;overflow:hidden;">%s</span>
+<table width="100%%" cellpadding="0" cellspacing="0" style="background:#0a0a0f;padding:40px 20px;">
+  <tr><td align="center">
+    <table width="100%%" cellpadding="0" cellspacing="0" style="max-width:560px;">
+      <!-- Header -->
+      <tr><td align="center" style="background:linear-gradient(135deg,#1a0a2e 0%%,#0d1117 100%%);border-radius:20px 20px 0 0;padding:40px 40px 32px;">
+        <img src="https://kidstoreperu.com/logotipo.png" alt="KidStorePeru" width="160" style="display:block;margin:0 auto 20px;max-width:160px;"/>
+        <div style="width:48px;height:3px;background:linear-gradient(90deg,#7c3aed,#a855f7);border-radius:2px;margin:0 auto;"></div>
+      </td></tr>
+      <!-- Body -->
+      <tr><td style="background:#0f0f1a;padding:40px;border-left:1px solid #1e1e3a;border-right:1px solid #1e1e3a;">
+        %s
+      </td></tr>
+      <!-- Footer -->
+      <tr><td align="center" style="background:#080810;border-radius:0 0 20px 20px;padding:24px 40px;border:1px solid #1e1e3a;border-top:none;">
+        <p style="margin:0 0 8px;font-size:12px;color:#4a4a6a;">KidStorePeru — La tienda de Fortnite más confiable 🎮</p>
+        <p style="margin:0;font-size:11px;color:#3a3a5a;">
+          <a href="https://kidstoreperu.com" style="color:#7c3aed;text-decoration:none;">kidstoreperu.com</a>
+          &nbsp;·&nbsp;
+          <a href="https://kidstoreperu.com/privacy" style="color:#4a4a6a;text-decoration:none;">Privacidad</a>
+        </p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`, title, preheader, content)
+}
+
+func buildVerificationEmailES(username, verifyURL string) string {
+	content := fmt.Sprintf(`
+<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">¡Hola, %s! 👋</h1>
+<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Gracias por registrarte en <strong style="color:#a855f7;">KidStorePeru</strong>. Para activar tu cuenta y empezar a comprar items de Fortnite, verifica tu correo electrónico.</p>
+<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:24px;margin:0 0 24px;text-align:center;">
+  <p style="margin:0 0 6px;font-size:13px;color:#6b6b8a;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Tu cuenta está lista</p>
+  <p style="margin:0 0 20px;font-size:14px;color:#8b8ba7;">Un solo clic para activarla</p>
+  <a href="%s" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;padding:14px 36px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px;">✓ Verificar mi cuenta</a>
+</div>
+<p style="margin:0 0 12px;font-size:13px;color:#6b6b8a;">¿El botón no funciona? Copia y pega este enlace:</p>
+<div style="background:#080810;border:1px solid #1e1e3a;border-radius:10px;padding:12px 16px;margin:0 0 24px;word-break:break-all;">
+  <a href="%s" style="font-size:12px;color:#7c3aed;text-decoration:none;">%s</a>
+</div>
+<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
+  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ Este enlace expira en <strong style="color:#6b6b8a;">24 horas</strong>. Si no creaste esta cuenta, puedes ignorar este correo.</p>
+</div>`, username, verifyURL, verifyURL, verifyURL)
+	return emailBase("Verifica tu cuenta — KidStorePeru", "Activa tu cuenta en KidStorePeru con un clic", content)
+}
+
+func buildVerificationEmailEN(username, verifyURL string) string {
+	content := fmt.Sprintf(`
+<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Hey, %s! 👋</h1>
+<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Thanks for signing up at <strong style="color:#a855f7;">KidStorePeru</strong>. To activate your account and start buying Fortnite items, please verify your email address.</p>
+<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:24px;margin:0 0 24px;text-align:center;">
+  <p style="margin:0 0 6px;font-size:13px;color:#6b6b8a;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Your account is ready</p>
+  <p style="margin:0 0 20px;font-size:14px;color:#8b8ba7;">One click to activate it</p>
+  <a href="%s" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;padding:14px 36px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px;">✓ Verify my account</a>
+</div>
+<p style="margin:0 0 12px;font-size:13px;color:#6b6b8a;">Button not working? Copy and paste this link:</p>
+<div style="background:#080810;border:1px solid #1e1e3a;border-radius:10px;padding:12px 16px;margin:0 0 24px;word-break:break-all;">
+  <a href="%s" style="font-size:12px;color:#7c3aed;text-decoration:none;">%s</a>
+</div>
+<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
+  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ This link expires in <strong style="color:#6b6b8a;">24 hours</strong>. If you didn't create this account, you can safely ignore this email.</p>
+</div>`, username, verifyURL, verifyURL, verifyURL)
+	return emailBase("Verify your account — KidStorePeru", "Activate your KidStorePeru account with one click", content)
+}
+
+func buildResetEmailES(username, resetURL string) string {
+	content := fmt.Sprintf(`
+<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Recuperar contraseña</h1>
+<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Hola <strong style="color:#ffffff;">%s</strong>, recibimos una solicitud para restablecer la contraseña de tu cuenta en KidStorePeru.</p>
+<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:24px;margin:0 0 24px;text-align:center;">
+  <p style="margin:0 0 20px;font-size:14px;color:#8b8ba7;">Haz clic en el botón para crear una nueva contraseña</p>
+  <a href="%s" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;padding:14px 36px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px;">🔑 Restablecer contraseña</a>
+</div>
+<p style="margin:0 0 12px;font-size:13px;color:#6b6b8a;">¿El botón no funciona? Copia y pega este enlace:</p>
+<div style="background:#080810;border:1px solid #1e1e3a;border-radius:10px;padding:12px 16px;margin:0 0 24px;word-break:break-all;">
+  <a href="%s" style="font-size:12px;color:#7c3aed;text-decoration:none;">%s</a>
+</div>
+<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
+  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ Este enlace expira en <strong style="color:#6b6b8a;">10 minutos</strong>. Si no solicitaste esto, ignora este correo — tu contraseña no cambiará.</p>
+</div>`, username, resetURL, resetURL, resetURL)
+	return emailBase("Recuperar contraseña — KidStorePeru", "Restablece tu contraseña de KidStorePeru", content)
+}
+
+func buildResetEmailEN(username, resetURL string) string {
+	content := fmt.Sprintf(`
+<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Reset your password</h1>
+<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Hi <strong style="color:#ffffff;">%s</strong>, we received a request to reset the password for your KidStorePeru account.</p>
+<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:24px;margin:0 0 24px;text-align:center;">
+  <p style="margin:0 0 20px;font-size:14px;color:#8b8ba7;">Click the button below to create a new password</p>
+  <a href="%s" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;padding:14px 36px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px;">🔑 Reset password</a>
+</div>
+<p style="margin:0 0 12px;font-size:13px;color:#6b6b8a;">Button not working? Copy and paste this link:</p>
+<div style="background:#080810;border:1px solid #1e1e3a;border-radius:10px;padding:12px 16px;margin:0 0 24px;word-break:break-all;">
+  <a href="%s" style="font-size:12px;color:#7c3aed;text-decoration:none;">%s</a>
+</div>
+<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
+  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ This link expires in <strong style="color:#6b6b8a;">10 minutes</strong>. If you didn't request this, ignore this email — your password won't change.</p>
+</div>`, username, resetURL, resetURL, resetURL)
+	return emailBase("Reset your password — KidStorePeru", "Reset your KidStorePeru password", content)
 }

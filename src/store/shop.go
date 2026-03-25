@@ -219,32 +219,33 @@ func processOrders(database *sql.DB) {
 	accounts, err := db.GetActiveGameAccounts(database)
 	if err != nil || len(accounts) == 0 {
 		fmt.Println("[Worker] No hay cuentas bot activas disponibles")
-		noBotsMsg := "Sin cuentas bot activas disponibles. El admin debe vincular o reactivar una cuenta."
+		noBotsMsg := "Sin cuentas bot activas disponibles."
 		for _, order := range orders {
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &noBotsMsg)
 			db.RefundOrder(database, order.ID)
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED", fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, noBotsMsg), "worker")
+			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
+				fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, noBotsMsg), "worker")
 			sendDiscordNotification(database, order, "refunded")
 		}
 		return
 	}
 
 	for _, order := range orders {
+		// Buscar cuenta con slots disponibles
 		var selectedAccount *types.GameAccount
 		for i := range accounts {
 			if accounts[i].RemainingGifts > 0 { selectedAccount = &accounts[i]; break }
 		}
+
+		// Sin slots: solo procesar el pedido actual y salir del bucle
 		if selectedAccount == nil {
 			fmt.Println("[Worker] Sin slots de regalo en ninguna cuenta bot")
 			noSlotsMsg := "Todas las cuentas bot han agotado sus envíos del día. Los gifts se resetean diariamente."
-			for _, o := range orders {
-				if o.Status == "pending" {
-					db.UpdateOrderStatus(database, o.ID, "failed", nil, &noSlotsMsg)
-					db.RefundOrder(database, o.ID)
-					db.AddAuditLog(database, &o.CustomerID, "ORDER_FAILED", fmt.Sprintf("pedido %s: %s — KC reembolsados", o.ID, noSlotsMsg), "worker")
-					sendDiscordNotification(database, o, "refunded")
-				}
-			}
+			db.UpdateOrderStatus(database, order.ID, "failed", nil, &noSlotsMsg)
+			db.RefundOrder(database, order.ID)
+			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
+				fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, noSlotsMsg), "worker")
+			sendDiscordNotification(database, order, "refunded")
 			break
 		}
 
@@ -256,7 +257,8 @@ func processOrders(database *sql.DB) {
 			fmt.Printf("[Worker] ❌ %s\n", errMsg)
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
 			db.RefundOrder(database, order.ID)
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED", fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
+			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
+				fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
 			sendDiscordNotification(database, order, "refunded")
 			continue
 		}
@@ -267,7 +269,8 @@ func processOrders(database *sql.DB) {
 			fmt.Printf("[Worker] ❌ %s\n", errMsg)
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
 			db.RefundOrder(database, order.ID)
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED", fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
+			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
+				fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
 			sendDiscordNotification(database, order, "refunded")
 			continue
 		}
@@ -277,6 +280,7 @@ func processOrders(database *sql.DB) {
 			remaining := 48 - hoursAsFriend
 			errMsg := fmt.Sprintf("amigos hace %.1f horas — faltan %.1f horas para poder recibir regalos", hoursAsFriend, remaining)
 			fmt.Printf("[Worker] ⏳ pedido %s: %s\n", order.ID, errMsg)
+			// Solo actualizar el mensaje de error, mantener pending — NO notificar
 			db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
 			continue
 		}
@@ -328,6 +332,9 @@ func processOrders(database *sql.DB) {
 	}
 }
 
+// sendDiscordNotification envía UNA sola notificación por pedido.
+// Usa go para no bloquear el worker, pero la lógica de deduplicación
+// está garantizada porque se llama en un único punto por cada caso.
 func sendDiscordNotification(database *sql.DB, order types.Order, status string) {
 	if notifyDiscord == nil { return }
 	customer, err := db.GetCustomerByID(database, order.CustomerID)

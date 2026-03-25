@@ -97,6 +97,9 @@ func (r *ratesCache) refresh() {
 // ── Sesión global ──
 var BotSession *discordgo.Session
 
+// botHandlersRegistered evita registrar handlers duplicados si StartBot se llama más de una vez
+var botHandlersRegistered bool
+
 // ── Compras pendientes ──
 type pendingPurchase struct {
 	CustomerID  string
@@ -168,8 +171,12 @@ func StartBot(database *sql.DB, botToken string) (*discordgo.Session, error) {
 		currentPrefixMu.Lock(); currentPrefix = p; currentPrefixMu.Unlock()
 	}
 
-	dg.AddHandler(messageHandler(database))
-	dg.AddHandler(interactionHandler(database))
+	// Solo registrar handlers una vez para evitar mensajes/embeds duplicados
+	if !botHandlersRegistered {
+		dg.AddHandler(messageHandler(database))
+		dg.AddHandler(interactionHandler(database))
+		botHandlersRegistered = true
+	}
 
 	if err := dg.Open(); err != nil { return nil, fmt.Errorf("error conectando al bot: %w", err) }
 
@@ -188,13 +195,31 @@ func SendOrderNotification(discordID, status, itemName string, priceKC int, lang
 	switch status {
 	case "sent":
 		color = 0x22c55e
-		if es { title = fmt.Sprintf("✅ ¡Item enviado! **%s**", itemName); desc = fmt.Sprintf("Tu compra de **%s** fue enviada exitosamente a tu cuenta de Fortnite. ¡Disfrútalo! 🎮", itemName) } else { title = fmt.Sprintf("✅ Item sent! **%s**", itemName); desc = fmt.Sprintf("Your purchase of **%s** was successfully sent to your Fortnite account. Enjoy! 🎮", itemName) }
+		if es {
+			title = fmt.Sprintf("✅ ¡Item enviado! **%s**", itemName)
+			desc  = fmt.Sprintf("Tu compra de **%s** fue enviada exitosamente a tu cuenta de Fortnite. ¡Disfrútalo! 🎮", itemName)
+		} else {
+			title = fmt.Sprintf("✅ Item sent! **%s**", itemName)
+			desc  = fmt.Sprintf("Your purchase of **%s** was successfully sent to your Fortnite account. Enjoy! 🎮", itemName)
+		}
 	case "refunded":
 		color = 0xf59e0b
-		if es { title = fmt.Sprintf("↩️ Reembolso: **%s**", itemName); desc = fmt.Sprintf("Tu pedido de **%s** fue reembolsado. Se acreditaron **%s %s KC** a tu cuenta.", itemName, kcCoin, fmtNum(priceKC)) } else { title = fmt.Sprintf("↩️ Refund: **%s**", itemName); desc = fmt.Sprintf("Your order for **%s** was refunded. **%s %s KC** have been credited to your account.", itemName, kcCoin, fmtNum(priceKC)) }
+		if es {
+			title = fmt.Sprintf("↩️ Reembolso: **%s**", itemName)
+			desc  = fmt.Sprintf("Tu pedido de **%s** fue reembolsado. Se acreditaron **%s %s KC** a tu cuenta.", itemName, kcCoin, fmtNum(priceKC))
+		} else {
+			title = fmt.Sprintf("↩️ Refund: **%s**", itemName)
+			desc  = fmt.Sprintf("Your order for **%s** was refunded. **%s %s KC** have been credited to your account.", itemName, kcCoin, fmtNum(priceKC))
+		}
 	case "failed":
 		color = 0xef4444
-		if es { title = fmt.Sprintf("❌ Pedido fallido: **%s**", itemName); desc = fmt.Sprintf("Tu pedido de **%s** no pudo procesarse. Tus KC fueron reembolsados automáticamente.", itemName) } else { title = fmt.Sprintf("❌ Order failed: **%s**", itemName); desc = fmt.Sprintf("Your order for **%s** could not be processed. Your KC were automatically refunded.", itemName) }
+		if es {
+			title = fmt.Sprintf("❌ Pedido fallido: **%s**", itemName)
+			desc  = fmt.Sprintf("Tu pedido de **%s** no pudo procesarse. Tus KC fueron reembolsados automáticamente.", itemName)
+		} else {
+			title = fmt.Sprintf("❌ Order failed: **%s**", itemName)
+			desc  = fmt.Sprintf("Your order for **%s** could not be processed. Your KC were automatically refunded.", itemName)
+		}
 	default:
 		return
 	}
@@ -300,7 +325,11 @@ func messageHandler(database *sql.DB) func(*discordgo.Session, *discordgo.Messag
 			sendLink(s, m.ChannelID, m.Author.ID, m.Author.Username, lang)
 
 		default:
-			if es { s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("❓ Comando **`%s%s`** no reconocido. Usa **`%sayuda`** para ver los comandos.", pfx, cmd, pfx)) } else { s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("❓ Command **`%s%s`** not recognized. Use **`%shelp`** for all commands.", pfx, cmd, pfx)) }
+			if es {
+				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("❓ Comando **`%s%s`** no reconocido. Usa **`%sayuda`** para ver los comandos.", pfx, cmd, pfx))
+			} else {
+				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("❓ Command **`%s%s`** not recognized. Use **`%shelp`** for all commands.", pfx, cmd, pfx))
+			}
 		}
 	}
 }
@@ -376,14 +405,12 @@ func sendSchedule(s *discordgo.Session, channelID, userID string, database *sql.
 		return
 	}
 
-	// Calcular hora Lima (UTC-5) para los rangos UTC
 	startLima := schedule.StartHour
 	endLima   := schedule.EndHour
 
 	statusIcon := "🟢"; statusText := "Activos"
 	if !es { statusText = "Active" }
 
-	// Verificar si estamos dentro del horario ahora
 	inSchedule, _ := db.IsWithinSchedule(database)
 	if !inSchedule {
 		statusIcon = "🔴"; statusText = "Fuera de horario"
@@ -418,7 +445,8 @@ func sendSchedule(s *discordgo.Session, channelID, userID string, database *sql.
 	}
 
 	embed := &discordgo.MessageEmbed{
-		Title: title, Description: desc, Color: func() int { if inSchedule && schedule.Enabled { return 0x22c55e }; return 0xef4444 }(),
+		Title: title, Description: desc,
+		Color: func() int { if inSchedule && schedule.Enabled { return 0x22c55e }; return 0xef4444 }(),
 		Fields: []*discordgo.MessageEmbedField{
 			{Name: f1n, Value: f1v, Inline: true},
 			{Name: f2n, Value: f2v, Inline: true},
@@ -442,12 +470,15 @@ func interactionHandler(database *sql.DB) func(*discordgo.Session, *discordgo.In
 		if i.Member != nil && i.Member.User != nil { userID = i.Member.User.ID } else if i.User != nil { userID = i.User.ID }
 		if userID == "" { return }
 
-		lang     := getUserLang(database, userID)
+		lang    := getUserLang(database, userID)
 		customer, err := db.GetCustomerByDiscordID(database, userID)
-		linked   := err == nil
+		linked  := err == nil
 
 		if !strings.Contains(data.CustomID, userID) {
-			respondEphemeral(s, i, func() string { if lang == "es" { return "❌ Este menú no es tuyo. Ejecuta tu propio comando." }; return "❌ This menu is not yours. Run your own command." }())
+			respondEphemeral(s, i, func() string {
+				if lang == "es" { return "❌ Este menú no es tuyo. Ejecuta tu propio comando." }
+				return "❌ This menu is not yours. Run your own command."
+			}())
 			return
 		}
 
@@ -578,7 +609,10 @@ func sendHelp(s *discordgo.Session, channelID, userID, lang string) {
 
 // ── ?saldo ──
 func sendBalance(s *discordgo.Session, channelID, userID string, c types.Customer, lang string) {
-	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Embeds: []*discordgo.MessageEmbed{balanceEmbed(c, lang)}, Components: []discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:     []*discordgo.MessageEmbed{balanceEmbed(c, lang)},
+		Components: []discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func balanceEmbed(c types.Customer, lang string) *discordgo.MessageEmbed {
@@ -598,12 +632,18 @@ func balanceEmbed(c types.Customer, lang string) *discordgo.MessageEmbed {
 
 func updateToBalance(s *discordgo.Session, i *discordgo.InteractionCreate, userID string, c types.Customer, lang string) {
 	e := balanceEmbed(c, lang)
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{e}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{e},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 // ── ?perfil ──
 func sendProfile(s *discordgo.Session, channelID, userID string, c types.Customer, lang string) {
-	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Embeds: []*discordgo.MessageEmbed{profileEmbed(c, lang)}, Components: []discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:     []*discordgo.MessageEmbed{profileEmbed(c, lang)},
+		Components: []discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func profileEmbed(c types.Customer, lang string) *discordgo.MessageEmbed {
@@ -628,12 +668,18 @@ func profileEmbed(c types.Customer, lang string) *discordgo.MessageEmbed {
 
 func updateToProfile(s *discordgo.Session, i *discordgo.InteractionCreate, userID string, c types.Customer, lang string) {
 	e := profileEmbed(c, lang)
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{e}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{e},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 // ── ?pedidos ──
 func sendOrders(s *discordgo.Session, channelID, userID string, database *sql.DB, c types.Customer, lang string) {
-	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Embeds: []*discordgo.MessageEmbed{ordersEmbed(database, c, lang)}, Components: []discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:     []*discordgo.MessageEmbed{ordersEmbed(database, c, lang)},
+		Components: []discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func ordersEmbed(database *sql.DB, c types.Customer, lang string) *discordgo.MessageEmbed {
@@ -653,31 +699,58 @@ func ordersEmbed(database *sql.DB, c types.Customer, lang string) *discordgo.Mes
 	}
 	title := fmt.Sprintf("📦 Últimos pedidos de **%s**", c.EpicUsername)
 	if !es { title = fmt.Sprintf("📦 Recent orders of **%s**", c.EpicUsername) }
-	return &discordgo.MessageEmbed{Title: title, Color: 0x3b82f6, Fields: fields, Footer: &discordgo.MessageEmbedFooter{Text: storeURL + "/dashboard"}}
+	return &discordgo.MessageEmbed{
+		Title: title, Color: 0x3b82f6, Fields: fields,
+		Footer: &discordgo.MessageEmbedFooter{Text: storeURL + "/dashboard"},
+	}
 }
 
 func updateToOrders(s *discordgo.Session, i *discordgo.InteractionCreate, userID string, database *sql.DB, c types.Customer, lang string) {
 	e := ordersEmbed(database, c, lang)
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{e}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{e},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 // ── ?tienda ──
 func sendShop(s *discordgo.Session, channelID, userID, lang string) {
-	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Embeds: []*discordgo.MessageEmbed{shopEmbed(lang)}, Components: []discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:     []*discordgo.MessageEmbed{shopEmbed(lang)},
+		Components: []discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func shopEmbed(lang string) *discordgo.MessageEmbed {
 	es := lang == "es"
-	title := "🛒 Tienda de Fortnite — KidStorePeru"; desc := "Más de **200 items** disponibles hoy. ¡Compra con KidCoins!"
-	f1v := fmt.Sprintf("[🔗 Abrir tienda](%s/store)", storeURL); f2v := fmt.Sprintf("[💳 Recargar KC](%s/recharge)", storeURL)
-	foot := "Items se actualizan diariamente a las 00:00 UTC (19:00 hora Lima)"
-	if !es { title = "🛒 Fortnite Store — KidStorePeru"; desc = "More than **200 items** available today. Buy with KidCoins!"; f1v = fmt.Sprintf("[🔗 Open store](%s/store)", storeURL); f2v = fmt.Sprintf("[💳 Recharge KC](%s/recharge)", storeURL); foot = "Items update daily at 00:00 UTC (19:00 Lima time)" }
-	return &discordgo.MessageEmbed{Title: title, Description: desc, Color: 0x22c55e, Fields: []*discordgo.MessageEmbedField{{Name: "🌐 Web", Value: f1v, Inline: true}, {Name: "⚡ KC", Value: f2v, Inline: true}}, Footer: &discordgo.MessageEmbedFooter{Text: foot}}
+	title := "🛒 Tienda de Fortnite — KidStorePeru"
+	desc  := "Más de **200 items** disponibles hoy. ¡Compra con KidCoins!"
+	f1v   := fmt.Sprintf("[🔗 Abrir tienda](%s/store)", storeURL)
+	f2v   := fmt.Sprintf("[💳 Recargar KC](%s/recharge)", storeURL)
+	foot  := "Items se actualizan diariamente a las 00:00 UTC (19:00 hora Lima)"
+	if !es {
+		title = "🛒 Fortnite Store — KidStorePeru"
+		desc  = "More than **200 items** available today. Buy with KidCoins!"
+		f1v   = fmt.Sprintf("[🔗 Open store](%s/store)", storeURL)
+		f2v   = fmt.Sprintf("[💳 Recharge KC](%s/recharge)", storeURL)
+		foot  = "Items update daily at 00:00 UTC (19:00 Lima time)"
+	}
+	return &discordgo.MessageEmbed{
+		Title: title, Description: desc, Color: 0x22c55e,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "🌐 Web", Value: f1v, Inline: true},
+			{Name: "⚡ KC",  Value: f2v, Inline: true},
+		},
+		Footer: &discordgo.MessageEmbedFooter{Text: foot},
+	}
 }
 
 func updateToShop(s *discordgo.Session, i *discordgo.InteractionCreate, userID, lang string) {
 	e := shopEmbed(lang)
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{e}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{e},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func updateToSchedule(s *discordgo.Session, i *discordgo.InteractionCreate, userID string, database *sql.DB, lang string) {
@@ -704,12 +777,18 @@ func updateToSchedule(s *discordgo.Session, i *discordgo.InteractionCreate, user
 		},
 		Footer: &discordgo.MessageEmbedFooter{Text: foot},
 	}
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{embed}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{embed},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 // ── ?recargar ──
 func sendPackages(s *discordgo.Session, channelID, userID, lang string) {
-	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Embeds: []*discordgo.MessageEmbed{packagesEmbed(lang)}, Components: []discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:     []*discordgo.MessageEmbed{packagesEmbed(lang)},
+		Components: []discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func packagesEmbed(lang string) *discordgo.MessageEmbed {
@@ -729,7 +808,10 @@ func packagesEmbed(lang string) *discordgo.MessageEmbed {
 
 func updateToPackages(s *discordgo.Session, i *discordgo.InteractionCreate, userID, lang string) {
 	e := packagesEmbed(lang)
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{e}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{e},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 // ── ?comprar ──
@@ -825,15 +907,25 @@ func updateToBuyConfirm(s *discordgo.Session, i *discordgo.InteractionCreate, us
 	pendingMu.Unlock()
 
 	title, desc, balField, foot := "", "", "", ""
-	if es { title = fmt.Sprintf("🛒 Confirmar compra: **%s**", item.Name); desc = "*¿Deseas comprar este item?*"; balField = fmt.Sprintf("Saldo restante: **%s %s KC**", kcCoin, fmtNum(c.KCBalance-item.KC)); foot = "⚠️ Asegúrate de tener al menos un bot agregado en Epic Games" } else { title = fmt.Sprintf("🛒 Confirm purchase: **%s**", item.Name); desc = "*Do you want to buy this item?*"; balField = fmt.Sprintf("Remaining balance: **%s %s KC**", kcCoin, fmtNum(c.KCBalance-item.KC)); foot = "⚠️ Make sure you have at least one bot added in Epic Games" }
+	if es {
+		title    = fmt.Sprintf("🛒 Confirmar compra: **%s**", item.Name)
+		desc     = "*¿Deseas comprar este item?*"
+		balField = fmt.Sprintf("Saldo restante: **%s %s KC**", kcCoin, fmtNum(c.KCBalance-item.KC))
+		foot     = "⚠️ Asegúrate de tener al menos un bot agregado en Epic Games"
+	} else {
+		title    = fmt.Sprintf("🛒 Confirm purchase: **%s**", item.Name)
+		desc     = "*Do you want to buy this item?*"
+		balField = fmt.Sprintf("Remaining balance: **%s %s KC**", kcCoin, fmtNum(c.KCBalance-item.KC))
+		foot     = "⚠️ Make sure you have at least one bot added in Epic Games"
+	}
 
 	embed := &discordgo.MessageEmbed{
 		Title: title, Description: desc, Color: 0x7c3aed,
 		Fields: []*discordgo.MessageEmbedField{
-			{Name: "💰 KC",           Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(item.KC)), Inline: true},
-			{Name: "🎮 V-Bucks",     Value: fmt.Sprintf("**%d**", item.VBucks), Inline: true},
+			{Name: "💰 KC",            Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(item.KC)), Inline: true},
+			{Name: "🎮 V-Bucks",      Value: fmt.Sprintf("**%d**", item.VBucks), Inline: true},
 			{Name: "💵 Precio aprox.", Value: fmt.Sprintf("S/ %.2f · $%.2f · €%.2f", pricePEN, roundCents(pricePEN*usd), roundCents(pricePEN*eur))},
-			{Name: "📊 Balance",     Value: balField},
+			{Name: "📊 Balance",      Value: balField},
 		},
 		Footer: &discordgo.MessageEmbedFooter{Text: foot},
 	}
@@ -872,7 +964,10 @@ func confirmPurchaseInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 func executePurchase(s *discordgo.Session, channelID, userID string, database *sql.DB, c types.Customer, p *pendingPurchase, lang string) {
 	es := lang == "es"
 	customer, err := db.GetCustomerByID(database, c.ID)
-	if err != nil || customer.KCBalance < p.PriceKC { msg := "❌ **Saldo insuficiente**."; if !es { msg = "❌ **Insufficient balance**." }; s.ChannelMessageSend(channelID, msg); return }
+	if err != nil || customer.KCBalance < p.PriceKC {
+		msg := "❌ **Saldo insuficiente**."; if !es { msg = "❌ **Insufficient balance**." }
+		s.ChannelMessageSend(channelID, msg); return
+	}
 	inSchedule, _ := db.IsWithinSchedule(database)
 	if !inSchedule {
 		schedule, _ := db.GetBotSchedule(database)
@@ -884,17 +979,36 @@ func executePurchase(s *discordgo.Session, channelID, userID string, database *s
 	order, err := db.DeductKCAndCreateOrder(database, c.ID, customer.EpicUsername, req)
 	if err != nil { s.ChannelMessageSend(channelID, fmt.Sprintf("❌ *Error: %s*", err.Error())); return }
 	db.AddAuditLog(database, &c.ID, "ORDER_CREATED_BOT", fmt.Sprintf("pedido %s via Discord bot: %s por %d KC", order.ID, p.ItemName, p.PriceKC), "discord-bot")
-	title, desc := fmt.Sprintf("✅ ¡Compra realizada! **%s**", p.ItemName), fmt.Sprintf("El item será enviado a **%s** en cuanto el bot lo procese.", customer.EpicUsername)
+	title := fmt.Sprintf("✅ ¡Compra realizada! **%s**", p.ItemName)
+	desc  := fmt.Sprintf("El item será enviado a **%s** en cuanto el bot lo procese.", customer.EpicUsername)
 	f1, f2, f3 := "🆔 Pedido", "💰 KC gastados", "📊 Nuevo saldo"
-	if !es { title = fmt.Sprintf("✅ Purchase complete! **%s**", p.ItemName); desc = fmt.Sprintf("The item will be sent to **%s** once the bot processes it.", customer.EpicUsername); f1 = "🆔 Order"; f2 = "💰 KC spent"; f3 = "📊 New balance" }
-	embed := &discordgo.MessageEmbed{Title: title, Description: desc, Color: 0x22c55e, Fields: []*discordgo.MessageEmbedField{{Name: f1, Value: fmt.Sprintf("*%s...*", order.ID.String()[:8]), Inline: true}, {Name: f2, Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(p.PriceKC)), Inline: true}, {Name: f3, Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(customer.KCBalance-p.PriceKC)), Inline: true}}, Footer: &discordgo.MessageEmbedFooter{Text: storeURL + "/dashboard"}}
-	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Embeds: []*discordgo.MessageEmbed{embed}, Components: []discordgo.MessageComponent{navMenu(userID, lang)}})
+	if !es {
+		title = fmt.Sprintf("✅ Purchase complete! **%s**", p.ItemName)
+		desc  = fmt.Sprintf("The item will be sent to **%s** once the bot processes it.", customer.EpicUsername)
+		f1 = "🆔 Order"; f2 = "💰 KC spent"; f3 = "📊 New balance"
+	}
+	embed := &discordgo.MessageEmbed{
+		Title: title, Description: desc, Color: 0x22c55e,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: f1, Value: fmt.Sprintf("*%s...*", order.ID.String()[:8]), Inline: true},
+			{Name: f2, Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(p.PriceKC)), Inline: true},
+			{Name: f3, Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(customer.KCBalance-p.PriceKC)), Inline: true},
+		},
+		Footer: &discordgo.MessageEmbedFooter{Text: storeURL + "/dashboard"},
+	}
+	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:     []*discordgo.MessageEmbed{embed},
+		Components: []discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func executePurchaseInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, userID string, database *sql.DB, c types.Customer, p *pendingPurchase, lang string) {
 	es := lang == "es"
 	customer, err := db.GetCustomerByID(database, c.ID)
-	if err != nil || customer.KCBalance < p.PriceKC { msg := "❌ **Saldo insuficiente**."; if !es { msg = "❌ **Insufficient balance**." }; s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &msg}); return }
+	if err != nil || customer.KCBalance < p.PriceKC {
+		msg := "❌ **Saldo insuficiente**."; if !es { msg = "❌ **Insufficient balance**." }
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &msg}); return
+	}
 	inSchedule, _ := db.IsWithinSchedule(database)
 	if !inSchedule {
 		schedule, _ := db.GetBotSchedule(database)
@@ -906,16 +1020,35 @@ func executePurchaseInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	order, err := db.DeductKCAndCreateOrder(database, c.ID, customer.EpicUsername, req)
 	if err != nil { msg := fmt.Sprintf("❌ *Error: %s*", err.Error()); s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &msg}); return }
 	db.AddAuditLog(database, &c.ID, "ORDER_CREATED_BOT", fmt.Sprintf("pedido %s via Discord bot: %s por %d KC", order.ID, p.ItemName, p.PriceKC), "discord-bot")
-	title, desc := fmt.Sprintf("✅ ¡Compra realizada! **%s**", p.ItemName), fmt.Sprintf("Enviado a **%s** en breve.", customer.EpicUsername)
+	title := fmt.Sprintf("✅ ¡Compra realizada! **%s**", p.ItemName)
+	desc  := fmt.Sprintf("Enviado a **%s** en breve.", customer.EpicUsername)
 	f1, f2, f3 := "🆔 Pedido", "💰 KC gastados", "📊 Nuevo saldo"
-	if !es { title = fmt.Sprintf("✅ Purchase complete! **%s**", p.ItemName); desc = fmt.Sprintf("Will be sent to **%s** shortly.", customer.EpicUsername); f1 = "🆔 Order"; f2 = "💰 KC spent"; f3 = "📊 New balance" }
-	embed := &discordgo.MessageEmbed{Title: title, Description: desc, Color: 0x22c55e, Fields: []*discordgo.MessageEmbedField{{Name: f1, Value: fmt.Sprintf("*%s...*", order.ID.String()[:8]), Inline: true}, {Name: f2, Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(p.PriceKC)), Inline: true}, {Name: f3, Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(customer.KCBalance-p.PriceKC)), Inline: true}}, Footer: &discordgo.MessageEmbedFooter{Text: storeURL + "/dashboard"}}
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{embed}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	if !es {
+		title = fmt.Sprintf("✅ Purchase complete! **%s**", p.ItemName)
+		desc  = fmt.Sprintf("Will be sent to **%s** shortly.", customer.EpicUsername)
+		f1 = "🆔 Order"; f2 = "💰 KC spent"; f3 = "📊 New balance"
+	}
+	embed := &discordgo.MessageEmbed{
+		Title: title, Description: desc, Color: 0x22c55e,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: f1, Value: fmt.Sprintf("*%s...*", order.ID.String()[:8]), Inline: true},
+			{Name: f2, Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(p.PriceKC)), Inline: true},
+			{Name: f3, Value: fmt.Sprintf("**%s %s KC**", kcCoin, fmtNum(customer.KCBalance-p.PriceKC)), Inline: true},
+		},
+		Footer: &discordgo.MessageEmbedFooter{Text: storeURL + "/dashboard"},
+	}
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{embed},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 // ── ?agregar ──
 func sendAddBots(s *discordgo.Session, channelID, userID, lang string) {
-	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Embeds: []*discordgo.MessageEmbed{addBotsEmbed(lang)}, Components: []discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:     []*discordgo.MessageEmbed{addBotsEmbed(lang)},
+		Components: []discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func addBotsEmbed(lang string) *discordgo.MessageEmbed {
@@ -923,39 +1056,95 @@ func addBotsEmbed(lang string) *discordgo.MessageEmbed {
 	bots := []string{"KidStore0001", "KidStore0002", "KidStore0003", "KidStore0004", "KidStore0005"}
 	var sb strings.Builder
 	for _, b := range bots { sb.WriteString(fmt.Sprintf("• `%s`\n", b)) }
-	title, desc, f1n, f2n, f2v := "🤖 Cuentas Bot de KidStorePeru", "**Agrega al menos una** de estas cuentas como amigo en Epic Games.", "📋 Cuentas disponibles", "⚠️ Importante", "Fortnite requiere **48 horas** de amistad antes de poder enviarte un regalo."
-	if !es { title = "🤖 KidStorePeru Bot Accounts"; desc = "**Add at least one** of these accounts as a friend in Epic Games."; f1n = "📋 Available accounts"; f2n = "⚠️ Important"; f2v = "Fortnite requires **48 hours** of friendship before sending a gift." }
-	return &discordgo.MessageEmbed{Title: title, Description: desc, Color: 0x3b82f6, Fields: []*discordgo.MessageEmbedField{{Name: f1n, Value: sb.String()}, {Name: f2n, Value: f2v}}, Footer: &discordgo.MessageEmbedFooter{Text: storeURL + "/bots"}}
+	title  := "🤖 Cuentas Bot de KidStorePeru"
+	desc   := "**Agrega al menos una** de estas cuentas como amigo en Epic Games."
+	f1n    := "📋 Cuentas disponibles"
+	f2n    := "⚠️ Importante"
+	f2v    := "Fortnite requiere **48 horas** de amistad antes de poder enviarte un regalo."
+	if !es {
+		title = "🤖 KidStorePeru Bot Accounts"
+		desc  = "**Add at least one** of these accounts as a friend in Epic Games."
+		f1n   = "📋 Available accounts"
+		f2n   = "⚠️ Important"
+		f2v   = "Fortnite requires **48 hours** of friendship before sending a gift."
+	}
+	return &discordgo.MessageEmbed{
+		Title: title, Description: desc, Color: 0x3b82f6,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: f1n, Value: sb.String()},
+			{Name: f2n, Value: f2v},
+		},
+		Footer: &discordgo.MessageEmbedFooter{Text: storeURL + "/bots"},
+	}
 }
 
 func updateToAddBots(s *discordgo.Session, i *discordgo.InteractionCreate, userID, lang string) {
 	e := addBotsEmbed(lang)
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{e}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{e},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 // ── ?vincular ──
 func sendLink(s *discordgo.Session, channelID, userID, username, lang string) {
-	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Embeds: []*discordgo.MessageEmbed{linkEmbed(username, lang)}, Components: []discordgo.MessageComponent{navMenu(userID, lang)}})
+	s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:     []*discordgo.MessageEmbed{linkEmbed(username, lang)},
+		Components: []discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 func linkEmbed(username, lang string) *discordgo.MessageEmbed {
 	es := lang == "es"
-	title, desc, fn, fv := "🔗 Vincular cuenta", fmt.Sprintf("Hola **%s**, sigue estos pasos:", username), "Pasos", fmt.Sprintf("1. Ve a [%s](%s)\n2. **Inicia sesión** con tu cuenta\n3. Ve a **Mi Cuenta**\n4. Haz clic en **Conectar con Discord**\n5. Autoriza la aplicación", storeURL, storeURL)
-	if !es { title = "🔗 Link account"; desc = fmt.Sprintf("Hi **%s**, follow these steps:", username); fn = "Steps"; fv = fmt.Sprintf("1. Go to [%s](%s)\n2. **Log in** with your account\n3. Go to **My Account**\n4. Click **Connect with Discord**\n5. Authorize the app", storeURL, storeURL) }
-	return &discordgo.MessageEmbed{Title: title, Description: desc, Color: 0x5865f2, Fields: []*discordgo.MessageEmbedField{{Name: fn, Value: fv}}}
+	greeting := ""
+	if username != "" {
+		if es { greeting = fmt.Sprintf("Hola **%s**, sigue estos pasos:\n\n", username) } else { greeting = fmt.Sprintf("Hi **%s**, follow these steps:\n\n", username) }
+	}
+	linkText := "kidstoreperu.com"
+	title := "🔗 Vincular cuenta"
+	fn    := "Pasos"
+	fv    := fmt.Sprintf("1. Ve a [%s](%s)\n2. **Inicia sesión** con tu cuenta\n3. Ve a **Mi Cuenta**\n4. Haz clic en **Conectar con Discord**\n5. Autoriza la aplicación", linkText, storeURL)
+	if !es {
+		title = "🔗 Link account"
+		fn    = "Steps"
+		fv    = fmt.Sprintf("1. Go to [%s](%s)\n2. **Log in** with your account\n3. Go to **My Account**\n4. Click **Connect with Discord**\n5. Authorize the app", linkText, storeURL)
+	}
+	desc := greeting
+	if es { desc += "Vincula tu cuenta de Discord con KidStorePeru para comprar items de Fortnite directamente desde Discord." } else { desc += "Link your Discord account with KidStorePeru to buy Fortnite items directly from Discord." }
+	return &discordgo.MessageEmbed{
+		Title: title, Description: desc, Color: 0x5865f2,
+		Fields: []*discordgo.MessageEmbedField{{Name: fn, Value: fv}},
+	}
 }
 
 func updateToLink(s *discordgo.Session, i *discordgo.InteractionCreate, userID, lang string) {
-	e := linkEmbed("", lang)
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &[]*discordgo.MessageEmbed{e}, Components: &[]discordgo.MessageComponent{navMenu(userID, lang)}})
+	username := ""
+	if i.Member != nil && i.Member.User != nil { username = i.Member.User.Username } else if i.User != nil { username = i.User.Username }
+	e := linkEmbed(username, lang)
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &[]*discordgo.MessageEmbed{e},
+		Components: &[]discordgo.MessageComponent{navMenu(userID, lang)},
+	})
 }
 
 // ── No vinculado ──
 func sendNotLinked(s *discordgo.Session, channelID, username, lang string) {
 	es := lang == "es"
-	title, desc, fn, fv := "⚠️ Cuenta no vinculada", fmt.Sprintf("Hola **%s**, tu Discord no está vinculado a ninguna cuenta de KidStorePeru.", username), "¿Cómo vincular?", fmt.Sprintf("1. Inicia sesión en [%s](%s)\n2. Ve a **Mi Cuenta**\n3. Haz clic en **Conectar con Discord**", storeURL, storeURL)
-	if !es { title = "⚠️ Account not linked"; desc = fmt.Sprintf("Hi **%s**, your Discord is not linked to any KidStorePeru account.", username); fn = "How to link?"; fv = fmt.Sprintf("1. Log in at [%s](%s)\n2. Go to **My Account**\n3. Click **Connect with Discord**", storeURL, storeURL) }
-	s.ChannelMessageSendEmbed(channelID, &discordgo.MessageEmbed{Title: title, Description: desc, Color: 0xf59e0b, Fields: []*discordgo.MessageEmbedField{{Name: fn, Value: fv}}})
+	linkText := "kidstoreperu.com"
+	title := "⚠️ Cuenta no vinculada"
+	desc  := fmt.Sprintf("Hola **%s**, tu Discord no está vinculado a ninguna cuenta de KidStorePeru.", username)
+	fn    := "¿Cómo vincular?"
+	fv    := fmt.Sprintf("1. Inicia sesión en [%s](%s)\n2. Ve a **Mi Cuenta**\n3. Haz clic en **Conectar con Discord**", linkText, storeURL)
+	if !es {
+		title = "⚠️ Account not linked"
+		desc  = fmt.Sprintf("Hi **%s**, your Discord is not linked to any KidStorePeru account.", username)
+		fn    = "How to link?"
+		fv    = fmt.Sprintf("1. Log in at [%s](%s)\n2. Go to **My Account**\n3. Click **Connect with Discord**", linkText, storeURL)
+	}
+	s.ChannelMessageSendEmbed(channelID, &discordgo.MessageEmbed{
+		Title: title, Description: desc, Color: 0xf59e0b,
+		Fields: []*discordgo.MessageEmbedField{{Name: fn, Value: fv}},
+	})
 }
 
 // ── Helpers de tienda ──
@@ -993,7 +1182,9 @@ func fetchShopItems(lang string) []shopItem {
 func filterItems(items []shopItem, query string) []shopItem {
 	q := strings.ToLower(query)
 	var result []shopItem
-	for _, it := range items { if strings.Contains(strings.ToLower(it.Name), q) || strings.Contains(strings.ToLower(it.Section), q) { result = append(result, it) } }
+	for _, it := range items {
+		if strings.Contains(strings.ToLower(it.Name), q) || strings.Contains(strings.ToLower(it.Section), q) { result = append(result, it) }
+	}
 	return result
 }
 

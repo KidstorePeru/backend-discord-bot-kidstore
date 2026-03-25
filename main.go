@@ -53,6 +53,7 @@ func main() {
 
 	authLimiter  := middleware.NewIPRateLimiter(5, time.Minute)
 	orderLimiter := middleware.NewIPRateLimiter(10, time.Minute)
+	adminLimiter := middleware.NewIPRateLimiter(30, time.Minute)
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
@@ -60,7 +61,7 @@ func main() {
 	router.Use(gin.Recovery())
 
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{cfg.FrontendURL, "http://localhost:5173", "http://localhost:5174", "http://localhost:3000"}, 
+		AllowOrigins:     []string{cfg.FrontendURL, "http://localhost:5173", "http://localhost:5174", "http://localhost:3000"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Admin-Key", "X-Approved-By"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -72,7 +73,7 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"service": "KidStore Store API", "status": "ok"})
 	})
 
-	// ── Discord OAuth config ──
+	// ── Discord OAuth ──
 	discordCfg := discord.Config{
 		ClientID:     cfg.DiscordClientID,
 		ClientSecret: cfg.DiscordClientSecret,
@@ -81,19 +82,21 @@ func main() {
 		BotToken:     cfg.DiscordBotToken,
 		SecretKey:    cfg.SecretKey,
 	}
-
-	// ── Discord OAuth routes (públicas) ──
 	router.GET("/discord/auth",     discord.HandlerGetAuthURL(discordCfg))
 	router.GET("/discord/callback", discord.HandlerCallback(database, discordCfg))
+
+	// ── Verificación de email (pública) ──
+	router.GET("/store/verify-email", store.HandlerVerifyEmail(database, cfg.SecretKey))
 
 	// ── Auth pública (con rate limit) ──
 	authGroup := router.Group("/store")
 	authGroup.Use(middleware.RateLimitMiddleware(authLimiter))
 	{
-		authGroup.POST("/register",        store.HandlerRegister(database, cfg.SecretKey))
-		authGroup.POST("/login",           store.HandlerLogin(database, cfg.SecretKey))
-		authGroup.POST("/forgot-password", store.HandlerForgotPassword(database, cfg))
-		authGroup.POST("/reset-password",  store.HandlerResetPassword(database))
+		authGroup.POST("/register",              store.HandlerRegister(database, cfg.SecretKey, cfg))
+		authGroup.POST("/login",                 store.HandlerLogin(database, cfg.SecretKey))
+		authGroup.POST("/forgot-password",       store.HandlerForgotPassword(database, cfg))
+		authGroup.POST("/reset-password",        store.HandlerResetPassword(database))
+		authGroup.POST("/resend-verification",   store.HandlerResendVerification(database, cfg))
 	}
 
 	router.GET("/store/shop",        store.HandlerGetShop)
@@ -103,10 +106,10 @@ func main() {
 	customer := router.Group("/store")
 	customer.Use(middleware.CustomerAuthMiddleware(cfg.SecretKey))
 	{
-		customer.GET("/me",            store.HandlerMe(database))
-		customer.GET("/orders",        store.HandlerGetMyOrders(database))
-		customer.PUT("/profile",       store.HandlerUpdateProfile(database, cfg.SecretKey))
-		customer.POST("/link-discord", store.HandlerLinkDiscord(database))
+		customer.GET("/me",               store.HandlerMe(database))
+		customer.GET("/orders",           store.HandlerGetMyOrders(database))
+		customer.PUT("/profile",          store.HandlerUpdateProfile(database, cfg.SecretKey))
+		customer.POST("/link-discord",    store.HandlerLinkDiscord(database))
 		customer.DELETE("/unlink-discord", store.HandlerUnlinkDiscord(database))
 		customer.POST("/order",
 			middleware.RateLimitMiddleware(orderLimiter),
@@ -114,17 +117,20 @@ func main() {
 		)
 	}
 
-	// ── Admin ──
+	// ── Admin (API Key + rate limit) ──
 	adminGroup := router.Group("/admin")
+	adminGroup.Use(middleware.RateLimitMiddleware(adminLimiter))
 	adminGroup.Use(middleware.AdminAuthMiddleware(cfg.AdminAPIKey))
 	{
-		adminGroup.GET("/customers",     admin.HandlerGetAllCustomers(database))
-		adminGroup.GET("/customers/:id", admin.HandlerGetCustomer(database))
-		adminGroup.POST("/recharge",     admin.HandlerRechargeKC(database))
-		adminGroup.GET("/orders",        admin.HandlerGetAllOrders(database))
-		adminGroup.GET("/stats",         admin.HandlerGetStats(database))
-		adminGroup.GET("/bot-schedule",  admin.HandlerGetBotSchedule(database))
-		adminGroup.PUT("/bot-schedule",  admin.HandlerUpdateBotSchedule(database))
+		adminGroup.GET("/customers",        admin.HandlerGetAllCustomers(database))
+		adminGroup.GET("/customers/:id",    admin.HandlerGetCustomer(database))
+		adminGroup.PUT("/customers/:id",    admin.HandlerUpdateCustomer(database))
+		adminGroup.DELETE("/customers/:id", admin.HandlerDeleteCustomer(database))
+		adminGroup.POST("/recharge",        admin.HandlerRechargeKC(database))
+		adminGroup.GET("/orders",           admin.HandlerGetAllOrders(database))
+		adminGroup.GET("/stats",            admin.HandlerGetStats(database))
+		adminGroup.GET("/bot-schedule",     admin.HandlerGetBotSchedule(database))
+		adminGroup.PUT("/bot-schedule",     admin.HandlerUpdateBotSchedule(database))
 		adminGroup.GET("/bots",             fortnite.HandlerGetBotAccounts(database))
 		adminGroup.POST("/bots/connect",    fortnite.HandlerConnectBotAccount(database))
 		adminGroup.POST("/bots/finish",     fortnite.HandlerFinishConnectBotAccount(database))
@@ -134,7 +140,7 @@ func main() {
 		adminGroup.POST("/bots/verify",     fortnite.HandlerVerifyBotTokens(database))
 	}
 
-	// ── Discord Bot — inicia antes del worker para poder inyectar notificador ──
+	// ── Discord Bot ──
 	var discordSession interface{ Close() error }
 	if cfg.DiscordBotToken != "" {
 		session, err := discord.StartBot(database, cfg.DiscordBotToken)
@@ -142,7 +148,6 @@ func main() {
 			fmt.Printf("⚠️ Error iniciando bot de Discord: %v\n", err)
 		} else {
 			discordSession = session
-			// Inyectar función de notificación en shop (evita importación circular)
 			store.SetDiscordNotifier(discord.SendOrderNotification)
 			fmt.Println("✅ Bot de Discord iniciado")
 		}

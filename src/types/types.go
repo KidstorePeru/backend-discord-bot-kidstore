@@ -31,7 +31,7 @@ type EnvConfig struct {
 	// App
 	FrontendURL      string `envconfig:"FRONTEND_URL" default:"http://localhost:5173"`
 	AdminAPIKey      string `envconfig:"ADMIN_API_KEY"`
-	BotCheckInterval int    `envconfig:"BOT_CHECK_INTERVAL" default:"3"` // minutos entre health checks
+	BotCheckInterval int    `envconfig:"BOT_CHECK_INTERVAL" default:"3"`
 
 	// SMTP
 	SMTPHost     string `envconfig:"SMTP_HOST"`
@@ -52,6 +52,7 @@ type Customer struct {
 	DiscordID       *string   `json:"discord_id,omitempty"`
 	DiscordUsername *string   `json:"discord_username,omitempty"`
 	IsActive        bool      `json:"is_active"`
+	IsVerified      bool      `json:"is_verified"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -104,7 +105,7 @@ type Order struct {
 	ItemImage     *string    `json:"item_image,omitempty"`
 	PriceKC       int        `json:"price_kc"`
 	PriceVBucks   int        `json:"price_vbucks"`
-	Status        string     `json:"status"` // pending, processing, sent, failed, refunded
+	Status        string     `json:"status"`
 	GameAccountID *uuid.UUID `json:"game_account_id,omitempty"`
 	ErrorMsg      *string    `json:"error_msg,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
@@ -114,6 +115,17 @@ type Order struct {
 // ==================== PASSWORD RESET ====================
 
 type PasswordResetToken struct {
+	ID         uuid.UUID  `json:"id"`
+	CustomerID uuid.UUID  `json:"customer_id"`
+	Token      string     `json:"token"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	UsedAt     *time.Time `json:"used_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// ==================== EMAIL VERIFICATION ====================
+
+type EmailVerificationToken struct {
 	ID         uuid.UUID  `json:"id"`
 	CustomerID uuid.UUID  `json:"customer_id"`
 	Token      string     `json:"token"`
@@ -135,7 +147,6 @@ type AuditLog struct {
 
 // ==================== BOT SCHEDULE ====================
 
-// BotSchedule representa la configuración de horario de operación de los bots.
 type BotSchedule struct {
 	ID        int       `json:"id"`
 	Enabled   bool      `json:"enabled"`
@@ -145,7 +156,6 @@ type BotSchedule struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// BotScheduleRequest es el body del PUT /admin/bot-schedule
 type BotScheduleRequest struct {
 	Enabled   bool   `json:"enabled"`
 	StartHour int    `json:"start_hour" binding:"min=0,max=23"`
@@ -244,6 +254,7 @@ type CustomerPublic struct {
 	KCBalance       int       `json:"kc_balance"`
 	DiscordID       *string   `json:"discord_id,omitempty"`
 	DiscordUsername *string   `json:"discord_username,omitempty"`
+	IsVerified      bool      `json:"is_verified"`
 	CreatedAt       time.Time `json:"created_at"`
 }
 
