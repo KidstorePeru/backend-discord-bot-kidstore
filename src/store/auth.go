@@ -66,7 +66,7 @@ func HandlerRegister(database *sql.DB, secretKey string, cfg types.EnvConfig) gi
 			}
 		}
 
-		go sendVerificationEmail(cfg, req.Email, verificationToken, req.EpicUsername, lang)
+		sendVerificationEmail(cfg, req.Email, verificationToken, req.EpicUsername, lang)
 
 		c.JSON(http.StatusOK, gin.H{
 			"success":               true,
