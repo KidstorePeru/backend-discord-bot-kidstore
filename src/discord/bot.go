@@ -1173,7 +1173,7 @@ func fetchShopItems(lang string) []shopItem {
 		if e.Bundle != nil { name = e.Bundle.Name } else if len(e.BrItems) > 0 { name = e.BrItems[0].Name } else if len(e.Tracks) > 0 { name = e.Tracks[0].Title }
 		if e.Layout != nil { section = e.Layout.Name }
 		if name == "" { continue }
-		kc := int(math.Ceil(float64(e.FinalPrice) * 0.5))
+		kc := int(math.Ceil(float64(e.FinalPrice) * 1))
 		items = append(items, shopItem{OfferID: e.OfferId, Name: name, VBucks: e.FinalPrice, KC: kc, Section: section})
 	}
 	return items
