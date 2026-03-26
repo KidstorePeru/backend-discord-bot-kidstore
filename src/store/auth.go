@@ -66,7 +66,7 @@ func HandlerRegister(database *sql.DB, secretKey string, cfg types.EnvConfig) gi
 			}
 		}
 
-		sendVerificationEmail(cfg, req.Email, verificationToken, req.EpicUsername, lang)
+		go sendVerificationEmail(cfg, req.Email, verificationToken, req.EpicUsername, lang)
 
 		c.JSON(http.StatusOK, gin.H{
 			"success":               true,
@@ -197,7 +197,6 @@ func HandlerResendVerification(database *sql.DB, cfg types.EnvConfig) gin.Handle
 		// Buscar registro pendiente primero
 		pending, err := db.GetPendingRegistrationByEmail(database, body.Email)
 		if err == nil {
-			// Generar nuevo token
 			tokenBytes := make([]byte, 32)
 			rand.Read(tokenBytes)
 			newToken := hex.EncodeToString(tokenBytes)
@@ -210,7 +209,6 @@ func HandlerResendVerification(database *sql.DB, cfg types.EnvConfig) gin.Handle
 		// Buscar cuenta ya existente no verificada
 		customer, err := db.GetCustomerByEmail(database, body.Email)
 		if err != nil {
-			// Siempre OK para no revelar si el email existe
 			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un nuevo enlace."})
 			return
 		}
@@ -242,7 +240,6 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 
 		customer, err := db.GetCustomerByEmail(database, req.Email)
 		if err != nil {
-			// Verificar si hay un registro pendiente con ese email
 			if db.PendingRegistrationExists(database, req.Email) {
 				c.JSON(http.StatusForbidden, gin.H{
 					"success":               false,
@@ -414,23 +411,20 @@ func HandlerForgotPassword(database *sql.DB, cfg types.EnvConfig) gin.HandlerFun
 
 		customer, err := db.GetCustomerByEmail(database, req.Email)
 		if err != nil {
-    		fmt.Printf("[Debug] GetCustomerByEmail error para %s: %v\n", req.Email, err)
-    		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un enlace"})
-    		return
-}
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un enlace de recuperación"})
+			return
+		}
 
 		tokenBytes := make([]byte, 32)
 		rand.Read(tokenBytes)
 		token := hex.EncodeToString(tokenBytes)
 
-		fmt.Printf("[Debug] Creando token para customerID: %s, token: %s\n", customer.ID, token)
-if err := db.CreatePasswordResetToken(database, customer.ID, token); err != nil {
-    fmt.Printf("[Debug] Error creando token: %v\n", err)
-    c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error interno"})
-    return
-}
-fmt.Printf("[Debug] Token creado exitosamente\n")
-go sendResetEmail(cfg, req.Email, token, customer.EpicUsername, lang)
+		if err := db.CreatePasswordResetToken(database, customer.ID, token); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error interno"})
+			return
+		}
+
+		go sendResetEmail(cfg, req.Email, token, customer.EpicUsername, lang)
 
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un enlace de recuperación"})
 	}
@@ -532,7 +526,6 @@ func sendVerificationEmail(cfg types.EnvConfig, toEmail, token, username, lang s
 	}
 
 	es := lang != "en"
-
 	subject := "Verifica tu cuenta — KidStorePeru"
 	if !es { subject = "Verify your account — KidStorePeru" }
 
@@ -562,7 +555,6 @@ func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) 
 
 	es := lang != "en"
 	resetURL := fmt.Sprintf("%s/reset-password?token=%s", cfg.FrontendURL, token)
-
 	subject := "Recuperar contraseña — KidStorePeru"
 	if !es { subject = "Reset your password — KidStorePeru" }
 
@@ -577,7 +569,11 @@ func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) 
 		cfg.SMTPFrom, toEmail, subject, htmlBody)
 
 	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
-	smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg))
+	if err := smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg)); err != nil {
+		fmt.Printf("[Email] Error enviando reset a %s: %v\n", toEmail, err)
+	} else {
+		fmt.Printf("[Email] Reset enviado a %s\n", toEmail)
+	}
 }
 
 // ── Templates HTML de emails ──
@@ -597,7 +593,7 @@ func emailBase(title, preheader, content string) string {
     <table width="100%%" cellpadding="0" cellspacing="0" style="max-width:560px;">
       <!-- Header -->
       <tr><td align="center" style="background:linear-gradient(135deg,#1a0a2e 0%%,#0d1117 100%%);border-radius:20px 20px 0 0;padding:40px 40px 32px;">
-        <img src="https://kidstoreperu.com/logotipo.png" alt="KidStorePeru" width="160" style="display:block;margin:0 auto 20px;max-width:160px;"/>
+        <img src="https://www.kidstoreperu.net/logotipo.png" alt="KidStorePeru" width="160" style="display:block;margin:0 auto 20px;max-width:160px;"/>
         <div style="width:48px;height:3px;background:linear-gradient(90deg,#7c3aed,#a855f7);border-radius:2px;margin:0 auto;"></div>
       </td></tr>
       <!-- Body -->
@@ -608,9 +604,9 @@ func emailBase(title, preheader, content string) string {
       <tr><td align="center" style="background:#080810;border-radius:0 0 20px 20px;padding:24px 40px;border:1px solid #1e1e3a;border-top:none;">
         <p style="margin:0 0 8px;font-size:12px;color:#4a4a6a;">KidStorePeru — La tienda de Fortnite más confiable 🎮</p>
         <p style="margin:0;font-size:11px;color:#3a3a5a;">
-          <a href="https://kidstoreperu.com" style="color:#7c3aed;text-decoration:none;">kidstoreperu.com</a>
+          <a href="https://www.kidstoreperu.net" style="color:#7c3aed;text-decoration:none;">kidstoreperu.net</a>
           &nbsp;·&nbsp;
-          <a href="https://kidstoreperu.com/privacy" style="color:#4a4a6a;text-decoration:none;">Privacidad</a>
+          <a href="https://www.kidstoreperu.net/privacy" style="color:#4a4a6a;text-decoration:none;">Privacidad</a>
         </p>
       </td></tr>
     </table>
