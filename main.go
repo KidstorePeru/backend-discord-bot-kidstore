@@ -60,8 +60,27 @@ func main() {
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
 
+	// Construir lista de orígenes permitidos incluyendo siempre los dominios de producción
+	allowedOrigins := []string{
+		"https://www.kidstoreperu.net",
+		"https://kidstoreperu.net",
+		"https://frontend-discord-bot-kidstore-production.up.railway.app",
+		"http://localhost:5173",
+		"http://localhost:5174",
+		"http://localhost:3000",
+	}
+	// Añadir FRONTEND_URL si es diferente a los anteriores
+	if cfg.FrontendURL != "" {
+		found := false
+		for _, o := range allowedOrigins {
+			if o == cfg.FrontendURL { found = true; break }
+		}
+		if !found { allowedOrigins = append(allowedOrigins, cfg.FrontendURL) }
+	}
+	fmt.Printf("🌐 CORS orígenes permitidos: %v\n", allowedOrigins)
+
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{cfg.FrontendURL, "http://localhost:5173", "http://localhost:5174", "http://localhost:3000"},
+		AllowOrigins:     allowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Admin-Key", "X-Approved-By", "X-Lang"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -92,11 +111,11 @@ func main() {
 	authGroup := router.Group("/store")
 	authGroup.Use(middleware.RateLimitMiddleware(authLimiter))
 	{
-		authGroup.POST("/register",              store.HandlerRegister(database, cfg.SecretKey, cfg))
-		authGroup.POST("/login",                 store.HandlerLogin(database, cfg.SecretKey))
-		authGroup.POST("/forgot-password",       store.HandlerForgotPassword(database, cfg))
-		authGroup.POST("/reset-password",        store.HandlerResetPassword(database))
-		authGroup.POST("/resend-verification",   store.HandlerResendVerification(database, cfg))
+		authGroup.POST("/register",            store.HandlerRegister(database, cfg.SecretKey, cfg))
+		authGroup.POST("/login",               store.HandlerLogin(database, cfg.SecretKey))
+		authGroup.POST("/forgot-password",     store.HandlerForgotPassword(database, cfg))
+		authGroup.POST("/reset-password",      store.HandlerResetPassword(database))
+		authGroup.POST("/resend-verification", store.HandlerResendVerification(database, cfg))
 	}
 
 	router.GET("/store/shop",        store.HandlerGetShop)
@@ -106,10 +125,10 @@ func main() {
 	customer := router.Group("/store")
 	customer.Use(middleware.CustomerAuthMiddleware(cfg.SecretKey))
 	{
-		customer.GET("/me",               store.HandlerMe(database))
-		customer.GET("/orders",           store.HandlerGetMyOrders(database))
-		customer.PUT("/profile",          store.HandlerUpdateProfile(database, cfg.SecretKey))
-		customer.POST("/link-discord",    store.HandlerLinkDiscord(database))
+		customer.GET("/me",                store.HandlerMe(database))
+		customer.GET("/orders",            store.HandlerGetMyOrders(database))
+		customer.PUT("/profile",           store.HandlerUpdateProfile(database, cfg.SecretKey))
+		customer.POST("/link-discord",     store.HandlerLinkDiscord(database))
 		customer.DELETE("/unlink-discord", store.HandlerUnlinkDiscord(database))
 		customer.POST("/order",
 			middleware.RateLimitMiddleware(orderLimiter),
