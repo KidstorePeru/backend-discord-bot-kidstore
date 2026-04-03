@@ -2,6 +2,7 @@ package main
 
 import (
 	"KidStoreStore/src/admin"
+	"KidStoreStore/src/autobuyer"
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/discord"
 	"KidStoreStore/src/fortnite"
@@ -12,6 +13,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,7 +39,31 @@ func main() {
 		log.Fatalf("Error procesando variables de entorno: %v", err)
 	}
 
-	fortnite.Init(cfg.EpicClient, cfg.EpicSecret)
+	fortnite.Init(cfg.EpicClient, cfg.EpicSecret, cfg.EncryptionKey)
+	store.SetEncryptionKey(cfg.EncryptionKey)
+	store.SetExchangeRateAPIKey(cfg.ExchangeRateAPIKey)
+	store.SetSMTPConfig(cfg)
+	store.SetPaymentInfoJSON(cfg.PaymentInfoJSON)
+	// Groq AI removed — chatbot now connects directly to autobuyer V2
+
+	// Determine backend URL for webhooks
+	backendURL := fmt.Sprintf("http://localhost:%s", cfg.Port)
+	if cfg.FrontendURL != "http://localhost:5173" {
+		// Production: derive backend URL from frontend URL pattern
+		backendURL = "https://backend-discord-bot-kidstore-production.up.railway.app"
+	}
+	store.SetPaymentConfig(store.PaymentConfig{
+		MercadoPagoToken:    cfg.MercadoPagoAccessToken,
+		PayPalClientID:      cfg.PayPalClientID,
+		PayPalClientSecret:  cfg.PayPalClientSecret,
+		PayPalMode:          cfg.PayPalMode,
+		NOWPaymentsAPIKey:   cfg.NOWPaymentsAPIKey,
+		FrontendURL:         cfg.FrontendURL,
+		BackendURL:          backendURL,
+	})
+
+	autobuyer.Init(cfg.AutobuyerURL, cfg.AutobuyerAPIKey)
+	store.SetActivationBackendURL(backendURL)
 
 	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName)
@@ -45,11 +71,23 @@ func main() {
 	if err != nil { log.Fatalf("Error abriendo DB: %v", err) }
 	defer database.Close()
 
+	database.SetMaxOpenConns(25)
+	database.SetMaxIdleConns(10)
+	database.SetConnMaxLifetime(5 * time.Minute)
+	database.SetConnMaxIdleTime(3 * time.Minute)
+
 	if err := database.Ping(); err != nil { log.Fatalf("Error conectando a DB: %v", err) }
-	fmt.Println("✅ Conectado a PostgreSQL")
+	slog.Info("Conectado a PostgreSQL")
 
 	if err := db.CreateTables(database); err != nil { log.Fatalf("Error creando tablas: %v", err) }
-	fmt.Println("✅ Tablas verificadas")
+	slog.Info("Tablas verificadas")
+
+	if cfg.EncryptionKey != "" {
+		if err := db.MigrateEncryptTokens(database, cfg.EncryptionKey); err != nil {
+			log.Fatalf("Error migrando tokens encriptados: %v", err)
+		}
+		slog.Info("Tokens encriptados verificados")
+	}
 
 	authLimiter  := middleware.NewIPRateLimiter(5, time.Minute)
 	orderLimiter := middleware.NewIPRateLimiter(10, time.Minute)
@@ -77,7 +115,7 @@ func main() {
 		}
 		if !found { allowedOrigins = append(allowedOrigins, cfg.FrontendURL) }
 	}
-	fmt.Printf("🌐 CORS orígenes permitidos: %v\n", allowedOrigins)
+	slog.Info("CORS configurado", "origins", allowedOrigins)
 
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,
@@ -116,17 +154,38 @@ func main() {
 		authGroup.POST("/forgot-password",     store.HandlerForgotPassword(database, cfg))
 		authGroup.POST("/reset-password",      store.HandlerResetPassword(database))
 		authGroup.POST("/resend-verification", store.HandlerResendVerification(database, cfg))
+		authGroup.POST("/refresh-token",      store.HandlerRefreshToken(database, cfg.SecretKey))
 	}
 
-	router.GET("/store/shop",        store.HandlerGetShop)
-	router.GET("/store/bots-status", store.HandlerBotsStatus(database))
+	// Payment webhooks (public, no auth — called by gateways)
+	router.POST("/store/webhook/mercadopago", store.HandlerMercadoPagoWebhook(database))
+	router.POST("/store/webhook/paypal",      store.HandlerPayPalWebhook(database))
+	router.POST("/store/webhook/nowpayments", store.HandlerNOWPaymentsWebhook(database))
+	router.POST("/store/paypal-capture",       store.HandlerPayPalCapture(database))
+	router.POST("/store/webhook/autobuyer",   store.HandlerAutobuyerWebhook(database))
+	router.GET("/store/shop",            store.HandlerGetShop)
+	router.GET("/store/bots-status",     store.HandlerBotsStatus(database))
+	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
+	router.GET("/store/product-available/:id", admin.HandlerCheckProductAvailable(database))
+	router.GET("/store/discord-lang/:discord_id", func(c *gin.Context) {
+		lang, err := db.GetDiscordLang(database, c.Param("discord_id"))
+		if err != nil || lang == "" { lang = "es" }
+		c.JSON(200, gin.H{"lang": lang})
+	})
 
 	// ── Rutas de cliente (JWT requerido) ──
 	customer := router.Group("/store")
 	customer.Use(middleware.CustomerAuthMiddleware(cfg.SecretKey))
 	{
 		customer.GET("/me",                store.HandlerMe(database))
+		customer.GET("/payment-info",      store.HandlerGetPaymentInfo())
+		customer.POST("/payment",              middleware.RateLimitMiddleware(orderLimiter), store.HandlerCreatePayment(database))
+		customer.GET("/payment-status/:id",    store.HandlerPaymentStatus(database))
+		customer.POST("/activate",             store.HandlerActivate(database))
+		customer.GET("/activation-status/:code", store.HandlerActivationStatus(database))
+		customer.POST("/activation-input/:code", store.HandlerActivationInput(database))
 		customer.GET("/orders",            store.HandlerGetMyOrders(database))
+		customer.GET("/recharges",         store.HandlerGetMyRecharges(database))
 		customer.PUT("/profile",           store.HandlerUpdateProfile(database, cfg.SecretKey))
 		customer.POST("/link-discord",     store.HandlerLinkDiscord(database))
 		customer.DELETE("/unlink-discord", store.HandlerUnlinkDiscord(database))
@@ -148,6 +207,9 @@ func main() {
 		adminGroup.POST("/recharge",        admin.HandlerRechargeKC(database))
 		adminGroup.GET("/orders",           admin.HandlerGetAllOrders(database))
 		adminGroup.GET("/stats",            admin.HandlerGetStats(database))
+		adminGroup.GET("/payments",         admin.HandlerGetAllPayments(database))
+		adminGroup.GET("/product-availability",  admin.HandlerGetProductAvailability(database))
+		adminGroup.PUT("/product-availability",  admin.HandlerUpdateProductAvailability(database))
 		adminGroup.GET("/bot-schedule",     admin.HandlerGetBotSchedule(database))
 		adminGroup.PUT("/bot-schedule",     admin.HandlerUpdateBotSchedule(database))
 		adminGroup.GET("/bots",             fortnite.HandlerGetBotAccounts(database))
@@ -162,13 +224,14 @@ func main() {
 	// ── Discord Bot ──
 	var discordSession interface{ Close() error }
 	if cfg.DiscordBotToken != "" {
-		session, err := discord.StartBot(database, cfg.DiscordBotToken)
+		session, err := discord.StartBot(database, cfg.DiscordBotToken, cfg.DiscordGuildID)
 		if err != nil {
-			fmt.Printf("⚠️ Error iniciando bot de Discord: %v\n", err)
+			slog.Warn("Error iniciando bot de Discord", "error", err)
 		} else {
 			discordSession = session
 			store.SetDiscordNotifier(discord.SendOrderNotification)
-			fmt.Println("✅ Bot de Discord iniciado")
+			store.SetProductPurchaseNotifier(discord.SendProductPurchaseNotification)
+			slog.Info("Bot de Discord iniciado")
 		}
 	}
 
@@ -177,14 +240,14 @@ func main() {
 	store.StartOrderWorker(workerCtx, database)
 	fortnite.StartFriendRequestAcceptor(database, 300)
 	fortnite.StartTokenHealthCheck(database, cfg.BotCheckInterval)
-	fmt.Println("✅ Workers iniciados: pedidos, amigos, health check de tokens")
+	slog.Info("Workers iniciados", "workers", "pedidos, amigos, health check")
 
 	port := cfg.Port
 	if port == "" { port = "8081" }
 	srv := &http.Server{Addr: ":" + port, Handler: router}
 
 	go func() {
-		fmt.Printf("🚀 KidStore Store API corriendo en puerto %s\n", port)
+		slog.Info("KidStore Store API iniciado", "port", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Error iniciando servidor: %v", err)
 		}
@@ -193,14 +256,14 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	fmt.Println("\n⏳ Apagando servidor...")
+	slog.Info("Apagando servidor...")
 	workerCancel()
 	if discordSession != nil {
 		discordSession.Close()
-		fmt.Println("✅ Bot de Discord desconectado")
+		slog.Info("Bot de Discord desconectado")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)
-	fmt.Println("✅ Servidor detenido limpiamente.")
+	slog.Info("Servidor detenido limpiamente")
 }

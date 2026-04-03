@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"strings"
@@ -96,6 +97,7 @@ func (r *ratesCache) refresh() {
 
 // ── Sesión global ──
 var BotSession *discordgo.Session
+var Database *sql.DB
 
 // botHandlersRegistered evita registrar handlers duplicados si StartBot se llama más de una vez
 var botHandlersRegistered bool
@@ -160,7 +162,11 @@ func setUserLang(database *sql.DB, discordID, lang string) {
 }
 
 // ── StartBot ──
-func StartBot(database *sql.DB, botToken string) (*discordgo.Session, error) {
+var guildID string
+
+func StartBot(database *sql.DB, botToken, discordGuildID string) (*discordgo.Session, error) {
+	guildID = discordGuildID
+	Database = database
 	dg, err := discordgo.New("Bot " + botToken)
 	if err != nil { return nil, fmt.Errorf("error creando sesión Discord: %w", err) }
 	dg.Identify.Intents = discordgo.IntentsGuildMessages |
@@ -181,9 +187,36 @@ func StartBot(database *sql.DB, botToken string) (*discordgo.Session, error) {
 	if err := dg.Open(); err != nil { return nil, fmt.Errorf("error conectando al bot: %w", err) }
 
 	BotSession = dg
+
+	// Slash commands are handled by Autobuyer V2 Python bot — don't touch them here
+
 	go rates.refresh()
-	fmt.Printf("🤖 Bot de Discord iniciado — prefijo: %s\n", getPrefix())
+	slog.Info("Bot de Discord iniciado", "prefix", getPrefix())
 	return dg, nil
+}
+
+
+// Slash commands removed — now handled by Autobuyer V2 Python bot
+
+// ── SendProductPurchaseNotification — notifies admin via DM ──
+func SendProductPurchaseNotification(productName, epicUsername, gateway string, amountPEN float64) {
+	if BotSession == nil { return }
+	// Notify all bot admins
+	admins, err := db.GetBotAdmins(Database)
+	if err != nil || len(admins) == 0 { return }
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "🛒 Nueva compra de producto",
+		Description: fmt.Sprintf("**%s** compró **%s**\nPasarela: **%s**\nMonto: **S/ %.2f**\n\n⚠️ *Pendiente de entrega*", epicUsername, productName, gateway, amountPEN),
+		Color:       0xf59e0b,
+		Footer:      &discordgo.MessageEmbedFooter{Text: "KidStorePeru — Fulfillment pendiente"},
+	}
+
+	for _, adminID := range admins {
+		ch, err := BotSession.UserChannelCreate(adminID)
+		if err != nil { continue }
+		BotSession.ChannelMessageSendEmbed(ch.ID, embed)
+	}
 }
 
 // ── SendOrderNotification ──
@@ -324,6 +357,20 @@ func messageHandler(database *sql.DB) func(*discordgo.Session, *discordgo.Messag
 		case "vincular", "link":
 			sendLink(s, m.ChannelID, m.Author.ID, m.Author.Username, lang)
 
+		case "activar", "activate":
+			if es { s.ChannelMessageSend(m.ChannelID, "💡 Usa `/activar` para activar tu producto de forma privada.")
+			} else { s.ChannelMessageSend(m.ChannelID, "💡 Use `/activar` to activate your product privately.") }
+
+		case "region":
+			if es { s.ChannelMessageSend(m.ChannelID, "💡 Usa `/region` para ver tu region o `/verificar` para comprobar elegibilidad de cambio.")
+			} else { s.ChannelMessageSend(m.ChannelID, "💡 Use `/region` to check your region or `/verificar` to check change eligibility.") }
+
+		case "verificar", "verify":
+			if es { s.ChannelMessageSend(m.ChannelID, "💡 Usa `/verificar` para comprobar si eres elegible para cambio de region.")
+			} else { s.ChannelMessageSend(m.ChannelID, "💡 Use `/verificar` to check if you're eligible for region change.") }
+
+
+
 		default:
 			if es {
 				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("❓ Comando **`%s%s`** no reconocido. Usa **`%sayuda`** para ver los comandos.", pfx, cmd, pfx))
@@ -367,7 +414,7 @@ func manageKC(s *discordgo.Session, channelID string, database *sql.DB, args []s
 	var newBalance int
 	note := "Ajuste manual via Discord bot por admin"
 	if amount > 0 {
-		if err := db.RechargeKC(database, customer.ID, amount, nil, &note, "discord-admin"); err != nil { s.ChannelMessageSend(channelID, fmt.Sprintf("❌ Error: %s", err.Error())); return }
+		if err := db.RechargeKC(database, customer.ID, amount, nil, &note, "discord-admin", "manual"); err != nil { s.ChannelMessageSend(channelID, fmt.Sprintf("❌ Error: %s", err.Error())); return }
 		newBalance = customer.KCBalance + amount
 	} else {
 		deduct := -amount
@@ -463,8 +510,20 @@ func sendSchedule(s *discordgo.Session, channelID, userID string, database *sql.
 // ── Handler de interacciones ──
 func interactionHandler(database *sql.DB) func(*discordgo.Session, *discordgo.InteractionCreate) {
 	return func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		// Slash commands are now handled by the Autobuyer V2 Python bot
+		if i.Type == discordgo.InteractionApplicationCommand { return }
+
 		if i.Type != discordgo.InteractionMessageComponent { return }
 		data := i.MessageComponentData()
+
+		// Only handle interactions from the Go bot (nav_menu, shop, buy).
+		// All other interactions belong to the Autobuyer V2 Python bot — ignore them.
+		goKnownPrefixes := []string{"nav_menu_", "shop_page_", "shop_select_", "buy_confirm_", "buy_cancel_"}
+		isGoBotInteraction := false
+		for _, prefix := range goKnownPrefixes {
+			if strings.HasPrefix(data.CustomID, prefix) { isGoBotInteraction = true; break }
+		}
+		if !isGoBotInteraction { return }
 
 		userID := ""
 		if i.Member != nil && i.Member.User != nil { userID = i.Member.User.ID } else if i.User != nil { userID = i.User.ID }
@@ -575,28 +634,88 @@ func navMenu(userID, lang string) discordgo.MessageComponent {
 func sendHelp(s *discordgo.Session, channelID, userID, lang string) {
 	es := lang == "es"
 	pfx := getPrefix()
-	var desc, linksTitle, linksVal string
+
+	var textCmds, slashCmds, adminCmds, linksTitle, linksVal string
 	if es {
-		desc = fmt.Sprintf(
-			"**» Menú de ayuda**\n¡Aquí encontrarás todos los comandos disponibles!\nUsa `%shelp <comando>` para ver detalles.\n\n**» Categorías**\n`%ssaldo` :: %s  Ver tu balance de KidCoins\n`%srecargar` :: 💳  Ver paquetes KC con precios\n`%sperfil` :: 👤  Ver tu perfil completo\n`%svincular` :: 🔗  Cómo vincular tu cuenta\n`%slang es/en` :: 🌐  Cambiar idioma\n`%stienda` :: 🛒  Link a la tienda de Fortnite\n`%scomprar [item]` :: 🎮  Buscar y comprar un ítem\n`%spedidos` :: 📦  Ver tus últimos pedidos\n`%sagregar` :: 🤖  Cuentas bot a agregar en Epic\n`%shorario` :: 🕐  Ver horario de los bots",
-			pfx, pfx, kcCoin, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
+		textCmds = fmt.Sprintf(
+			"`%ssaldo` :: %s  Ver tu balance de KidCoins\n"+
+			"`%srecargar` :: 💳  Ver paquetes KC con precios\n"+
+			"`%sperfil` :: 👤  Ver tu perfil completo\n"+
+			"`%spedidos` :: 📦  Ver tus ultimos pedidos\n"+
+			"`%scomprar [item]` :: 🎮  Buscar y comprar un item con KC\n"+
+			"`%stienda` :: 🛒  Link a la tienda de Fortnite\n"+
+			"`%svincular` :: 🔗  Como vincular tu cuenta\n"+
+			"`%sagregar` :: 🤖  Cuentas bot para agregar en Epic\n"+
+			"`%shorario` :: 🕐  Horario de operacion de bots\n"+
+			"`%slang es/en` :: 🌐  Cambiar idioma",
+			pfx, kcCoin, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
 		)
-		linksTitle = "**» Enlaces útiles**"
-		linksVal   = fmt.Sprintf("🌐 [Website](%s) | 📖 [FAQ](%s/faq) | 📜 [Términos y Condiciones](%s/terms)\n🔒 [Política de Privacidad](%s/privacy) | 💸 [Política de Reembolsos](%s/refunds)", storeURL, storeURL, storeURL, storeURL, storeURL)
+		slashCmds = "" +
+			"`/region` :: 🌍  Ver region de tu cuenta Epic\n" +
+			"`/verify` :: 🔍  Comprobar elegibilidad para cambio de region\n" +
+			"`/activate <code>` :: 🚀  Activar producto comprado\n" +
+			"`/cancel` :: 🛑  Cancelar compra activa\n" +
+			"`/pin <valor>` :: 🔑  Enviar PIN de control parental\n" +
+			"`/code <valor>` :: 📧  Enviar codigo de verificacion\n" +
+			"`/support` :: 📞  Contactar soporte\n" +
+			"`/vbucks` :: 🎮  Comprar V-Bucks\n" +
+			"`/fncrew` :: 👑  Club de Fortnite\n" +
+			"`/fnpacks` :: 📦  Packs de Fortnite\n" +
+			"`/rlcredits` :: 🚀  RL Credits\n" +
+			"`/epicgames` :: 🎮  Juegos de Epic Games"
+		adminCmds = fmt.Sprintf(
+			"`%ssetprefix [nuevo]` :: ⚙️  Cambiar prefijo del bot\n"+
+			"`%skc @usuario +/-cantidad` :: 💰  Gestionar KC de un usuario",
+			pfx, pfx,
+		)
+		linksTitle = "» Enlaces utiles"
+		linksVal = fmt.Sprintf("🌐 [Website](%s) · 📖 [FAQ](%s/faq) · 📜 [Terminos](%s/terms) · 🔒 [Privacidad](%s/privacy) · 💸 [Reembolsos](%s/refunds)", storeURL, storeURL, storeURL, storeURL, storeURL)
 	} else {
-		desc = fmt.Sprintf(
-			"**» Help Menu**\nHere you'll find all available commands!\nUse `%shelp <command>` for details.\n\n**» Categories**\n`%sbalance` :: %s  Check your KidCoins balance\n`%srecharge` :: 💳  View KC packages with prices\n`%sprofile` :: 👤  View your full profile\n`%slink` :: 🔗  How to link your account\n`%slang es/en` :: 🌐  Change language\n`%sshop` :: 🛒  Link to the Fortnite store\n`%sbuy [item]` :: 🎮  Search and buy an item\n`%sorders` :: 📦  View your recent orders\n`%sadd` :: 🤖  Bot accounts to add in Epic\n`%sschedule` :: 🕐  View bot working hours",
-			pfx, pfx, kcCoin, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
+		textCmds = fmt.Sprintf(
+			"`%sbalance` :: %s  Check your KidCoins balance\n"+
+			"`%srecharge` :: 💳  View KC packages with prices\n"+
+			"`%sprofile` :: 👤  View your full profile\n"+
+			"`%sorders` :: 📦  View your recent orders\n"+
+			"`%sbuy [item]` :: 🎮  Search and buy an item with KC\n"+
+			"`%sshop` :: 🛒  Link to the Fortnite store\n"+
+			"`%slink` :: 🔗  How to link your account\n"+
+			"`%sadd` :: 🤖  Bot accounts to add in Epic\n"+
+			"`%sschedule` :: 🕐  Bot working hours\n"+
+			"`%slang es/en` :: 🌐  Change language",
+			pfx, kcCoin, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
 		)
-		linksTitle = "**» Useful links**"
-		linksVal   = fmt.Sprintf("🌐 [Website](%s) | 📖 [FAQ](%s/faq) | 📜 [Terms & Conditions](%s/terms)\n🔒 [Privacy Policy](%s/privacy) | 💸 [Refund Policy](%s/refunds)", storeURL, storeURL, storeURL, storeURL, storeURL)
+		slashCmds = "" +
+			"`/region` :: 🌍  Check Epic account region\n" +
+			"`/verify` :: 🔍  Check region change eligibility\n" +
+			"`/activate <code>` :: 🚀  Activate purchased product\n" +
+			"`/cancel` :: 🛑  Cancel active purchase\n" +
+			"`/pin <value>` :: 🔑  Send parental control PIN\n" +
+			"`/code <value>` :: 📧  Send verification code\n" +
+			"`/support` :: 📞  Contact support\n" +
+			"`/vbucks` :: 🎮  V-Bucks\n" +
+			"`/fncrew` :: 👑  Fortnite Club\n" +
+			"`/fnpacks` :: 📦  Fortnite Packs\n" +
+			"`/rlcredits` :: 🚀  RL Credits\n" +
+			"`/epicgames` :: 🎮  Epic Games"
+		adminCmds = fmt.Sprintf(
+			"`%ssetprefix [new]` :: ⚙️  Change bot prefix\n"+
+			"`%skc @user +/-amount` :: 💰  Manage user KC",
+			pfx, pfx,
+		)
+		linksTitle = "» Useful links"
+		linksVal = fmt.Sprintf("🌐 [Website](%s) · 📖 [FAQ](%s/faq) · 📜 [Terms](%s/terms) · 🔒 [Privacy](%s/privacy) · 💸 [Refunds](%s/refunds)", storeURL, storeURL, storeURL, storeURL, storeURL)
 	}
+
 	embed := &discordgo.MessageEmbed{
-		Title:       "🎮 KidStorePeru Bot — " + func() string { if es { return "Centro de Ayuda" }; return "Help Center" }(),
-		Description: desc,
-		Color:       0x7c3aed,
+		Title: "🎮 KidStorePeru Bot — " + func() string { if es { return "Centro de Ayuda" }; return "Help Center" }(),
+		Color: 0x7c3aed,
 		Fields: []*discordgo.MessageEmbedField{
-			{Name: "\u200b", Value: "\u200b"},
+			{Name: func() string { if es { return "📝 Comandos de texto" }; return "📝 Text commands" }(),
+				Value: textCmds},
+			{Name: func() string { if es { return "⚡ Slash commands (privados)" }; return "⚡ Slash commands (private)" }(),
+				Value: slashCmds},
+			{Name: func() string { if es { return "🔐 Admin" }; return "🔐 Admin" }(),
+				Value: adminCmds},
 			{Name: linksTitle, Value: linksVal},
 		},
 		Footer: &discordgo.MessageEmbedFooter{Text: " © Kiddarkness "},
@@ -684,7 +803,7 @@ func sendOrders(s *discordgo.Session, channelID, userID string, database *sql.DB
 
 func ordersEmbed(database *sql.DB, c types.Customer, lang string) *discordgo.MessageEmbed {
 	es := lang == "es"
-	orders, err := db.GetOrdersByCustomer(database, c.ID)
+	orders, _, err := db.GetOrdersByCustomer(database, c.ID, 1, 10)
 	if err != nil || len(orders) == 0 {
 		msg := "*No tienes pedidos registrados aún.*"; if !es { msg = "*No orders registered yet.*" }
 		return &discordgo.MessageEmbed{Description: "📭 " + msg, Color: 0x3b82f6}

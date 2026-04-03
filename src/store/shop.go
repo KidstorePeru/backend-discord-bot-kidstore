@@ -10,15 +10,108 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// ==================== PAYMENT INFO ====================
+
+var paymentInfoJSON string
+
+func SetPaymentInfoJSON(json string) {
+	paymentInfoJSON = json
+}
+
+func HandlerGetPaymentInfo() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if paymentInfoJSON == "" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "error": "payment info not configured"})
+			return
+		}
+		c.Data(http.StatusOK, "application/json", []byte(paymentInfoJSON))
+	}
+}
+
+// ==================== EXCHANGE RATES ====================
+
+type ratesCacheEntry struct {
+	body      []byte
+	fetchedAt time.Time
+}
+
+var (
+	ratesCacheMu  sync.RWMutex
+	ratesCacheVal *ratesCacheEntry
+	ratesTTL      = 24 * time.Hour
+	ratesClient   = &http.Client{Timeout: 10 * time.Second}
+)
+
+var exchangeRateAPIKey string
+
+func SetExchangeRateAPIKey(key string) {
+	exchangeRateAPIKey = key
+}
+
+func HandlerGetExchangeRates(c *gin.Context) {
+	ratesCacheMu.RLock()
+	cached := ratesCacheVal
+	ratesCacheMu.RUnlock()
+
+	if cached != nil && time.Since(cached.fetchedAt) < ratesTTL {
+		c.Data(http.StatusOK, "application/json", cached.body)
+		return
+	}
+
+	if exchangeRateAPIKey == "" {
+		c.JSON(http.StatusOK, gin.H{"USD": 0.27, "EUR": 0.25, "fetchedAt": 0})
+		return
+	}
+
+	apiURL := fmt.Sprintf("https://v6.exchangerate-api.com/v6/%s/latest/PEN", exchangeRateAPIKey)
+	resp, err := ratesClient.Get(apiURL)
+	if err != nil {
+		if cached != nil {
+			c.Data(http.StatusOK, "application/json", cached.body)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"USD": 0.27, "EUR": 0.25, "fetchedAt": 0})
+		return
+	}
+	defer resp.Body.Close()
+
+	var apiResp struct {
+		Result          string             `json:"result"`
+		ConversionRates map[string]float64 `json:"conversion_rates"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil || apiResp.Result != "success" {
+		if cached != nil {
+			c.Data(http.StatusOK, "application/json", cached.body)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"USD": 0.27, "EUR": 0.25, "fetchedAt": 0})
+		return
+	}
+
+	result := gin.H{
+		"USD":       apiResp.ConversionRates["USD"],
+		"EUR":       apiResp.ConversionRates["EUR"],
+		"fetchedAt": time.Now().UnixMilli(),
+	}
+	body, _ := json.Marshal(result)
+
+	ratesCacheMu.Lock()
+	ratesCacheVal = &ratesCacheEntry{body: body, fetchedAt: time.Now()}
+	ratesCacheMu.Unlock()
+
+	c.Data(http.StatusOK, "application/json", body)
+}
 
 // ==================== CACHÉ DE TIENDA ====================
 
@@ -175,37 +268,44 @@ func HandlerGetMyOrders(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
 			return
 		}
-		orders, err := db.GetOrdersByCustomer(database, customerID)
+		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+		orders, total, err := db.GetOrdersByCustomer(database, customerID, page, limit)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo pedidos"})
 			return
 		}
 		if orders == nil { orders = []types.Order{} }
-		c.JSON(http.StatusOK, gin.H{"success": true, "orders": orders})
+		c.JSON(http.StatusOK, gin.H{"success": true, "orders": orders, "total": total, "page": page, "limit": limit})
 	}
 }
 
 // ==================== WORKER ====================
 
 var notifyDiscord func(discordID, status, itemName string, priceKC int, lang string)
+var encryptionKey string
 
 func SetDiscordNotifier(fn func(discordID, status, itemName string, priceKC int, lang string)) {
 	notifyDiscord = fn
 }
 
+func SetEncryptionKey(key string) {
+	encryptionKey = key
+}
+
 func StartOrderWorker(ctx context.Context, database *sql.DB) {
-	fmt.Println("[Worker] Iniciando cola de envíos...")
+	slog.Info("Worker: Iniciando cola de envíos")
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				fmt.Println("[Worker] Detenido.")
+				slog.Info("Worker: Detenido")
 				return
 			case <-ticker.C:
 				inSchedule, reason := db.IsWithinSchedule(database)
-				if !inSchedule { fmt.Printf("[Worker] ⏰ Pausado: %s\n", reason); continue }
+				if !inSchedule { slog.Info("Worker: pausado", "reason", reason); continue }
 				processOrders(database)
 			}
 		}
@@ -216,9 +316,9 @@ func processOrders(database *sql.DB) {
 	orders, err := db.GetPendingOrders(database)
 	if err != nil || len(orders) == 0 { return }
 
-	accounts, err := db.GetActiveGameAccounts(database)
+	accounts, err := db.GetActiveGameAccounts(database, encryptionKey)
 	if err != nil || len(accounts) == 0 {
-		fmt.Println("[Worker] No hay cuentas bot activas disponibles")
+		slog.Warn("Worker: no hay cuentas bot activas disponibles")
 		noBotsMsg := "Sin cuentas bot activas disponibles."
 		for _, order := range orders {
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &noBotsMsg)
@@ -239,7 +339,7 @@ func processOrders(database *sql.DB) {
 
 		// Sin slots: solo procesar el pedido actual y salir del bucle
 		if selectedAccount == nil {
-			fmt.Println("[Worker] Sin slots de regalo en ninguna cuenta bot")
+			slog.Warn("Worker: sin slots de regalo en ninguna cuenta bot")
 			noSlotsMsg := "Todas las cuentas bot han agotado sus envíos del día. Los gifts se resetean diariamente."
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &noSlotsMsg)
 			db.RefundOrder(database, order.ID)
@@ -254,7 +354,7 @@ func processOrders(database *sql.DB) {
 		receiverAccountID, err := fortnite.GetReceiverAccountID(database, *selectedAccount, order.EpicUsername)
 		if err != nil {
 			errMsg := fmt.Sprintf("no se encontró el usuario Epic '%s': %s", order.EpicUsername, err.Error())
-			fmt.Printf("[Worker] ❌ %s\n", errMsg)
+			slog.Error("Worker: error", "msg", errMsg)
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
 			db.RefundOrder(database, order.ID)
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
@@ -266,7 +366,7 @@ func processOrders(database *sql.DB) {
 		isFriend, friendSince, err := fortnite.CheckFriendship(database, *selectedAccount, receiverAccountID)
 		if err != nil || !isFriend {
 			errMsg := fmt.Sprintf("el usuario '%s' no tiene agregado al bot '%s' como amigo", order.EpicUsername, selectedAccount.DisplayName)
-			fmt.Printf("[Worker] ❌ %s\n", errMsg)
+			slog.Error("Worker: error", "msg", errMsg)
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
 			db.RefundOrder(database, order.ID)
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
@@ -279,7 +379,7 @@ func processOrders(database *sql.DB) {
 		if hoursAsFriend < 48 {
 			remaining := 48 - hoursAsFriend
 			errMsg := fmt.Sprintf("amigos hace %.1f horas — faltan %.1f horas para poder recibir regalos", hoursAsFriend, remaining)
-			fmt.Printf("[Worker] ⏳ pedido %s: %s\n", order.ID, errMsg)
+			slog.Info("Worker: pedido pendiente por amistad reciente", "orderID", order.ID, "msg", errMsg)
 			// Solo actualizar el mensaje de error, mantener pending — NO notificar
 			db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
 			continue
@@ -291,16 +391,16 @@ func processOrders(database *sql.DB) {
 
 		if err != nil {
 			errMsg := err.Error()
-			fmt.Printf("[Worker] ❌ Error enviando gift pedido %s: %s\n", order.ID, errMsg)
+			slog.Error("Worker: error enviando gift", "orderID", order.ID, "msg", errMsg)
 			if strings.Contains(errMsg, "token") || strings.Contains(errMsg, "401") ||
 				strings.Contains(errMsg, "403") || strings.Contains(errMsg, "unauthorized") ||
 				strings.Contains(errMsg, "deactivated") {
-				fmt.Printf("[Worker] 🔒 Token inválido para bot %s — marcando como inactivo\n", selectedAccount.DisplayName)
+				slog.Warn("Worker: token invalido, marcando bot como inactivo", "bot", selectedAccount.DisplayName)
 				db.DeactivateGameAccount(database, selectedAccount.ID)
 				selectedAccount.RemainingGifts = 0
 			}
 			if refundErr := db.RefundOrder(database, order.ID); refundErr != nil {
-				fmt.Printf("[Worker] ⚠️ Error reembolsando pedido %s: %s\n", order.ID, refundErr)
+				slog.Warn("Worker: error reembolsando pedido", "orderID", order.ID, "error", refundErr)
 			}
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
@@ -316,9 +416,9 @@ func processOrders(database *sql.DB) {
 
 		if order.PriceVBucks > 0 {
 			if err := db.DeductBotVbucks(database, selectedAccount.ID, order.PriceVBucks); err != nil {
-				fmt.Printf("[Worker] ⚠️ Error descontando pavos del bot %s: %s\n", selectedAccount.DisplayName, err)
+				slog.Warn("Worker: error descontando pavos del bot", "bot", selectedAccount.DisplayName, "error", err)
 			} else {
-				fmt.Printf("[Worker] 💰 Descontados %d pavos del bot %s\n", order.PriceVBucks, selectedAccount.DisplayName)
+				slog.Info("Worker: pavos descontados", "vbucks", order.PriceVBucks, "bot", selectedAccount.DisplayName)
 			}
 		}
 
@@ -327,8 +427,16 @@ func processOrders(database *sql.DB) {
 
 		sendDiscordNotification(database, order, "sent")
 
-		fmt.Printf("[Worker] ✅ Pedido %s enviado: bot %s → %s (%s)\n",
-			order.ID, selectedAccount.DisplayName, order.EpicUsername, order.ItemName)
+		// Send order sent email notification
+		if customer, err := db.GetCustomerByID(database, order.CustomerID); err == nil && customer.Email != nil && *customer.Email != "" {
+			emailLang := "es"
+			if customer.DiscordID != nil {
+				if dl, err := db.GetDiscordLang(database, *customer.DiscordID); err == nil && dl != "" { emailLang = dl }
+			}
+			go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, emailLang)
+		}
+
+		slog.Info("Worker: pedido enviado", "orderID", order.ID, "bot", selectedAccount.DisplayName, "recipient", order.EpicUsername, "item", order.ItemName)
 	}
 }
 
@@ -361,5 +469,3 @@ func ParseShopEntry(data []byte, offerID string) (int, error) {
 	}
 	return 0, fmt.Errorf("offer %s not found in shop", offerID)
 }
-
-var _ = (*discordgo.Session)(nil)

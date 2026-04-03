@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -22,10 +23,12 @@ import (
 
 var epicClient string
 var epicSecret string
+var encryptionKey string
 
-func Init(client, secret string) {
+func Init(client, secret, encKey string) {
 	epicClient = client
 	epicSecret = secret
+	encryptionKey = encKey
 }
 
 func authHeader() string {
@@ -78,7 +81,7 @@ func HandlerConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Error leyendo respuesta de Epic"})
 			return
 		}
-		fmt.Printf("[Epic deviceAuthorization] HTTP %d — Body: %s\n", respDevice.StatusCode, string(deviceBodyBytes))
+		slog.Info("Epic deviceAuthorization", "status", respDevice.StatusCode, "body", string(deviceBodyBytes))
 
 		// Si Epic devolvió error (no 200), retornarlo directamente
 		if respDevice.StatusCode != 200 {
@@ -190,7 +193,7 @@ func HandlerFinishConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 			CreatedAt:           time.Now(),
 			UpdatedAt:           time.Now(),
 		}
-		if err := db.UpsertGameAccount(database, account); err != nil {
+		if err := db.UpsertGameAccount(database, account, encryptionKey); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "No se pudo guardar la cuenta bot", "details": err.Error()})
 			return
 		}
@@ -212,7 +215,7 @@ func HandlerFinishConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 					DeviceID:  secrets.DeviceId,
 					Secret:    secrets.Secret,
 					CreatedAt: time.Now(),
-				})
+				}, encryptionKey)
 			}
 		}
 
@@ -256,7 +259,7 @@ func HandlerDisconnectBotAccount(database *sql.DB) gin.HandlerFunc {
 
 func HandlerGetBotAccounts(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		accounts, err := db.GetAllGameAccounts(database)
+		accounts, err := db.GetAllGameAccounts(database, encryptionKey)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Error obteniendo cuentas bot"})
 			return
@@ -346,12 +349,12 @@ func refreshAccessToken(database *sql.DB, account types.GameAccount) (types.Game
 	account.RefreshTokenExpDate = time.Now().Add(time.Duration(result.RefreshExpiresIn) * time.Second)
 	account.UpdatedAt = time.Now()
 
-	db.UpsertGameAccount(database, account)
+	db.UpsertGameAccount(database, account, encryptionKey)
 	return account, nil
 }
 
 func refreshWithDeviceSecrets(database *sql.DB, account types.GameAccount) (types.GameAccount, error) {
-	secrets, err := db.GetGameAccountSecrets(database, account.ID)
+	secrets, err := db.GetGameAccountSecrets(database, account.ID, encryptionKey)
 	if err != nil {
 		return account, fmt.Errorf("no device secrets found for account %s: %w", account.ID, err)
 	}
@@ -389,7 +392,7 @@ func refreshWithDeviceSecrets(database *sql.DB, account types.GameAccount) (type
 	account.RefreshTokenExpDate = time.Now().Add(time.Duration(result.RefreshExpiresIn) * time.Second)
 	account.UpdatedAt = time.Now()
 
-	db.UpsertGameAccount(database, account)
+	db.UpsertGameAccount(database, account, encryptionKey)
 	return account, nil
 }
 
@@ -567,11 +570,11 @@ func StartFriendRequestAcceptor(database *sql.DB, intervalSeconds int) {
 			acceptPendingFriendRequests(database)
 		}
 	}()
-	fmt.Printf("[Bots] Auto-aceptar solicitudes de amistad cada %d segundos\n", intervalSeconds)
+	slog.Info("Bots: auto-aceptar solicitudes de amistad", "intervalSeconds", intervalSeconds)
 }
 
 func acceptPendingFriendRequests(database *sql.DB) {
-	accounts, err := db.GetActiveGameAccounts(database)
+	accounts, err := db.GetActiveGameAccounts(database, encryptionKey)
 	if err != nil || len(accounts) == 0 {
 		return
 	}
@@ -599,7 +602,7 @@ func acceptPendingFriendRequests(database *sql.DB) {
 			acceptResp, _, err := executeWithRefresh(database, account, acceptReq)
 			if err == nil {
 				acceptResp.Body.Close()
-				fmt.Printf("[Bots] ✅ Solicitud aceptada: %s → bot %s\n", friend.AccountId, account.DisplayName)
+				slog.Info("Bots: solicitud aceptada", "friendAccountId", friend.AccountId, "bot", account.DisplayName)
 			}
 		}
 	}

@@ -15,7 +15,7 @@ import (
 // Endpoint público — lo usan los clientes para ver si hay bots disponibles.
 func HandlerBotsStatus(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		accounts, err := db.GetAllGameAccounts(database)
+		accounts, err := db.GetAllGameAccounts(database, encryptionKey)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error"})
 			return

@@ -27,11 +27,30 @@ type EnvConfig struct {
 	DiscordClientSecret string `envconfig:"DISCORD_CLIENT_SECRET"`
 	DiscordRedirectURL  string `envconfig:"DISCORD_REDIRECT_URL"`
 	DiscordBotToken     string `envconfig:"DISCORD_BOT_TOKEN"`
+	DiscordGuildID      string `envconfig:"DISCORD_GUILD_ID"`
 
 	// App
 	FrontendURL      string `envconfig:"FRONTEND_URL" default:"http://localhost:5173"`
 	AdminAPIKey      string `envconfig:"ADMIN_API_KEY"`
 	BotCheckInterval int    `envconfig:"BOT_CHECK_INTERVAL" default:"3"`
+	EncryptionKey    string `envconfig:"ENCRYPTION_KEY"`
+
+	// Exchange Rate
+	ExchangeRateAPIKey string `envconfig:"EXCHANGE_RATE_API_KEY"`
+
+	// Payment Info (JSON string)
+	PaymentInfoJSON string `envconfig:"PAYMENT_INFO_JSON"`
+
+	// Autobuyer
+	AutobuyerURL    string `envconfig:"AUTOBUYER_URL"`
+	AutobuyerAPIKey string `envconfig:"AUTOBUYER_API_KEY"`
+
+	// Payment Gateways
+	MercadoPagoAccessToken string `envconfig:"MERCADOPAGO_ACCESS_TOKEN"`
+	PayPalClientID         string `envconfig:"PAYPAL_CLIENT_ID"`
+	PayPalClientSecret     string `envconfig:"PAYPAL_CLIENT_SECRET"`
+	PayPalMode             string `envconfig:"PAYPAL_MODE" default:"sandbox"`
+	NOWPaymentsAPIKey      string `envconfig:"NOWPAYMENTS_API_KEY"`
 
 	// SMTP
 	SMTPHost     string `envconfig:"SMTP_HOST"`
@@ -261,6 +280,47 @@ type CustomerPublic struct {
 type AuthResponse struct {
 	Token    string         `json:"token"`
 	Customer CustomerPublic `json:"customer"`
+}
+
+// ==================== PAYMENT TRANSACTION ====================
+
+type PaymentTransaction struct {
+	ID          uuid.UUID `json:"id"`
+	CustomerID  uuid.UUID `json:"customer_id"`
+	Gateway     string    `json:"gateway"`      // mercadopago, paypal, binance_pay
+	PaymentType string    `json:"payment_type"` // kc_recharge, product_purchase
+	ProductID   string    `json:"product_id"`
+	ProductName string    `json:"product_name"`
+	AmountPEN   float64   `json:"amount_pen"`
+	AmountUSD   float64   `json:"amount_usd"`
+	KCAmount    int       `json:"kc_amount"`
+	ExternalID      string    `json:"external_id"`
+	Status          string    `json:"status"` // pending, approved, failed, expired, fulfilled
+	ActivationCode  string    `json:"activation_code,omitempty"`
+	AutobuyerTaskID string    `json:"autobuyer_task_id,omitempty"`
+	Progress        string    `json:"progress,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type CreatePaymentRequest struct {
+	Gateway     string `json:"gateway" binding:"required"`      // mercadopago, paypal, binance_pay
+	PaymentType string `json:"payment_type" binding:"required"` // kc_recharge, product_purchase
+	ProductID   string `json:"product_id" binding:"required"`   // vb-800, pack-koi, starter, etc.
+}
+
+// ==================== REFRESH TOKEN ====================
+
+type RefreshToken struct {
+	ID         uuid.UUID `json:"id"`
+	CustomerID uuid.UUID `json:"customer_id"`
+	TokenHash  string    `json:"-"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type RefreshTokenRequest struct {
+	RefreshToken string `json:"refresh_token" binding:"required"`
 }
 
 // ==================== JWT CLAIMS ====================

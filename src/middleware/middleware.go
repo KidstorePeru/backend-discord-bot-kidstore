@@ -2,6 +2,9 @@ package middleware
 
 import (
 	"KidStoreStore/src/types"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -22,11 +25,29 @@ func GenerateCustomerToken(customer types.Customer, secretKey string) (string, e
 		"epic_username": customer.EpicUsername,
 		"email":         func() string { if customer.Email != nil { return *customer.Email }; return "" }(),
 		"is_customer":   true, // CRÍTICO: distingue de tokens admin
-		"exp":           time.Now().Add(72 * time.Hour).Unix(),
+		"exp":           time.Now().Add(1 * time.Hour).Unix(),
 		"iat":           time.Now().Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(secretKey))
+}
+
+// GenerateRefreshToken generates a random refresh token.
+// Returns the plaintext token (to send to client) and its SHA-256 hash (to store in DB).
+func GenerateRefreshToken() (plaintext string, hash string, err error) {
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", "", fmt.Errorf("generating refresh token: %w", err)
+	}
+	plaintext = hex.EncodeToString(tokenBytes)
+	hash = HashRefreshToken(plaintext)
+	return plaintext, hash, nil
+}
+
+// HashRefreshToken returns the SHA-256 hash of a refresh token.
+func HashRefreshToken(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])
 }
 
 // ParseCustomerToken valida y parsea un JWT de cliente.

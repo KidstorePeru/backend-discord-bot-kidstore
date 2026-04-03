@@ -3,7 +3,7 @@ package fortnite
 import (
 	"KidStoreStore/src/db"
 	"database/sql"
-	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -26,16 +26,16 @@ func StartTokenHealthCheck(database *sql.DB, intervalMinutes int) {
 			checkAllTokens(database)
 		}
 	}()
-	fmt.Printf("[HealthCheck] Verificación de tokens cada %d minutos\n", intervalMinutes)
+	slog.Info("HealthCheck: verificacion de tokens periodica", "intervalMinutes", intervalMinutes)
 }
 
 func checkAllTokens(database *sql.DB) {
-	accounts, err := db.GetActiveGameAccounts(database)
+	accounts, err := db.GetActiveGameAccounts(database, encryptionKey)
 	if err != nil || len(accounts) == 0 {
 		return
 	}
 
-	fmt.Printf("[HealthCheck] Verificando tokens de %d cuenta(s) bot...\n", len(accounts))
+	slog.Info("HealthCheck: verificando tokens", "accounts", len(accounts))
 
 	for _, account := range accounts {
 		// Llamada ligera a Epic: obtener perfil propio
@@ -52,29 +52,27 @@ func checkAllTokens(database *sql.DB) {
 		client := &http.Client{Timeout: 8 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			fmt.Printf("[HealthCheck] ⚠️ Error de red verificando %s: %v\n", account.DisplayName, err)
+			slog.Warn("HealthCheck: error de red verificando token", "bot", account.DisplayName, "error", err)
 			continue
 		}
 		resp.Body.Close()
 
 		if resp.StatusCode == 200 {
-			fmt.Printf("[HealthCheck] ✅ %s — token OK\n", account.DisplayName)
+			slog.Info("HealthCheck: token OK", "bot", account.DisplayName)
 			continue
 		}
 
 		// Token inválido (401/403) — intentar refresh
-		fmt.Printf("[HealthCheck] 🔄 %s — token expirado (HTTP %d), intentando refresh...\n",
-			account.DisplayName, resp.StatusCode)
+		slog.Info("HealthCheck: token expirado, intentando refresh", "bot", account.DisplayName, "status", resp.StatusCode)
 
 		_, err = refreshAccessToken(database, account)
 		if err != nil {
 			// Refresh también falló → cuenta inutilizable
 			// (el dueño inició sesión directamente en el juego)
-			fmt.Printf("[HealthCheck] 🔒 %s — refresh falló, marcando como INACTIVA: %v\n",
-				account.DisplayName, err)
+			slog.Warn("HealthCheck: refresh fallo, marcando como inactiva", "bot", account.DisplayName, "error", err)
 			db.DeactivateGameAccount(database, account.ID)
 		} else {
-			fmt.Printf("[HealthCheck] ✅ %s — token refrescado correctamente\n", account.DisplayName)
+			slog.Info("HealthCheck: token refrescado correctamente", "bot", account.DisplayName)
 		}
 
 		// Pequeña pausa entre cuentas para no saturar la API de Epic

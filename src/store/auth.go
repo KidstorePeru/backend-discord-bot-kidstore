@@ -8,9 +8,11 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/smtp"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -275,11 +277,73 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 			return
 		}
 
+		refreshPlain, refreshHash, err := middleware.GenerateRefreshToken()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error generando refresh token"})
+			return
+		}
+		db.CreateRefreshToken(database, customer.ID, refreshHash, time.Now().Add(7*24*time.Hour))
+
 		db.AddAuditLog(database, &customer.ID, "LOGIN", "login exitoso", c.ClientIP())
 
 		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"token":   token,
+			"success":       true,
+			"token":         token,
+			"refresh_token": refreshPlain,
+			"customer": types.CustomerPublic{
+				ID: customer.ID, EpicUsername: customer.EpicUsername,
+				Email: customer.Email, KCBalance: customer.KCBalance,
+				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
+				IsVerified: customer.IsVerified, CreatedAt: customer.CreatedAt,
+			},
+		})
+	}
+}
+
+// ==================== REFRESH TOKEN ====================
+
+func HandlerRefreshToken(database *sql.DB, secretKey string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req types.RefreshTokenRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		tokenHash := middleware.HashRefreshToken(req.RefreshToken)
+		storedToken, err := db.GetRefreshToken(database, tokenHash)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "refresh token inválido o expirado", "code": "INVALID_REFRESH_TOKEN"})
+			return
+		}
+
+		// Delete the used token (rotation)
+		db.DeleteRefreshToken(database, tokenHash)
+
+		customer, err := db.GetCustomerByID(database, storedToken.CustomerID)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "cliente no encontrado"})
+			return
+		}
+
+		// Generate new token pair
+		newAccessToken, err := middleware.GenerateCustomerToken(customer, secretKey)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error generando token"})
+			return
+		}
+
+		newRefreshPlain, newRefreshHash, err := middleware.GenerateRefreshToken()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error generando refresh token"})
+			return
+		}
+		db.CreateRefreshToken(database, customer.ID, newRefreshHash, time.Now().Add(7*24*time.Hour))
+
+		c.JSON(http.StatusOK, gin.H{
+			"success":       true,
+			"token":         newAccessToken,
+			"refresh_token": newRefreshPlain,
 			"customer": types.CustomerPublic{
 				ID: customer.ID, EpicUsername: customer.EpicUsername,
 				Email: customer.Email, KCBalance: customer.KCBalance,
@@ -317,6 +381,39 @@ func HandlerMe(database *sql.DB) gin.HandlerFunc {
 				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
 				IsVerified: customer.IsVerified, CreatedAt: customer.CreatedAt,
 			},
+		})
+	}
+}
+
+// ==================== RECHARGE HISTORY ====================
+
+func HandlerGetMyRecharges(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, _ := uuid.Parse(customerIDStr)
+
+		recharges, err := db.GetRechargesByCustomer(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo recargas"})
+			return
+		}
+		if recharges == nil { recharges = []types.KCRecharge{} }
+
+		payments, err := db.GetPaymentsByCustomer(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo pagos"})
+			return
+		}
+		if payments == nil { payments = []types.PaymentTransaction{} }
+
+		c.JSON(http.StatusOK, gin.H{
+			"success":   true,
+			"recharges": recharges,
+			"payments":  payments,
 		})
 	}
 }
@@ -521,7 +618,7 @@ func sendVerificationEmail(cfg types.EnvConfig, toEmail, token, username, lang s
 	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", cfg.FrontendURL, token)
 
 	if cfg.SMTPHost == "" {
-		fmt.Printf("[Email] Verification URL para %s: %s\n", toEmail, verifyURL)
+		slog.Info("Email: verification URL (SMTP not configured)", "to", toEmail, "url", verifyURL)
 		return
 	}
 
@@ -541,15 +638,15 @@ func sendVerificationEmail(cfg types.EnvConfig, toEmail, token, username, lang s
 
 	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
 	if err := smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg)); err != nil {
-		fmt.Printf("[Email] Error enviando verificación a %s: %v\n", toEmail, err)
+		slog.Error("Email: error enviando verificacion", "to", toEmail, "error", err)
 	} else {
-		fmt.Printf("[Email] Verificación enviada a %s\n", toEmail)
+		slog.Info("Email: verificacion enviada", "to", toEmail)
 	}
 }
 
 func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) {
 	if cfg.SMTPHost == "" {
-		fmt.Printf("[Email] Reset token para %s: %s\n", toEmail, token)
+		slog.Info("Email: reset token (SMTP not configured)", "to", toEmail, "token", token)
 		return
 	}
 
@@ -570,9 +667,9 @@ func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) 
 
 	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
 	if err := smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg)); err != nil {
-		fmt.Printf("[Email] Error enviando reset a %s: %v\n", toEmail, err)
+		slog.Error("Email: error enviando reset", "to", toEmail, "error", err)
 	} else {
-		fmt.Printf("[Email] Reset enviado a %s\n", toEmail)
+		slog.Info("Email: reset enviado", "to", toEmail)
 	}
 }
 

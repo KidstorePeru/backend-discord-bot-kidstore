@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -14,13 +15,15 @@ import (
 
 func HandlerGetAllCustomers(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		customers, err := db.GetAllCustomers(database)
+		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+		customers, total, err := db.GetAllCustomers(database, page, limit)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo clientes"})
 			return
 		}
 		if customers == nil { customers = []types.Customer{} }
-		c.JSON(http.StatusOK, gin.H{"success": true, "customers": customers})
+		c.JSON(http.StatusOK, gin.H{"success": true, "customers": customers, "total": total, "page": page, "limit": limit})
 	}
 }
 
@@ -38,7 +41,7 @@ func HandlerGetCustomer(database *sql.DB) gin.HandlerFunc {
 		}
 		recharges, _ := db.GetRechargesByCustomer(database, id)
 		if recharges == nil { recharges = []types.KCRecharge{} }
-		orders, _ := db.GetOrdersByCustomer(database, id)
+		orders, _, _ := db.GetOrdersByCustomer(database, id, 1, 50)
 		if orders == nil { orders = []types.Order{} }
 		c.JSON(http.StatusOK, gin.H{
 			"success": true, "customer": customer,
@@ -145,7 +148,7 @@ func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
 		approvedBy := strings.TrimSpace(c.GetHeader("X-Approved-By"))
 		if approvedBy == "" { approvedBy = "admin" }
 
-		if err := db.RechargeKC(database, customerID, req.AmountKC, req.AmountSoles, req.Note, approvedBy); err != nil {
+		if err := db.RechargeKC(database, customerID, req.AmountKC, req.AmountSoles, req.Note, approvedBy, "manual"); err != nil {
 			if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "inactive") {
 				c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado o inactivo"})
 			} else {
@@ -167,13 +170,67 @@ func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
 
 func HandlerGetAllOrders(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		orders, err := db.GetAllOrders(database)
+		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+		orders, total, err := db.GetAllOrders(database, page, limit)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo pedidos"})
 			return
 		}
 		if orders == nil { orders = []types.Order{} }
-		c.JSON(http.StatusOK, gin.H{"success": true, "orders": orders})
+		c.JSON(http.StatusOK, gin.H{"success": true, "orders": orders, "total": total, "page": page, "limit": limit})
+	}
+}
+
+func HandlerGetAllPayments(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+		payments, total, err := db.GetAllPaymentTransactions(database, page, limit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo pagos"})
+			return
+		}
+		if payments == nil { payments = []types.PaymentTransaction{} }
+		c.JSON(http.StatusOK, gin.H{"success": true, "payments": payments, "total": total, "page": page, "limit": limit})
+	}
+}
+
+// ==================== PRODUCT AVAILABILITY ====================
+
+func HandlerGetProductAvailability(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		items, err := db.GetAllProductAvailability(database)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo disponibilidad"})
+			return
+		}
+		if items == nil { items = []db.ProductAvailability{} }
+		c.JSON(http.StatusOK, gin.H{"success": true, "items": items})
+	}
+}
+
+func HandlerUpdateProductAvailability(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req db.ProductAvailability
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+		if req.Timezone == "" { req.Timezone = "America/Lima" }
+		if err := db.UpsertProductAvailability(database, req); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error guardando disponibilidad"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "disponibilidad actualizada"})
+	}
+}
+
+func HandlerCheckProductAvailable(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		productID := c.Param("id")
+		available := db.IsProductAvailable(database, productID)
+		c.JSON(http.StatusOK, gin.H{"success": true, "available": available, "product_id": productID})
 	}
 }
 
