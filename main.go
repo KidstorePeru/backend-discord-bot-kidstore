@@ -198,7 +198,7 @@ func main() {
 	// ── Admin (API Key + rate limit) ──
 	adminGroup := router.Group("/admin")
 	adminGroup.Use(middleware.RateLimitMiddleware(adminLimiter))
-	adminGroup.Use(middleware.AdminAuthMiddleware(cfg.AdminAPIKey))
+	adminGroup.Use(middleware.AdminAuthMiddleware(cfg.AdminAPIKey, cfg.SecretKey))
 	{
 		adminGroup.GET("/customers",        admin.HandlerGetAllCustomers(database))
 		adminGroup.GET("/customers/:id",    admin.HandlerGetCustomer(database))
@@ -219,7 +219,22 @@ func main() {
 		adminGroup.POST("/bots/gifts",      fortnite.HandlerUpdateRemainingGifts(database))
 		adminGroup.POST("/bots/vbucks",     fortnite.HandlerUpdateBotVbucks(database))
 		adminGroup.POST("/bots/verify",     fortnite.HandlerVerifyBotTokens(database))
+		adminGroup.PUT("/payments/:id",     admin.HandlerUpdatePayment(database))
+		adminGroup.DELETE("/payments/:id",  admin.HandlerDeletePayment(database))
+		adminGroup.GET("/check",            admin.HandlerAdminCheck(database))
 	}
+
+	// ── Payment expiration goroutine (expire pending payments after 30 min) ──
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			if n, err := db.ExpirePendingPayments(database); err != nil {
+				slog.Error("Error expirando pagos", "error", err)
+			} else if n > 0 {
+				slog.Info("Pagos pendientes expirados", "count", n)
+			}
+		}
+	}()
 
 	// ── Discord Bot ──
 	var discordSession interface{ Close() error }

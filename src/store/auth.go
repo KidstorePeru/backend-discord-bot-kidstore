@@ -293,7 +293,8 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 				ID: customer.ID, EpicUsername: customer.EpicUsername,
 				Email: customer.Email, KCBalance: customer.KCBalance,
 				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
-				IsVerified: customer.IsVerified, CreatedAt: customer.CreatedAt,
+				IsVerified: customer.IsVerified, IsAdmin: customer.IsAdmin,
+				CreatedAt: customer.CreatedAt,
 			},
 		})
 	}
@@ -347,7 +348,8 @@ func HandlerRefreshToken(database *sql.DB, secretKey string) gin.HandlerFunc {
 				ID: customer.ID, EpicUsername: customer.EpicUsername,
 				Email: customer.Email, KCBalance: customer.KCBalance,
 				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
-				IsVerified: customer.IsVerified, CreatedAt: customer.CreatedAt,
+				IsVerified: customer.IsVerified, IsAdmin: customer.IsAdmin,
+				CreatedAt: customer.CreatedAt,
 			},
 		})
 	}
@@ -378,7 +380,8 @@ func HandlerMe(database *sql.DB) gin.HandlerFunc {
 				ID: customer.ID, EpicUsername: customer.EpicUsername,
 				Email: customer.Email, KCBalance: customer.KCBalance,
 				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
-				IsVerified: customer.IsVerified, CreatedAt: customer.CreatedAt,
+				IsVerified: customer.IsVerified, IsAdmin: customer.IsAdmin,
+				CreatedAt: customer.CreatedAt,
 			},
 		})
 	}

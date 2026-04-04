@@ -64,6 +64,7 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 			EpicUsername *string `json:"epic_username"`
 			Email        *string `json:"email"`
 			KCBalance    *int    `json:"kc_balance"`
+			IsAdmin      *bool   `json:"is_admin"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
@@ -95,6 +96,14 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 		if req.KCBalance != nil {
 			if _, err := database.Exec(`UPDATE customers SET kc_balance=$1, updated_at=NOW() WHERE id=$2`, *req.KCBalance, id); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando balance"})
+				return
+			}
+		}
+
+		// Actualizar rol admin si se especificó
+		if req.IsAdmin != nil {
+			if err := db.SetCustomerAdmin(database, id, *req.IsAdmin); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando rol"})
 				return
 			}
 		}
@@ -245,13 +254,83 @@ func HandlerGetStats(database *sql.DB) gin.HandlerFunc {
 		database.QueryRow(`SELECT COUNT(*) FROM orders WHERE status='pending'`).Scan(&totalPending)
 		database.QueryRow(`SELECT COALESCE(SUM(amount_kc),0) FROM kc_recharges`).Scan(&totalKCRecharged)
 
+		// Revenue stats from payment_transactions
+		var totalRevenuePEN, todayRevenuePEN, weekRevenuePEN, monthRevenuePEN sql.NullFloat64
+		var totalPayments, approvedPayments, pendingPayments, failedPayments, expiredPayments, fulfilledPayments int
+		database.QueryRow(`SELECT COALESCE(SUM(amount_pen),0) FROM payment_transactions WHERE status IN ('approved','fulfilled')`).Scan(&totalRevenuePEN)
+		database.QueryRow(`SELECT COALESCE(SUM(amount_pen),0) FROM payment_transactions WHERE status IN ('approved','fulfilled') AND created_at >= CURRENT_DATE`).Scan(&todayRevenuePEN)
+		database.QueryRow(`SELECT COALESCE(SUM(amount_pen),0) FROM payment_transactions WHERE status IN ('approved','fulfilled') AND created_at >= CURRENT_DATE - INTERVAL '7 days'`).Scan(&weekRevenuePEN)
+		database.QueryRow(`SELECT COALESCE(SUM(amount_pen),0) FROM payment_transactions WHERE status IN ('approved','fulfilled') AND created_at >= CURRENT_DATE - INTERVAL '30 days'`).Scan(&monthRevenuePEN)
+		database.QueryRow(`SELECT COUNT(*) FROM payment_transactions`).Scan(&totalPayments)
+		database.QueryRow(`SELECT COUNT(*) FROM payment_transactions WHERE status='approved'`).Scan(&approvedPayments)
+		database.QueryRow(`SELECT COUNT(*) FROM payment_transactions WHERE status='pending'`).Scan(&pendingPayments)
+		database.QueryRow(`SELECT COUNT(*) FROM payment_transactions WHERE status='failed'`).Scan(&failedPayments)
+		database.QueryRow(`SELECT COUNT(*) FROM payment_transactions WHERE status='expired'`).Scan(&expiredPayments)
+		database.QueryRow(`SELECT COUNT(*) FROM payment_transactions WHERE status='fulfilled'`).Scan(&fulfilledPayments)
+
+		// Gateway breakdown
+		type gwStat struct {
+			Gateway string  `json:"gateway"`
+			Count   int     `json:"count"`
+			Total   float64 `json:"total_pen"`
+		}
+		var gwStats []gwStat
+		gwRows, _ := database.Query(`SELECT gateway, COUNT(*), COALESCE(SUM(amount_pen),0) FROM payment_transactions WHERE status IN ('approved','fulfilled') GROUP BY gateway ORDER BY SUM(amount_pen) DESC`)
+		if gwRows != nil {
+			defer gwRows.Close()
+			for gwRows.Next() {
+				var g gwStat
+				gwRows.Scan(&g.Gateway, &g.Count, &g.Total)
+				gwStats = append(gwStats, g)
+			}
+		}
+
+		// Recent payments (last 5)
+		type recentPay struct {
+			ProductName string  `json:"product_name"`
+			AmountPEN   float64 `json:"amount_pen"`
+			Gateway     string  `json:"gateway"`
+			Status      string  `json:"status"`
+			CreatedAt   string  `json:"created_at"`
+		}
+		var recentPayments []recentPay
+		rpRows, _ := database.Query(`SELECT product_name, amount_pen, gateway, status, created_at FROM payment_transactions ORDER BY created_at DESC LIMIT 5`)
+		if rpRows != nil {
+			defer rpRows.Close()
+			for rpRows.Next() {
+				var r recentPay
+				rpRows.Scan(&r.ProductName, &r.AmountPEN, &r.Gateway, &r.Status, &r.CreatedAt)
+				recentPayments = append(recentPayments, r)
+			}
+		}
+
+		// New customers this week
+		var newCustomersWeek int
+		database.QueryRow(`SELECT COUNT(*) FROM customers WHERE is_active=true AND created_at >= CURRENT_DATE - INTERVAL '7 days'`).Scan(&newCustomersWeek)
+
 		c.JSON(http.StatusOK, gin.H{
 			"success":            true,
 			"total_customers":    totalCustomers,
+			"new_customers_week": newCustomersWeek,
 			"total_orders":       totalOrders,
 			"total_sent":         totalSent,
 			"total_pending":      totalPending,
 			"total_kc_recharged": totalKCRecharged.Int64,
+			// Revenue
+			"revenue_total_pen":   totalRevenuePEN.Float64,
+			"revenue_today_pen":   todayRevenuePEN.Float64,
+			"revenue_week_pen":    weekRevenuePEN.Float64,
+			"revenue_month_pen":   monthRevenuePEN.Float64,
+			// Payment counts
+			"total_payments":      totalPayments,
+			"approved_payments":   approvedPayments,
+			"pending_payments":    pendingPayments,
+			"failed_payments":     failedPayments,
+			"expired_payments":    expiredPayments,
+			"fulfilled_payments":  fulfilledPayments,
+			// Breakdowns
+			"gateway_stats":      gwStats,
+			"recent_payments":    recentPayments,
 		})
 	}
 }
@@ -285,5 +364,83 @@ func HandlerUpdateBotSchedule(database *sql.DB) gin.HandlerFunc {
 			c.ClientIP())
 		schedule, _ := db.GetBotSchedule(database)
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "horario actualizado correctamente", "schedule": schedule})
+	}
+}
+
+// ==================== PAYMENT ADMIN ACTIONS ====================
+
+func HandlerUpdatePayment(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "ID inválido"})
+			return
+		}
+
+		var req struct {
+			Status string `json:"status" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		validStatuses := map[string]bool{"approved": true, "failed": true, "expired": true, "fulfilled": true}
+		if !validStatuses[req.Status] {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Status inválido. Usar: approved, failed, expired, fulfilled"})
+			return
+		}
+
+		// Verify payment exists
+		payment, err := db.GetPaymentByID(database, id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "Pago no encontrado"})
+			return
+		}
+
+		if err := db.AdminUpdatePaymentStatus(database, id, req.Status); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		db.AddAuditLog(database, nil, "ADMIN_PAYMENT_UPDATED",
+			fmt.Sprintf("payment %s: %s → %s (%s)", id.String()[:8], payment.Status, req.Status, payment.ProductName),
+			c.ClientIP())
+
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": fmt.Sprintf("Pago actualizado a %s", req.Status)})
+	}
+}
+
+func HandlerDeletePayment(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "ID inválido"})
+			return
+		}
+
+		payment, err := db.GetPaymentByID(database, id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "Pago no encontrado"})
+			return
+		}
+
+		if err := db.DeletePayment(database, id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		db.AddAuditLog(database, nil, "ADMIN_PAYMENT_DELETED",
+			fmt.Sprintf("payment %s deleted (%s, %s, S/%.2f)", id.String()[:8], payment.ProductName, payment.Status, payment.AmountPEN),
+			c.ClientIP())
+
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Pago eliminado"})
+	}
+}
+
+// HandlerAdminCheck returns whether the authenticated user is an admin.
+func HandlerAdminCheck(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"success": true, "is_admin": true})
 	}
 }

@@ -24,7 +24,8 @@ func GenerateCustomerToken(customer types.Customer, secretKey string) (string, e
 		"customer_id":   customer.ID.String(),
 		"epic_username": customer.EpicUsername,
 		"email":         func() string { if customer.Email != nil { return *customer.Email }; return "" }(),
-		"is_customer":   true, // CRÍTICO: distingue de tokens admin
+		"is_customer":   true,
+		"is_admin":      customer.IsAdmin,
 		"exp":           time.Now().Add(1 * time.Hour).Unix(),
 		"iat":           time.Now().Unix(),
 	}
@@ -73,11 +74,13 @@ func ParseCustomerToken(tokenStr string, secretKey string) (*types.CustomerClaim
 	if !isCustomer {
 		return nil, fmt.Errorf("token no es de cliente")
 	}
+	isAdmin, _ := claims["is_admin"].(bool)
 	return &types.CustomerClaims{
 		CustomerID:   claims["customer_id"].(string),
 		EpicUsername: claims["epic_username"].(string),
 		Email:        claims["email"].(string),
 		IsCustomer:   true,
+		IsAdmin:      isAdmin,
 	}, nil
 }
 
@@ -138,17 +141,32 @@ func CustomerAuthMiddleware(secretKey string) gin.HandlerFunc {
 	}
 }
 
-// AdminAuthMiddleware valida la API Key del admin SOLO por header X-Admin-Key.
-// Se eliminó la aceptación por query param para evitar que la clave quede en logs del servidor.
-func AdminAuthMiddleware(adminAPIKey string) gin.HandlerFunc {
+// AdminAuthMiddleware validates admin access via API Key (X-Admin-Key header)
+// OR via JWT with is_admin=true claim. Either method grants full admin access.
+func AdminAuthMiddleware(adminAPIKey, secretKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		key := c.GetHeader("X-Admin-Key")
-		if key == "" || key != adminAPIKey || adminAPIKey == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "acceso denegado"})
-			c.Abort()
+		// Method 1: API Key header (legacy, still works)
+		apiKey := c.GetHeader("X-Admin-Key")
+		if apiKey != "" && adminAPIKey != "" && apiKey == adminAPIKey {
+			c.Next()
 			return
 		}
-		c.Next()
+
+		// Method 2: JWT with is_admin=true
+		authHeader := c.GetHeader("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+			claims, err := ParseCustomerToken(tokenStr, secretKey)
+			if err == nil && claims.IsAdmin {
+				c.Set("customer_id", claims.CustomerID)
+				c.Set("is_admin", true)
+				c.Next()
+				return
+			}
+		}
+
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "acceso denegado"})
+		c.Abort()
 	}
 }
 

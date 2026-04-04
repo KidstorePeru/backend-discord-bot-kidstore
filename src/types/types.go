@@ -73,6 +73,7 @@ type Customer struct {
 	DiscordUsername *string   `json:"discord_username,omitempty"`
 	IsActive        bool      `json:"is_active"`
 	IsVerified      bool      `json:"is_verified"`
+	IsAdmin         bool      `json:"is_admin"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -275,6 +276,7 @@ type CustomerPublic struct {
 	DiscordID       *string   `json:"discord_id,omitempty"`
 	DiscordUsername *string   `json:"discord_username,omitempty"`
 	IsVerified      bool      `json:"is_verified"`
+	IsAdmin         bool      `json:"is_admin"`
 	CreatedAt       time.Time `json:"created_at"`
 }
 
@@ -331,4 +333,5 @@ type CustomerClaims struct {
 	EpicUsername string `json:"epic_username"`
 	Email        string `json:"email"`
 	IsCustomer   bool   `json:"is_customer"`
+	IsAdmin      bool   `json:"is_admin"`
 }

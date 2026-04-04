@@ -201,6 +201,12 @@ func CreateTables(db *sql.DB) error {
 			ALTER TABLE payment_transactions ADD CONSTRAINT payment_transactions_status_check
 				CHECK (status IN ('pending','approved','failed','expired','fulfilled','activating'));
 		END $$`,
+		// Add is_admin column to customers
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='customers' AND column_name='is_admin') THEN
+				ALTER TABLE customers ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT false;
+			END IF;
+		END $$`,
 		`DELETE FROM pending_registrations WHERE expires_at < NOW()`,
 		`DELETE FROM refresh_tokens WHERE expires_at < NOW()`,
 	}
@@ -482,10 +488,10 @@ func GetCustomerByEmail(db *sql.DB, email string) (types.Customer, error) {
 	var c types.Customer
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
-		       discord_id, discord_username, is_active, is_verified, created_at, updated_at
+		       discord_id, discord_username, is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
 		FROM customers WHERE email = $1 AND is_active = true`, email).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
-			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.CreatedAt, &c.UpdatedAt)
+			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -493,10 +499,10 @@ func GetCustomerByID(db *sql.DB, id uuid.UUID) (types.Customer, error) {
 	var c types.Customer
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
-		       discord_id, discord_username, is_active, is_verified, created_at, updated_at
+		       discord_id, discord_username, is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
 		FROM customers WHERE id = $1 AND is_active = true`, id).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
-			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.CreatedAt, &c.UpdatedAt)
+			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -510,7 +516,7 @@ func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error)
 
 	rows, err := db.Query(`
     SELECT id, epic_username, email, kc_balance,
-           discord_id, discord_username, is_active, is_verified, created_at, updated_at
+           discord_id, discord_username, is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
     FROM customers WHERE is_active=true ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
@@ -518,7 +524,7 @@ func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error)
 	for rows.Next() {
 		var c types.Customer
 		if err := rows.Scan(&c.ID, &c.EpicUsername, &c.Email, &c.KCBalance,
-			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		customers = append(customers, c)
@@ -1060,10 +1066,10 @@ func GetCustomerByDiscordID(db *sql.DB, discordID string) (types.Customer, error
 	var c types.Customer
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
-		       discord_id, discord_username, is_active, is_verified, created_at, updated_at
+		       discord_id, discord_username, is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
 		FROM customers WHERE discord_id = $1 AND is_active = true`, discordID).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
-			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.CreatedAt, &c.UpdatedAt)
+			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -1129,4 +1135,43 @@ func CountPendingOrdersByCustomer(db *sql.DB, customerID uuid.UUID) (int, error)
 	var count int
 	err := db.QueryRow(`SELECT COUNT(*) FROM orders WHERE customer_id=$1 AND status IN ('pending','processing')`, customerID).Scan(&count)
 	return count, err
+}
+
+// ==================== PAYMENT EXPIRATION ====================
+
+func ExpirePendingPayments(db *sql.DB) (int64, error) {
+	result, err := db.Exec(`UPDATE payment_transactions SET status='expired', updated_at=NOW() WHERE status='pending' AND created_at < NOW() - INTERVAL '30 minutes'`)
+	if err != nil { return 0, err }
+	return result.RowsAffected()
+}
+
+func AdminUpdatePaymentStatus(db *sql.DB, id uuid.UUID, status string) error {
+	_, err := db.Exec(`UPDATE payment_transactions SET status=$1, updated_at=NOW() WHERE id=$2`, status, id)
+	return err
+}
+
+func DeletePayment(db *sql.DB, id uuid.UUID) error {
+	_, err := db.Exec(`DELETE FROM payment_transactions WHERE id=$1`, id)
+	return err
+}
+
+func GetPaymentByID(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, error) {
+	var t types.PaymentTransaction
+	err := db.QueryRow(`SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		FROM payment_transactions WHERE id=$1`, id).
+		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
+	return t, err
+}
+
+// ==================== ADMIN ROLE ====================
+
+func IsCustomerAdmin(db *sql.DB, customerID uuid.UUID) bool {
+	var isAdmin bool
+	db.QueryRow(`SELECT COALESCE(is_admin, false) FROM customers WHERE id=$1`, customerID).Scan(&isAdmin)
+	return isAdmin
+}
+
+func SetCustomerAdmin(db *sql.DB, customerID uuid.UUID, isAdmin bool) error {
+	_, err := db.Exec(`UPDATE customers SET is_admin=$1, updated_at=NOW() WHERE id=$2`, isAdmin, customerID)
+	return err
 }
