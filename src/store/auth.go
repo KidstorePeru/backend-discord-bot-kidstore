@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/smtp"
 	"strings"
 	"time"
 
@@ -633,11 +632,7 @@ func sendVerificationEmail(cfg types.EnvConfig, toEmail, token, username, lang s
 		htmlBody = buildVerificationEmailEN(username, verifyURL)
 	}
 
-	msg := fmt.Sprintf("From: KidStorePeru <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n%s",
-		cfg.SMTPFrom, toEmail, subject, htmlBody)
-
-	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
-	if err := smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg)); err != nil {
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: error enviando verificacion", "to", toEmail, "error", err)
 	} else {
 		slog.Info("Email: verificacion enviada", "to", toEmail)
@@ -645,8 +640,8 @@ func sendVerificationEmail(cfg types.EnvConfig, toEmail, token, username, lang s
 }
 
 func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) {
-	if cfg.SMTPHost == "" {
-		slog.Info("Email: reset token (SMTP not configured)", "to", toEmail, "token", token)
+	if cfg.ResendAPIKey == "" && cfg.SMTPHost == "" {
+		slog.Info("Email: reset token (no email provider configured)", "to", toEmail, "token", token)
 		return
 	}
 
@@ -662,11 +657,7 @@ func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) 
 		htmlBody = buildResetEmailEN(username, resetURL)
 	}
 
-	msg := fmt.Sprintf("From: KidStorePeru <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n%s",
-		cfg.SMTPFrom, toEmail, subject, htmlBody)
-
-	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
-	if err := smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg)); err != nil {
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: error enviando reset", "to", toEmail, "error", err)
 	} else {
 		slog.Info("Email: reset enviado", "to", toEmail)

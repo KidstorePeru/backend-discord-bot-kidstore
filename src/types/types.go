@@ -52,7 +52,8 @@ type EnvConfig struct {
 	PayPalMode             string `envconfig:"PAYPAL_MODE" default:"sandbox"`
 	NOWPaymentsAPIKey      string `envconfig:"NOWPAYMENTS_API_KEY"`
 
-	// SMTP
+	// Email (Resend API preferred, SMTP fallback for local dev)
+	ResendAPIKey string `envconfig:"RESEND_API_KEY"`
 	SMTPHost     string `envconfig:"SMTP_HOST"`
 	SMTPPort     int    `envconfig:"SMTP_PORT" default:"587"`
 	SMTPUser     string `envconfig:"SMTP_USER"`

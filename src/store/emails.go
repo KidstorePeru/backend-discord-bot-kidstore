@@ -2,10 +2,59 @@ package store
 
 import (
 	"KidStoreStore/src/types"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"net/smtp"
 )
+
+// sendEmail sends an HTML email using Resend API (production) or SMTP (local dev).
+func sendEmail(cfg types.EnvConfig, to, subject, htmlBody string) error {
+	if cfg.ResendAPIKey != "" {
+		return sendViaResend(cfg.ResendAPIKey, cfg.SMTPFrom, to, subject, htmlBody)
+	}
+	if cfg.SMTPHost != "" {
+		return sendViaSMTP(cfg, to, subject, htmlBody)
+	}
+	slog.Warn("Email: no email provider configured (set RESEND_API_KEY or SMTP_HOST)", "to", to)
+	return fmt.Errorf("no email provider configured")
+}
+
+func sendViaResend(apiKey, from, to, subject, htmlBody string) error {
+	payload := map[string]interface{}{
+		"from":    fmt.Sprintf("KidStorePeru <%s>", from),
+		"to":      []string{to},
+		"subject": subject,
+		"html":    htmlBody,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "https://api.resend.com/emails", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("resend request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("resend error %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func sendViaSMTP(cfg types.EnvConfig, to, subject, htmlBody string) error {
+	msg := fmt.Sprintf("From: KidStorePeru <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n%s",
+		cfg.SMTPFrom, to, subject, htmlBody)
+	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
+	return smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{to}, []byte(msg))
+}
 
 // ==================== SMTP CONFIG ====================
 
@@ -105,11 +154,7 @@ func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, 
 </body>
 </html>`, title, intro, productLabel, productName, amountLabel, amountPEN, gatewayLabel, gateway, kcLine, activationLine, footer)
 
-	msg := fmt.Sprintf("From: KidStorePeru <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n%s",
-		cfg.SMTPFrom, toEmail, subject, htmlBody)
-
-	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
-	if err := smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg)); err != nil {
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: payment approved send error", "to", toEmail, "error", err)
 	} else {
 		slog.Info("Email: payment approved sent", "to", toEmail)
@@ -180,11 +225,7 @@ func SendOrderSentEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName str
 </body>
 </html>`, title, intro, itemLabel, itemName, accountLabel, epicUsername, costLabel, priceKC, check, footer)
 
-	msg := fmt.Sprintf("From: KidStorePeru <%s>\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n%s",
-		cfg.SMTPFrom, toEmail, subject, htmlBody)
-
-	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
-	if err := smtp.SendMail(fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort), auth, cfg.SMTPFrom, []string{toEmail}, []byte(msg)); err != nil {
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: order sent send error", "to", toEmail, "error", err)
 	} else {
 		slog.Info("Email: order sent notification sent", "to", toEmail)
