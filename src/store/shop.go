@@ -391,14 +391,31 @@ func processOrders(database *sql.DB) {
 
 		if err != nil {
 			errMsg := err.Error()
+			errLower := strings.ToLower(errMsg)
 			slog.Error("Worker: error enviando gift", "orderID", order.ID, "msg", errMsg)
-			if strings.Contains(errMsg, "token") || strings.Contains(errMsg, "401") ||
-				strings.Contains(errMsg, "403") || strings.Contains(errMsg, "unauthorized") ||
-				strings.Contains(errMsg, "deactivated") {
+
+			// Token/auth errors → deactivate bot
+			if strings.Contains(errLower, "token") || strings.Contains(errLower, "401") ||
+				strings.Contains(errLower, "403") || strings.Contains(errLower, "unauthorized") ||
+				strings.Contains(errLower, "deactivated") {
 				slog.Warn("Worker: token invalido, marcando bot como inactivo", "bot", selectedAccount.DisplayName)
 				db.DeactivateGameAccount(database, selectedAccount.ID)
 				selectedAccount.RemainingGifts = 0
 			}
+
+			// Network/transient errors → keep pending for retry next cycle
+			isNetworkError := strings.Contains(errLower, "timeout") ||
+				strings.Contains(errLower, "connection refused") ||
+				strings.Contains(errLower, "no such host") ||
+				strings.Contains(errLower, "eof") ||
+				strings.Contains(errLower, "temporarily unavailable")
+			if isNetworkError {
+				slog.Warn("Worker: error de red transitorio, reintentando en siguiente ciclo", "orderID", order.ID)
+				db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
+				continue
+			}
+
+			// Permanent error → fail & refund
 			if refundErr := db.RefundOrder(database, order.ID); refundErr != nil {
 				slog.Warn("Worker: error reembolsando pedido", "orderID", order.ID, "error", refundErr)
 			}
@@ -444,9 +461,19 @@ func processOrders(database *sql.DB) {
 // Usa go para no bloquear el worker, pero la lógica de deduplicación
 // está garantizada porque se llama en un único punto por cada caso.
 func sendDiscordNotification(database *sql.DB, order types.Order, status string) {
-	if notifyDiscord == nil { return }
+	if notifyDiscord == nil {
+		slog.Debug("Discord notifier not configured, skipping notification", "orderID", order.ID, "status", status)
+		return
+	}
 	customer, err := db.GetCustomerByID(database, order.CustomerID)
-	if err != nil || customer.DiscordID == nil || *customer.DiscordID == "" { return }
+	if err != nil {
+		slog.Warn("Discord notify: customer not found", "orderID", order.ID, "customerID", order.CustomerID)
+		return
+	}
+	if customer.DiscordID == nil || *customer.DiscordID == "" {
+		slog.Debug("Discord notify: customer has no Discord linked", "orderID", order.ID, "user", order.EpicUsername)
+		return
+	}
 	lang, _ := db.GetDiscordLang(database, *customer.DiscordID)
 	if lang == "" { lang = "es" }
 	go notifyDiscord(*customer.DiscordID, status, order.ItemName, order.PriceKC, lang)
