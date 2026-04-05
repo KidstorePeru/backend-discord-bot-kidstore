@@ -52,21 +52,21 @@ var productPrices = map[string]struct {
 	"pro":     {Name: "Pro 4,800 KC", PricePEN: 76.80, KCAmount: 4800},
 	"legend":  {Name: "Legend 12,500 KC", PricePEN: 200.00, KCAmount: 12500},
 	// V-Bucks (names MUST match autobuyer products.json)
-	"vb-800":   {Name: "800 V-Bucks", PricePEN: 20.90},
-	"vb-2400":  {Name: "2400 V-Bucks", PricePEN: 52.90},
-	"vb-4500":  {Name: "4500 V-Bucks", PricePEN: 76.90},
-	"vb-12500": {Name: "12500 V-Bucks", PricePEN: 179.90},
-	// Packs (placeholder URLs in autobuyer)
-	"pack-koi":   {Name: "Pack de Reino Koi", PricePEN: 59.90},
-	"pack-drift": {Name: "Pack de Deriva Infinita", PricePEN: 55.90},
-	"pack-brite": {Name: "Operation Brite", PricePEN: 11.90},
+	"vb-800":   {Name: "800 V-Bucks", PricePEN: 23.20},
+	"vb-2400":  {Name: "2400 V-Bucks", PricePEN: 53.60},
+	"vb-4500":  {Name: "4500 V-Bucks", PricePEN: 79.80},
+	"vb-12500": {Name: "12500 V-Bucks", PricePEN: 190.00},
+	// Packs
+	"pack-koi":   {Name: "Pack de Reino Koi", PricePEN: 23.20},
+	"pack-drift": {Name: "Pack de Deriva Infinita", PricePEN: 23.20},
+	"pack-brite": {Name: "Operation Brite", PricePEN: 13.70},
 	// Club (name MUST match autobuyer card_products.json)
-	"club-monthly": {Name: "Fortnite Crew", PricePEN: 00.10},
+	"club-monthly": {Name: "Fortnite Crew", PricePEN: 22.10},
 	// Rocket League (names MUST match autobuyer products.json with em dash)
-	"rl-500":  {Name: "500 \u2014 RL Credits", PricePEN: 15.90},
-	"rl-1100": {Name: "1100 \u2014 RL Credits", PricePEN: 29.90},
-	"rl-3000": {Name: "3000 \u2014 RL Credits", PricePEN: 69.90},
-	"rl-6500": {Name: "6500 \u2014 RL Credits", PricePEN: 129.90},
+	"rl-500":  {Name: "500 \u2014 RL Credits", PricePEN: 13.70},
+	"rl-1100": {Name: "1100 \u2014 RL Credits", PricePEN: 26.30},
+	"rl-3000": {Name: "3000 \u2014 RL Credits", PricePEN: 59.90},
+	"rl-6500": {Name: "6500 \u2014 RL Credits", PricePEN: 116.50},
 }
 
 // ==================== CREATE PAYMENT ====================
