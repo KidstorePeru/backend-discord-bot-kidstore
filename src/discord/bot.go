@@ -100,7 +100,10 @@ var BotSession *discordgo.Session
 var Database *sql.DB
 
 // botHandlersRegistered evita registrar handlers duplicados si StartBot se llama más de una vez
-var botHandlersRegistered bool
+var (
+	botHandlersRegistered   bool
+	botHandlersRegisteredMu sync.Mutex
+)
 
 // ── Compras pendientes ──
 type pendingPurchase struct {
@@ -178,25 +181,22 @@ func StartBot(database *sql.DB, botToken, discordGuildID string) (*discordgo.Ses
 	}
 
 	// Solo registrar handlers una vez para evitar mensajes/embeds duplicados
+	botHandlersRegisteredMu.Lock()
 	if !botHandlersRegistered {
 		dg.AddHandler(messageHandler(database))
 		dg.AddHandler(interactionHandler(database))
 		botHandlersRegistered = true
 	}
+	botHandlersRegisteredMu.Unlock()
 
 	if err := dg.Open(); err != nil { return nil, fmt.Errorf("error conectando al bot: %w", err) }
 
 	BotSession = dg
 
-	// Slash commands are handled by Autobuyer V2 Python bot — don't touch them here
-
 	go rates.refresh()
 	slog.Info("Bot de Discord iniciado", "prefix", getPrefix())
 	return dg, nil
 }
-
-
-// Slash commands removed — now handled by Autobuyer V2 Python bot
 
 // ── SendProductPurchaseNotification — notifies admin via DM ──
 func SendProductPurchaseNotification(productName, epicUsername, gateway string, amountPEN float64) {

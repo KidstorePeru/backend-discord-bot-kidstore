@@ -17,6 +17,9 @@ import (
 	"github.com/google/uuid"
 )
 
+// Default exchange rate PEN → USD (fallback when API is unavailable)
+const defaultUSDRate = 0.27
+
 // ==================== CONFIG ====================
 
 type PaymentConfig struct {
@@ -117,7 +120,7 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			kcAmount = product.KCAmount
 		}
 
-		amountUSD := pricePEN * 0.27
+		amountUSD := pricePEN * defaultUSDRate
 
 		txID := uuid.New()
 		tx := db.PaymentTransactionInput{

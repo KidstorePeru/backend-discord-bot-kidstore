@@ -94,6 +94,10 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 
 		// Actualizar balance KC si se especificó
 		if req.KCBalance != nil {
+			if *req.KCBalance < 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "el balance KC no puede ser negativo"})
+				return
+			}
 			if _, err := database.Exec(`UPDATE customers SET kc_balance=$1, updated_at=NOW() WHERE id=$2`, *req.KCBalance, id); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando balance"})
 				return

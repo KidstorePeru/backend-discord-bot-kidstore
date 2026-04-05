@@ -44,7 +44,6 @@ func main() {
 	store.SetExchangeRateAPIKey(cfg.ExchangeRateAPIKey)
 	store.SetSMTPConfig(cfg)
 	store.SetPaymentInfoJSON(cfg.PaymentInfoJSON)
-	// Groq AI removed — chatbot now connects directly to autobuyer V2
 
 	// Determine backend URL for webhooks
 	backendURL := fmt.Sprintf("http://localhost:%s", cfg.Port)
