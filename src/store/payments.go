@@ -46,11 +46,11 @@ var productPrices = map[string]struct {
 	PricePEN float64
 	KCAmount int // only for kc_recharge
 }{
-	// KC packages
-	"starter": {Name: "Starter 800 KC", PricePEN: 12.80, KCAmount: 800},
-	"gamer":   {Name: "Gamer 2,400 KC", PricePEN: 38.40, KCAmount: 2400},
-	"pro":     {Name: "Pro 4,800 KC", PricePEN: 76.80, KCAmount: 4800},
-	"legend":  {Name: "Legend 12,500 KC", PricePEN: 200.00, KCAmount: 12500},
+	// KC packages (online prices with MP commission)
+	"starter": {Name: "Starter 800 KC", PricePEN: 14.70, KCAmount: 800},
+	"gamer":   {Name: "Gamer 2,400 KC", PricePEN: 41.60, KCAmount: 2400},
+	"pro":     {Name: "Pro 4,800 KC", PricePEN: 81.90, KCAmount: 4800},
+	"legend":  {Name: "Legend 12,500 KC", PricePEN: 211.30, KCAmount: 12500},
 	// V-Bucks (names MUST match autobuyer products.json)
 	"vb-800":   {Name: "800 V-Bucks", PricePEN: 23.20},
 	"vb-2400":  {Name: "2400 V-Bucks", PricePEN: 53.60},
