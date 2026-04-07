@@ -146,6 +146,10 @@ func CreateTables(db *sql.DB) error {
 			value VARCHAR(255) NOT NULL,
 			UNIQUE(key, value)
 		)`,
+		`CREATE TABLE IF NOT EXISTS discord_user_prefs (
+			discord_id VARCHAR(30) PRIMARY KEY,
+			lang       VARCHAR(2) NOT NULL DEFAULT 'es'
+		)`,
 		`CREATE TABLE IF NOT EXISTS refresh_tokens (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
@@ -1076,12 +1080,22 @@ func GetCustomerByDiscordID(db *sql.DB, discordID string) (types.Customer, error
 // ==================== DISCORD LANG ====================
 
 func GetDiscordLang(db *sql.DB, discordID string) (string, error) {
+	// 1. Try discord_user_prefs first (works for all users, even unlinked)
 	var lang string
-	err := db.QueryRow(`SELECT discord_lang FROM customers WHERE discord_id = $1`, discordID).Scan(&lang)
+	err := db.QueryRow(`SELECT lang FROM discord_user_prefs WHERE discord_id = $1`, discordID).Scan(&lang)
+	if err == nil && lang != "" {
+		return lang, nil
+	}
+	// 2. Fallback to customers table (legacy)
+	err = db.QueryRow(`SELECT discord_lang FROM customers WHERE discord_id = $1`, discordID).Scan(&lang)
 	return lang, err
 }
 
 func SetDiscordLang(db *sql.DB, discordID string, lang string) {
+	// Save in discord_user_prefs (works for all users, even unlinked)
+	db.Exec(`INSERT INTO discord_user_prefs (discord_id, lang) VALUES ($1, $2)
+		ON CONFLICT (discord_id) DO UPDATE SET lang = $2`, discordID, lang)
+	// Also update customers table if linked
 	db.Exec(`UPDATE customers SET discord_lang = $1 WHERE discord_id = $2`, lang, discordID)
 }
 
