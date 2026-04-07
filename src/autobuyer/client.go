@@ -68,6 +68,16 @@ func Ping() bool {
 	return err == nil
 }
 
+// SetDiscordLang notifies the autobuyer to update a Discord user's language cache.
+func SetDiscordLang(discordID, lang string) {
+	go func() {
+		_, _ = doRequestWithClient("POST", "/bots/discord-lang", map[string]string{
+			"discord_id": discordID,
+			"lang":       lang,
+		}, fastClient)
+	}()
+}
+
 type TaskResult struct {
 	ID          string `json:"id"`
 	Status      string `json:"status"`

@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"KidStoreStore/src/autobuyer"
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/types"
 	"database/sql"
@@ -292,6 +293,7 @@ func messageHandler(database *sql.DB) func(*discordgo.Session, *discordgo.Messag
 			newLang := strings.ToLower(args[0])
 			if newLang != "es" && newLang != "en" { s.ChannelMessageSend(m.ChannelID, "❌ Idioma no válido. Usa `"+pfx+"lang es` o `"+pfx+"lang en`"); return }
 			setUserLang(database, m.Author.ID, newLang)
+			autobuyer.SetDiscordLang(m.Author.ID, newLang)
 			if newLang == "es" { s.ChannelMessageSend(m.ChannelID, "✅ **Idioma cambiado a Español** 🇵🇪") } else { s.ChannelMessageSend(m.ChannelID, "✅ **Language changed to English** 🇺🇸") }
 
 		case "setprefix":
