@@ -265,6 +265,29 @@ func SendOrderNotification(discordID, status, itemName string, priceKC int, lang
 	})
 }
 
+// ── Gift log channel ──
+const giftLogChannelID = "1333568919058780230"
+
+// SendGiftLogEmbed sends a public embed to the gift log channel when a gift is sent successfully.
+func SendGiftLogEmbed(epicUsername, itemName string, priceKC, kcRemaining int) {
+	if BotSession == nil { return }
+	embed := &discordgo.MessageEmbed{
+		Title: "🎁 Regalo enviado con éxito",
+		Color: 0x22c55e,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "👤 Usuario Epic", Value: epicUsername, Inline: true},
+			{Name: "🎮 Regalo enviado", Value: itemName, Inline: true},
+			{Name: "💰 Costo", Value: fmt.Sprintf("%s %s KC", kcCoin, fmtNum(priceKC)), Inline: true},
+			{Name: "💳 Saldo KC restante", Value: fmt.Sprintf("%s %s KC", kcCoin, fmtNum(kcRemaining)), Inline: true},
+		},
+		Footer: &discordgo.MessageEmbedFooter{Text: "KidStorePeru — Sistema de Regalos"},
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	if _, err := BotSession.ChannelMessageSendEmbed(giftLogChannelID, embed); err != nil {
+		slog.Warn("Discord: failed to send gift log embed", "error", err)
+	}
+}
+
 // ── Handler de mensajes ──
 func messageHandler(database *sql.DB) func(*discordgo.Session, *discordgo.MessageCreate) {
 	return func(s *discordgo.Session, m *discordgo.MessageCreate) {

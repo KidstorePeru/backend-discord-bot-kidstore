@@ -2,6 +2,7 @@ package store
 
 import (
 	"KidStoreStore/src/db"
+	"KidStoreStore/src/discord"
 	"KidStoreStore/src/fortnite"
 	"KidStoreStore/src/middleware"
 	"KidStoreStore/src/types"
@@ -443,6 +444,11 @@ func processOrders(database *sql.DB) {
 			fmt.Sprintf("pedido %s enviado por bot %s → %s", order.ID, selectedAccount.DisplayName, order.EpicUsername), "worker")
 
 		sendDiscordNotification(database, order, "sent")
+
+		// Send gift log embed to public Discord channel
+		if customer, custErr := db.GetCustomerByID(database, order.CustomerID); custErr == nil {
+			go discord.SendGiftLogEmbed(order.EpicUsername, order.ItemName, order.PriceKC, customer.KCBalance)
+		}
 
 		// Send order sent email notification
 		if customer, err := db.GetCustomerByID(database, order.CustomerID); err == nil && customer.Email != nil && *customer.Email != "" {
