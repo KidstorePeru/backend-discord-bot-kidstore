@@ -445,18 +445,19 @@ func processOrders(database *sql.DB) {
 
 		sendDiscordNotification(database, order, "sent")
 
-		// Send gift log embed to public Discord channel
+		// Fetch customer once for gift log + email
 		if customer, custErr := db.GetCustomerByID(database, order.CustomerID); custErr == nil {
+			// Send gift log embed to public Discord channel
 			go discord.SendGiftLogEmbed(order.EpicUsername, order.ItemName, order.PriceKC, customer.KCBalance)
-		}
 
-		// Send order sent email notification
-		if customer, err := db.GetCustomerByID(database, order.CustomerID); err == nil && customer.Email != nil && *customer.Email != "" {
-			emailLang := "es"
-			if customer.DiscordID != nil {
-				if dl, err := db.GetDiscordLang(database, *customer.DiscordID); err == nil && dl != "" { emailLang = dl }
+			// Send order sent email notification
+			if customer.Email != nil && *customer.Email != "" {
+				emailLang := "es"
+				if customer.DiscordID != nil {
+					if dl, err := db.GetDiscordLang(database, *customer.DiscordID); err == nil && dl != "" { emailLang = dl }
+				}
+				go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, emailLang)
 			}
-			go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, emailLang)
 		}
 
 		slog.Info("Worker: pedido enviado", "orderID", order.ID, "bot", selectedAccount.DisplayName, "recipient", order.EpicUsername, "item", order.ItemName)
