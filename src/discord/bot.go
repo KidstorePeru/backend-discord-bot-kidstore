@@ -52,16 +52,17 @@ func setPrefix(database *sql.DB, p string) {
 // ── Paquetes KC ──
 type kcPackage struct {
 	Name     string
-	KC       int
-	PricePEN float64
-	Emoji    string
+	KC             int
+	PriceManual    float64
+	PriceOnline    float64
+	Emoji          string
 }
 
 var kcPackages = []kcPackage{
-	{Name: "Starter", KC: 800,   PricePEN: 12.80,  Emoji: "⚡"},
-	{Name: "Gamer",   KC: 2400,  PricePEN: 38.40,  Emoji: "🎮"},
-	{Name: "Pro",     KC: 4800,  PricePEN: 76.80,  Emoji: "🔥"},
-	{Name: "Legend",  KC: 12500, PricePEN: 200.00, Emoji: "👑"},
+	{Name: "Starter", KC: 800,   PriceManual: 12.80,  PriceOnline: 14.70,  Emoji: "⚡"},
+	{Name: "Gamer",   KC: 2400,  PriceManual: 38.40,  PriceOnline: 41.60,  Emoji: "🎮"},
+	{Name: "Pro",     KC: 4500,  PriceManual: 72.00,  PriceOnline: 76.80,  Emoji: "🔥"},
+	{Name: "Legend",  KC: 12500, PriceManual: 200.00, PriceOnline: 211.30, Emoji: "👑"},
 }
 
 // ── Caché de tasas ──
@@ -940,13 +941,19 @@ func packagesEmbed(lang string) *discordgo.MessageEmbed {
 	rates.refresh(); usd, eur := rates.get()
 	var fields []*discordgo.MessageEmbedField
 	for _, pkg := range kcPackages {
+		var value string
+		if es {
+			value = fmt.Sprintf("Manual: **S/ %.2f**\nOnline: **S/ %.2f** · $%.2f · €%.2f", pkg.PriceManual, pkg.PriceOnline, roundCents(pkg.PriceOnline*usd), roundCents(pkg.PriceOnline*eur))
+		} else {
+			value = fmt.Sprintf("Manual: **S/ %.2f**\nOnline: **S/ %.2f** · $%.2f · €%.2f", pkg.PriceManual, pkg.PriceOnline, roundCents(pkg.PriceOnline*usd), roundCents(pkg.PriceOnline*eur))
+		}
 		fields = append(fields, &discordgo.MessageEmbedField{
 			Name:  fmt.Sprintf("%s **%s — %s KC**", kcCoin, pkg.Name, fmtNum(pkg.KC)),
-			Value: fmt.Sprintf("**S/ %.2f** · $%.2f · €%.2f", pkg.PricePEN, roundCents(pkg.PricePEN*usd), roundCents(pkg.PricePEN*eur)),
+			Value: value,
 		})
 	}
-	title, foot := "💳 Paquetes de KidCoins", "Precios en USD y EUR calculados con tasa del día"
-	if !es { title = "💳 KidCoins Packages"; foot = "USD and EUR prices calculated with today's exchange rate" }
+	title, foot := "💳 Paquetes de KidCoins", "Manual = Yape/Plin/transferencia · Online = MercadoPago/PayPal/Crypto"
+	if !es { title = "💳 KidCoins Packages"; foot = "Manual = Yape/Plin/transfer · Online = MercadoPago/PayPal/Crypto" }
 	return &discordgo.MessageEmbed{Title: title, Color: 0xf59e0b, Fields: fields, Footer: &discordgo.MessageEmbedFooter{Text: foot}}
 }
 
