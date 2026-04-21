@@ -177,6 +177,24 @@ func main() {
 	router.POST("/store/chat/message",  store.HandlerChatMessage())
 	router.GET("/store/chat/poll/:sid", store.HandlerChatPoll())
 
+	// ── Autobuyer self-registration (called by Autobuyer on startup) ──
+	router.POST("/store/autobuyer-connect", func(c *gin.Context) {
+		if cfg.AutobuyerAPIKey == "" || c.GetHeader("X-API-Key") != cfg.AutobuyerAPIKey {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		var body struct {
+			URL string `json:"url"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || body.URL == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "url required"})
+			return
+		}
+		autobuyer.UpdateURL(body.URL)
+		slog.Info("Autobuyer URL updated via self-registration", "url", body.URL)
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
 	// ── Rutas de cliente (JWT requerido) ──
 	customer := router.Group("/store")
 	customer.Use(middleware.CustomerAuthMiddleware(cfg.SecretKey))

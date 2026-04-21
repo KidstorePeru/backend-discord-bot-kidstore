@@ -21,6 +21,12 @@ func Init(url, key string) {
 	apiKey = key
 }
 
+// UpdateURL replaces the in-memory base URL.
+// Called when the Autobuyer self-registers on startup via /store/autobuyer-connect.
+func UpdateURL(url string) {
+	baseURL = url
+}
+
 func IsConfigured() bool {
 	return baseURL != ""
 }
