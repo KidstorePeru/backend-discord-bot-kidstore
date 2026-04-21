@@ -332,144 +332,182 @@ func processOrders(database *sql.DB) {
 	}
 
 	for _, order := range orders {
-		// Buscar cuenta con slots disponibles
-		var selectedAccount *types.GameAccount
-		for i := range accounts {
-			if accounts[i].RemainingGifts > 0 { selectedAccount = &accounts[i]; break }
-		}
+		processOrder(database, order, accounts)
+	}
+}
 
-		// Sin slots: solo procesar el pedido actual y salir del bucle
-		if selectedAccount == nil {
-			slog.Warn("Worker: sin slots de regalo en ninguna cuenta bot")
-			noSlotsMsg := "Todas las cuentas bot han agotado sus envíos del día. Los gifts se resetean diariamente."
-			db.UpdateOrderStatus(database, order.ID, "failed", nil, &noSlotsMsg)
-			db.RefundOrder(database, order.ID)
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
-				fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, noSlotsMsg), "worker")
-			sendDiscordNotification(database, order, "refunded")
-			break
-		}
+// processOrder intenta enviar un pedido probando cada bot disponible en orden.
+// Si un bot falla por gift_limit_reached o token inválido, pasa al siguiente bot
+// en el mismo ciclo sin esperar 30 segundos.
+func processOrder(database *sql.DB, order types.Order, accounts []types.GameAccount) {
+	// Verificar que al menos un bot tiene slots
+	hasSlots := false
+	for i := range accounts {
+		if accounts[i].RemainingGifts > 0 { hasSlots = true; break }
+	}
+	if !hasSlots {
+		noSlotsMsg := "Todas las cuentas bot han agotado sus envíos del día. Los gifts se resetean diariamente."
+		slog.Warn("Worker: sin slots en ningún bot", "orderID", order.ID)
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noSlotsMsg)
+		return
+	}
 
-		db.UpdateOrderStatus(database, order.ID, "processing", nil, nil)
+	db.UpdateOrderStatus(database, order.ID, "processing", nil, nil)
 
-		receiverAccountID, err := fortnite.GetReceiverAccountID(database, *selectedAccount, order.EpicUsername)
+	// Obtener el Epic account ID del receptor (igual para todos los bots, basta con uno)
+	var receiverAccountID string
+	for i := range accounts {
+		if accounts[i].RemainingGifts <= 0 { continue }
+		id, err := fortnite.GetReceiverAccountID(database, accounts[i], order.EpicUsername)
 		if err != nil {
 			errMsg := fmt.Sprintf("no se encontró el usuario Epic '%s': %s", order.EpicUsername, err.Error())
-			slog.Error("Worker: error", "msg", errMsg)
+			slog.Error("Worker: usuario no encontrado", "orderID", order.ID, "msg", errMsg)
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
 			db.RefundOrder(database, order.ID)
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 				fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
 			sendDiscordNotification(database, order, "refunded")
-			continue
+			return
 		}
+		receiverAccountID = id
+		break
+	}
 
-		isFriend, friendSince, err := fortnite.CheckFriendship(database, *selectedAccount, receiverAccountID)
+	// Contadores para determinar el resultado final si todos los bots fallan
+	activeBots := 0
+	notFriendBots := 0
+	anyGiftLimit := false
+
+	// ── Loop interno: probar cada bot en orden ──
+	for i := range accounts {
+		bot := &accounts[i]
+		if bot.RemainingGifts <= 0 { continue }
+		activeBots++
+
+		// Verificar amistad con este bot
+		isFriend, friendSince, err := fortnite.CheckFriendship(database, *bot, receiverAccountID)
 		if err != nil || !isFriend {
-			errMsg := fmt.Sprintf("el usuario '%s' no tiene agregado al bot '%s' como amigo", order.EpicUsername, selectedAccount.DisplayName)
-			slog.Error("Worker: error", "msg", errMsg)
-			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
-			db.RefundOrder(database, order.ID)
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
-				fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
-			sendDiscordNotification(database, order, "refunded")
-			continue
+			slog.Info("Worker: usuario no es amigo del bot, probando siguiente",
+				"bot", bot.DisplayName, "user", order.EpicUsername)
+			notFriendBots++
+			continue // probar siguiente bot
 		}
 
+		// Verificar 48h de amistad
 		hoursAsFriend := time.Since(friendSince).Hours()
 		if hoursAsFriend < 48 {
-			remaining := 48 - hoursAsFriend
-			errMsg := fmt.Sprintf("amigos hace %.1f horas — faltan %.1f horas para poder recibir regalos", hoursAsFriend, remaining)
-			slog.Info("Worker: pedido pendiente por amistad reciente", "orderID", order.ID, "msg", errMsg)
-			// Solo actualizar el mensaje de error, mantener pending — NO notificar
-			db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
-			continue
+			slog.Info("Worker: amistad reciente con este bot, probando siguiente",
+				"bot", bot.DisplayName, "hours", hoursAsFriend)
+			continue // probar siguiente bot
 		}
 
+		// Intentar enviar el regalo
 		message := "¡Gracias por tu compra en KidStorePeru! 🎮"
-		err = fortnite.SendGift(database, *selectedAccount, receiverAccountID,
+		err = fortnite.SendGift(database, *bot, receiverAccountID,
 			order.ItemOfferID, order.PriceVBucks, order.ItemName, message)
 
-		if err != nil {
-			errMsg := err.Error()
-			errLower := strings.ToLower(errMsg)
-			slog.Error("Worker: error enviando gift", "orderID", order.ID, "msg", errMsg)
+		if err == nil {
+			// ── Éxito ──
+			accountID := bot.ID
+			db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
+			db.UpdateRemainingGifts(database, bot.ID, bot.RemainingGifts-1)
+			bot.RemainingGifts--
 
-			// Token/auth errors → deactivate bot
-			if strings.Contains(errLower, "token") || strings.Contains(errLower, "401") ||
-				strings.Contains(errLower, "403") || strings.Contains(errLower, "unauthorized") ||
-				strings.Contains(errLower, "deactivated") {
-				slog.Warn("Worker: token invalido, marcando bot como inactivo", "bot", selectedAccount.DisplayName)
-				db.DeactivateGameAccount(database, selectedAccount.ID)
-				selectedAccount.RemainingGifts = 0
-			}
-
-			// Gift limit reached → mark bot as exhausted, retry order next cycle with another bot
-			if strings.Contains(errLower, "gift_limit_reached") {
-				slog.Warn("Worker: límite de gifts alcanzado en Epic, marcando bot sin slots", "bot", selectedAccount.DisplayName, "orderID", order.ID)
-				db.UpdateRemainingGifts(database, selectedAccount.ID, 0)
-				selectedAccount.RemainingGifts = 0
-				db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
-				continue
-			}
-
-			// Network/transient errors → keep pending for retry next cycle
-			isNetworkError := strings.Contains(errLower, "timeout") ||
-				strings.Contains(errLower, "connection refused") ||
-				strings.Contains(errLower, "no such host") ||
-				strings.Contains(errLower, "eof") ||
-				strings.Contains(errLower, "temporarily unavailable")
-			if isNetworkError {
-				slog.Warn("Worker: error de red transitorio, reintentando en siguiente ciclo", "orderID", order.ID)
-				db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
-				continue
-			}
-
-			// Permanent error → fail & refund
-			if refundErr := db.RefundOrder(database, order.ID); refundErr != nil {
-				slog.Warn("Worker: error reembolsando pedido", "orderID", order.ID, "error", refundErr)
-			}
-			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
-				fmt.Sprintf("pedido %s falló: %s — KC reembolsados", order.ID, errMsg), "worker")
-			sendDiscordNotification(database, order, "refunded")
-			continue
-		}
-
-		accountID := selectedAccount.ID
-		db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
-		db.UpdateRemainingGifts(database, selectedAccount.ID, selectedAccount.RemainingGifts-1)
-		selectedAccount.RemainingGifts--
-
-		if order.PriceVBucks > 0 {
-			if err := db.DeductBotVbucks(database, selectedAccount.ID, order.PriceVBucks); err != nil {
-				slog.Warn("Worker: error descontando pavos del bot", "bot", selectedAccount.DisplayName, "error", err)
-			} else {
-				slog.Info("Worker: pavos descontados", "vbucks", order.PriceVBucks, "bot", selectedAccount.DisplayName)
-			}
-		}
-
-		db.AddAuditLog(database, &order.CustomerID, "ORDER_SENT",
-			fmt.Sprintf("pedido %s enviado por bot %s → %s", order.ID, selectedAccount.DisplayName, order.EpicUsername), "worker")
-
-		sendDiscordNotification(database, order, "sent")
-
-		// Fetch customer once for gift log + email
-		if customer, custErr := db.GetCustomerByID(database, order.CustomerID); custErr == nil {
-			// Send gift log embed to public Discord channel
-			go discord.SendGiftLogEmbed(order.EpicUsername, order.ItemName, order.PriceKC, customer.KCBalance)
-
-			// Send order sent email notification
-			if customer.Email != nil && *customer.Email != "" {
-				emailLang := "es"
-				if customer.DiscordID != nil {
-					if dl, err := db.GetDiscordLang(database, *customer.DiscordID); err == nil && dl != "" { emailLang = dl }
+			if order.PriceVBucks > 0 {
+				if deductErr := db.DeductBotVbucks(database, bot.ID, order.PriceVBucks); deductErr != nil {
+					slog.Warn("Worker: error descontando pavos del bot", "bot", bot.DisplayName, "error", deductErr)
+				} else {
+					slog.Info("Worker: pavos descontados", "vbucks", order.PriceVBucks, "bot", bot.DisplayName)
 				}
-				go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, emailLang)
 			}
+
+			db.AddAuditLog(database, &order.CustomerID, "ORDER_SENT",
+				fmt.Sprintf("pedido %s enviado por bot %s → %s", order.ID, bot.DisplayName, order.EpicUsername), "worker")
+			sendDiscordNotification(database, order, "sent")
+
+			if customer, custErr := db.GetCustomerByID(database, order.CustomerID); custErr == nil {
+				go discord.SendGiftLogEmbed(order.EpicUsername, order.ItemName, order.PriceKC, customer.KCBalance)
+				if customer.Email != nil && *customer.Email != "" {
+					emailLang := "es"
+					if customer.DiscordID != nil {
+						if dl, dlErr := db.GetDiscordLang(database, *customer.DiscordID); dlErr == nil && dl != "" { emailLang = dl }
+					}
+					go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, emailLang)
+				}
+			}
+
+			slog.Info("Worker: pedido enviado", "orderID", order.ID, "bot", bot.DisplayName,
+				"recipient", order.EpicUsername, "item", order.ItemName)
+			return
 		}
 
-		slog.Info("Worker: pedido enviado", "orderID", order.ID, "bot", selectedAccount.DisplayName, "recipient", order.EpicUsername, "item", order.ItemName)
+		// ── Error al enviar gift ──
+		errMsg := err.Error()
+		errLower := strings.ToLower(errMsg)
+		slog.Error("Worker: error enviando gift", "orderID", order.ID, "bot", bot.DisplayName, "msg", errMsg)
+
+		// Token/auth → desactivar bot y probar el siguiente
+		if strings.Contains(errLower, "token") || strings.Contains(errLower, "401") ||
+			strings.Contains(errLower, "403") || strings.Contains(errLower, "unauthorized") ||
+			strings.Contains(errLower, "deactivated") {
+			slog.Warn("Worker: token invalido, marcando bot como inactivo", "bot", bot.DisplayName)
+			db.DeactivateGameAccount(database, bot.ID)
+			bot.RemainingGifts = 0
+			continue // probar siguiente bot
+		}
+
+		// Gift limit → marcar bot sin slots y probar el siguiente inmediatamente
+		if strings.Contains(errLower, "gift_limit_reached") {
+			slog.Warn("Worker: límite de gifts alcanzado, probando siguiente bot",
+				"bot", bot.DisplayName, "orderID", order.ID)
+			db.UpdateRemainingGifts(database, bot.ID, 0)
+			bot.RemainingGifts = 0
+			anyGiftLimit = true
+			continue // probar siguiente bot
+		}
+
+		// Error de red transitorio → mantener pending, dejar de intentar
+		isNetworkError := strings.Contains(errLower, "timeout") ||
+			strings.Contains(errLower, "connection refused") ||
+			strings.Contains(errLower, "no such host") ||
+			strings.Contains(errLower, "eof") ||
+			strings.Contains(errLower, "temporarily unavailable")
+		if isNetworkError {
+			slog.Warn("Worker: error de red transitorio, reintentando en siguiente ciclo", "orderID", order.ID)
+			db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
+			return
+		}
+
+		// Error permanente → fallar y reembolsar
+		if refundErr := db.RefundOrder(database, order.ID); refundErr != nil {
+			slog.Warn("Worker: error reembolsando pedido", "orderID", order.ID, "error", refundErr)
+		}
+		db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
+		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
+			fmt.Sprintf("pedido %s falló: %s — KC reembolsados", order.ID, errMsg), "worker")
+		sendDiscordNotification(database, order, "refunded")
+		return
+	}
+
+	// Todos los bots probados sin éxito — determinar resultado final
+	if anyGiftLimit {
+		// Algún bot alcanzó el límite diario → mantener pending (se resetea al día siguiente)
+		noSlotsMsg := "Todas las cuentas bot han agotado sus envíos del día. Los gifts se resetean diariamente."
+		slog.Warn("Worker: todos los bots agotaron límite de gifts", "orderID", order.ID)
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noSlotsMsg)
+	} else if activeBots > 0 && notFriendBots == activeBots {
+		// El receptor no es amigo de ningún bot → error permanente
+		errMsg := fmt.Sprintf("el usuario '%s' no está en la lista de amigos de ningún bot disponible", order.EpicUsername)
+		slog.Error("Worker: usuario no es amigo de ningún bot", "orderID", order.ID)
+		db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
+		db.RefundOrder(database, order.ID)
+		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
+			fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, errMsg), "worker")
+		sendDiscordNotification(database, order, "refunded")
+	} else {
+		// Otro motivo (ej: amistad reciente en todos los bots) → mantener pending
+		slog.Warn("Worker: ningún bot pudo enviar el regalo en este ciclo, reintentando", "orderID", order.ID)
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
 	}
 }
 
