@@ -404,6 +404,15 @@ func processOrders(database *sql.DB) {
 				selectedAccount.RemainingGifts = 0
 			}
 
+			// Gift limit reached → mark bot as exhausted, retry order next cycle with another bot
+			if strings.Contains(errLower, "gift_limit_reached") {
+				slog.Warn("Worker: límite de gifts alcanzado en Epic, marcando bot sin slots", "bot", selectedAccount.DisplayName, "orderID", order.ID)
+				db.UpdateRemainingGifts(database, selectedAccount.ID, 0)
+				selectedAccount.RemainingGifts = 0
+				db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
+				continue
+			}
+
 			// Network/transient errors → keep pending for retry next cycle
 			isNetworkError := strings.Contains(errLower, "timeout") ||
 				strings.Contains(errLower, "connection refused") ||
