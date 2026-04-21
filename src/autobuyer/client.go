@@ -182,3 +182,46 @@ func RegisterCode(code, productName, paymentType, buyer, orderID string) error {
 	_, err := doRequest("POST", "/codes", body)
 	return err
 }
+
+// ==================== CHAT PROXY ====================
+
+// ChatStart creates a new chat session.  lang can be "es" or "en".
+// Returns the raw JSON body from the autobuyer (contains session_id).
+func ChatStart(lang string) ([]byte, error) {
+	path := "/chat/start"
+	if lang != "" {
+		path += "?lang=" + lang
+	}
+	return doRequest("POST", path, nil)
+}
+
+// ChatMessage sends a user command to an existing chat session.
+func ChatMessage(sessionID, text string) error {
+	_, err := doRequest("POST", "/chat/message", map[string]string{
+		"session_id": sessionID,
+		"text":       text,
+	})
+	return err
+}
+
+// ChatPoll drains queued messages for a session.
+// Returns the HTTP status code from the autobuyer plus the raw body.
+func ChatPoll(sessionID string) (int, []byte, error) {
+	if baseURL == "" {
+		return 503, nil, fmt.Errorf("autobuyer not configured")
+	}
+	req, err := http.NewRequest("GET", baseURL+"/api/v1/chat/poll/"+sessionID, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	resp, err := fastClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("autobuyer unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, nil
+}

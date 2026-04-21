@@ -172,6 +172,11 @@ func main() {
 		c.JSON(200, gin.H{"lang": lang})
 	})
 
+	// ── Chat proxy (public — no auth, session-based) ──
+	router.POST("/store/chat/start",    store.HandlerChatStart())
+	router.POST("/store/chat/message",  store.HandlerChatMessage())
+	router.GET("/store/chat/poll/:sid", store.HandlerChatPoll())
+
 	// ── Rutas de cliente (JWT requerido) ──
 	customer := router.Group("/store")
 	customer.Use(middleware.CustomerAuthMiddleware(cfg.SecretKey))
