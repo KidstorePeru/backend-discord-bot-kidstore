@@ -373,6 +373,15 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		break
 	}
 
+	// Defensive: receiverAccountID must be set at this point (loop above either sets
+	// it or returns early on error). Guard against unexpected empty string.
+	if receiverAccountID == "" {
+		noSlotsMsg := "no se pudo resolver el ID de la cuenta Epic del receptor"
+		slog.Error("Worker: receiverAccountID vacío inesperadamente", "orderID", order.ID)
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noSlotsMsg)
+		return
+	}
+
 	// Contadores para determinar el resultado final si todos los bots fallan
 	activeBots := 0
 	notFriendBots := 0
