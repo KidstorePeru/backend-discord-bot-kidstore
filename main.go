@@ -11,6 +11,7 @@ import (
 	"KidStoreStore/src/types"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"log/slog"
@@ -37,6 +38,27 @@ func main() {
 	var cfg types.EnvConfig
 	if err := envconfig.Process("", &cfg); err != nil {
 		log.Fatalf("Error procesando variables de entorno: %v", err)
+	}
+
+	// ── Validación de secretos críticos — fallar rápido y ruidoso en vez de
+	// arrancar "normal" con un hueco de seguridad silencioso ──
+	// SECRET_KEY firma TODOS los JWT (clientes y admin). Si estuviera vacía,
+	// el servidor arrancaría sin problema pero firmaría los tokens con una
+	// clave vacía — cualquiera podría forjar un token con is_admin:true sin
+	// necesitar contraseña ni exploit alguno, solo un editor de texto. Es el
+	// hueco de seguridad más grave posible, así que se rechaza arrancar.
+	if len(cfg.SecretKey) < 32 {
+		log.Fatalf("SECRET_KEY debe estar configurada con al menos 32 caracteres — sin esto cualquiera podría forjar un token de administrador. Configúrala antes de iniciar el servidor.")
+	}
+	// ENCRYPTION_KEY protege los tokens de las cuentas bot en la base de
+	// datos. Si estuviera vacía, crypto.Encrypt/Decrypt caen en un modo de
+	// compatibilidad que guarda los tokens SIN cifrar en texto plano — mejor
+	// fallar aquí que dejarlo pasar en silencio.
+	if cfg.EncryptionKey == "" {
+		log.Fatalf("ENCRYPTION_KEY debe estar configurada — sin esto los tokens de las cuentas bot se guardarían sin cifrar en la base de datos.")
+	}
+	if keyBytes, err := hex.DecodeString(cfg.EncryptionKey); err != nil || len(keyBytes) != 32 {
+		log.Fatalf("ENCRYPTION_KEY inválida: debe ser exactamente 64 caracteres hexadecimales (32 bytes).")
 	}
 
 	fortnite.Init(cfg.EpicClient, cfg.EpicSecret, cfg.EncryptionKey)
