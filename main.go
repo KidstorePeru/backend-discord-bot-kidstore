@@ -110,9 +110,16 @@ func main() {
 		slog.Info("Tokens encriptados verificados")
 	}
 
-	authLimiter  := middleware.NewIPRateLimiter(5, time.Minute)
-	orderLimiter := middleware.NewIPRateLimiter(10, time.Minute)
-	adminLimiter := middleware.NewIPRateLimiter(30, time.Minute)
+	authLimiter    := middleware.NewIPRateLimiter(5, time.Minute)
+	orderLimiter   := middleware.NewIPRateLimiter(10, time.Minute)
+	adminLimiter   := middleware.NewIPRateLimiter(30, time.Minute)
+	// Los webhooks de pago son rutas públicas sin autenticación por diseño
+	// (las llaman las pasarelas) — cada solicitud dispara una llamada saliente
+	// real a la API de PayPal/MercadoPago/etc. para verificar el pago. Sin un
+	// límite, cualquiera podría bombardear estas rutas para gastar cuota de
+	// esas APIs o sobrecargar el servidor. 40/min es generoso para tráfico
+	// legítimo de pasarelas reales, pero frena un abuso automatizado.
+	webhookLimiter := middleware.NewIPRateLimiter(40, time.Minute)
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
@@ -189,12 +196,17 @@ func main() {
 	router.GET("/auth/discord/callback", oauth.HandlerDiscordCallback(database, oauthCfg))
 	router.GET("/auth/pending/:token", oauth.HandlerGetPendingRegistration(database))
 
-	// Payment webhooks (public, no auth — called by gateways)
-	router.POST("/store/webhook/mercadopago", store.HandlerMercadoPagoWebhook(database))
-	router.POST("/store/webhook/paypal",      store.HandlerPayPalWebhook(database))
-	router.POST("/store/webhook/nowpayments", store.HandlerNOWPaymentsWebhook(database))
-	router.POST("/store/webhook/dlocalgo",    store.HandlerDLocalGoWebhook(database))
-	router.POST("/store/paypal-capture",       store.HandlerPayPalCapture(database))
+	// Payment webhooks (public, no auth — called by gateways; con rate limit
+	// por IP para que no se puedan bombardear)
+	webhookGroup := router.Group("/store")
+	webhookGroup.Use(middleware.RateLimitMiddleware(webhookLimiter))
+	{
+		webhookGroup.POST("/webhook/mercadopago", store.HandlerMercadoPagoWebhook(database))
+		webhookGroup.POST("/webhook/paypal",      store.HandlerPayPalWebhook(database))
+		webhookGroup.POST("/webhook/nowpayments", store.HandlerNOWPaymentsWebhook(database))
+		webhookGroup.POST("/webhook/dlocalgo",    store.HandlerDLocalGoWebhook(database))
+		webhookGroup.POST("/paypal-capture",      store.HandlerPayPalCapture(database))
+	}
 	router.GET("/store/shop",            store.HandlerGetShop)
 	router.GET("/store/bots-status",     store.HandlerBotsStatus(database))
 	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
