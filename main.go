@@ -122,9 +122,9 @@ func main() {
 	webhookLimiter := middleware.NewIPRateLimiter(40, time.Minute)
 
 	gin.SetMode(gin.ReleaseMode)
+	// gin.Default() ya trae Logger + Recovery — no hace falta (ni conviene)
+	// volver a registrarlos, eso duplicaba cada línea de log en producción.
 	router := gin.Default()
-	router.Use(gin.Logger())
-	router.Use(gin.Recovery())
 
 	// Construir lista de orígenes permitidos incluyendo siempre los dominios de producción
 	allowedOrigins := []string{
@@ -296,6 +296,7 @@ func main() {
 	fortnite.StartTokenHealthCheck(database, cfg.BotCheckInterval)
 	slog.Info("Workers iniciados", "workers", "pedidos, amigos, health check")
 
+	discordbot.SetEmailSender(store.SendPaymentApprovedEmail)
 	discordbot.Start(cfg, database)
 
 	port := cfg.Port

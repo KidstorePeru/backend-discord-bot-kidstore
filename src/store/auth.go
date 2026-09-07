@@ -469,6 +469,15 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 		token, _ := middleware.GenerateCustomerToken(updatedCustomer, secretKey)
 		db.AddAuditLog(database, &customerID, "PROFILE_UPDATED", "perfil actualizado", c.ClientIP())
 
+		// Alerta de seguridad: si cambió la contraseña, avisar por correo. Si
+		// no fue el dueño real quien la cambió, esta es la única forma de que
+		// se entere a tiempo.
+		if newHash != "" && updatedCustomer.Email != nil && *updatedCustomer.Email != "" {
+			lang := c.GetHeader("X-Lang")
+			if lang == "" { lang = "es" }
+			go sendPasswordChangedEmail(smtpConfig, *updatedCustomer.Email, updatedCustomer.EpicUsername, lang)
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"success":  true,
 			"message":  "perfil actualizado",
@@ -747,6 +756,13 @@ func HandlerResetPassword(database *sql.DB) gin.HandlerFunc {
 
 		db.MarkResetTokenUsed(database, req.Token)
 		db.AddAuditLog(database, &resetToken.CustomerID, "PASSWORD_RESET", "contraseña restablecida", c.ClientIP())
+
+		// Alerta de seguridad — mismo motivo que en HandlerUpdateProfile.
+		if customer, err := db.GetCustomerByID(database, resetToken.CustomerID); err == nil && customer.Email != nil && *customer.Email != "" {
+			lang := c.GetHeader("X-Lang")
+			if lang == "" { lang = "es" }
+			go sendPasswordChangedEmail(smtpConfig, *customer.Email, customer.EpicUsername, lang)
+		}
 
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "contraseña actualizada correctamente"})
 	}

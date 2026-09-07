@@ -4,6 +4,7 @@ import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/middleware"
+	"KidStoreStore/src/store"
 	"KidStoreStore/src/types"
 	"crypto/rand"
 	"database/sql"
@@ -100,9 +101,14 @@ func finishOAuthLink(c *gin.Context, database *sql.DB, cfg Config, provider, pro
 		return
 	}
 	db.AddAuditLog(database, &customerID, "OAUTH_LINKED", fmt.Sprintf("%s vinculado desde Seguridad", provider), c.ClientIP())
-	if provider == "discord" {
-		if updated, err3 := db.GetCustomerByID(database, customerID); err3 == nil {
+	if updated, err3 := db.GetCustomerByID(database, customerID); err3 == nil {
+		if provider == "discord" {
 			discordbot.NotifyWelcome(updated)
+		}
+		// Alerta de seguridad: si alguien más vinculó su propia cuenta de
+		// Google/Discord a este perfil, el dueño real debe enterarse.
+		if updated.Email != nil && *updated.Email != "" {
+			go store.SendAccountLinkedEmail(store.GetSMTPConfig(), *updated.Email, updated.EpicUsername, provider, "es")
 		}
 	}
 	c.Redirect(http.StatusFound, cfg.FrontendURL+"/account/security?linked="+provider)

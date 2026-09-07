@@ -125,6 +125,13 @@ func handleKCCommand(s *discordgo.Session, i *discordgo.InteractionCreate, data 
 			updated, _ := db.GetCustomerByID(database, target.ID)
 			newBalance = updated.KCBalance
 			NotifyRecharge(updated, int(amount), newBalance, "Manual (Discord)")
+			// Antes esto solo avisaba por Discord — un cliente sin cuenta de
+			// Discord vinculada nunca se enteraba de que ya se le acreditó el KC.
+			if emailSender != nil && updated.Email != nil && *updated.Email != "" {
+				productName := "Recarga manual de KC"
+				if note != "" { productName = note }
+				go emailSender(cfg, *updated.Email, productName, 0, int(amount), "Recarga manual (Discord)", "es")
+			}
 		}
 	} else {
 		verb = "quitaron"

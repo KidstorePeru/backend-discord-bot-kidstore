@@ -10,6 +10,18 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
+// emailSender manda el correo de "pago aprobado" desde el comando /kc add
+// del bot sin que este paquete tenga que importar "store" directamente —
+// store ya importa discordbot para las notificaciones (NotifyRecharge, etc.),
+// así que importar al revés crearía un ciclo. main.go conecta esta función
+// una sola vez al arrancar, con store.SendPaymentApprovedEmail (misma firma).
+var emailSender func(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, lang string)
+
+// SetEmailSender registra la función que manda el correo de pago aprobado.
+func SetEmailSender(fn func(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, lang string)) {
+	emailSender = fn
+}
+
 const (
 	colorAccent  = 0x6C5CE7
 	colorSuccess = 0x22C55E

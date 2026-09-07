@@ -409,12 +409,27 @@ func processOrders(database *sql.DB) {
 			db.RefundOrder(database, order.ID)
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 				fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, noBotsMsg), "worker")
+			notifyOrderFailed(database, order, "No había cuentas disponibles para procesar tu pedido en ese momento.")
 		}
 		return
 	}
 
 	for _, order := range orders {
 		processOrder(database, order, accounts)
+	}
+}
+
+// notifyOrderFailed avisa por correo que un pedido no se pudo completar y
+// que el KC ya se reembolsó — antes esto no pasaba, y el cliente solo se
+// enteraba si entraba a revisar su panel manualmente. "reason" debe ser un
+// texto ya pensado para el cliente, no el error técnico crudo.
+func notifyOrderFailed(database *sql.DB, order types.Order, reason string) {
+	customer, err := db.GetCustomerByID(database, order.CustomerID)
+	if err != nil {
+		return
+	}
+	if customer.Email != nil && *customer.Email != "" {
+		go SendOrderFailedEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, reason, "es")
 	}
 }
 
@@ -448,6 +463,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			db.RefundOrder(database, order.ID)
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 				fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
+			notifyOrderFailed(database, order, fmt.Sprintf("No pudimos encontrar la cuenta de Epic Games '%s'. Verifica que el usuario esté bien escrito.", order.EpicUsername))
 			return
 		}
 		receiverAccountID = id
@@ -570,6 +586,9 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
 		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 			fmt.Sprintf("pedido %s falló: %s — KC reembolsados", order.ID, errMsg), "worker")
+		// Al cliente no se le manda el error técnico crudo de Epic, solo un
+		// motivo genérico y entendible.
+		notifyOrderFailed(database, order, "Ocurrió un error técnico al procesar el envío.")
 		return
 	}
 
@@ -587,6 +606,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		db.RefundOrder(database, order.ID)
 		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 			fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, errMsg), "worker")
+		notifyOrderFailed(database, order, "Tu cuenta de Epic Games no es amiga de ninguno de nuestros bots todavía. Agrega alguno desde la página de Bots y vuelve a intentar tu compra.")
 	} else {
 		// Otro motivo (ej: amistad reciente en todos los bots) → mantener pending
 		slog.Warn("Worker: ningún bot pudo enviar el regalo en este ciclo, reintentando", "orderID", order.ID)
