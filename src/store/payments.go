@@ -221,6 +221,42 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// ==================== CANCELAR PAGO ====================
+
+// HandlerCancelPayment permite al cliente marcar su propio pago pendiente
+// como fallido en cuanto la pasarela le confirma en el navegador que lo
+// canceló — sin esto, la transacción se queda "pendiente" en su historial
+// hasta que el barrido automático la expira, hasta 30 minutos después.
+func HandlerCancelPayment(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
+			return
+		}
+		txID, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
+			return
+		}
+
+		cancelled, err := db.CancelPendingPayment(database, txID, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error cancelando pago"})
+			return
+		}
+		// Si no se canceló nada (no era tuya, o ya no estaba pending — pudo
+		// aprobarse justo en este instante) no es un error: el estado real de la
+		// transacción es el que ya tiene, y el frontend lo vuelve a consultar.
+		c.JSON(http.StatusOK, gin.H{"success": true, "cancelled": cancelled})
+	}
+}
+
 // ==================== MERCADOPAGO ====================
 
 func createMercadoPagoPreference(tx db.PaymentTransactionInput) (string, string, error) {

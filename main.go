@@ -186,6 +186,7 @@ func main() {
 		customer.GET("/payment-info",      store.HandlerGetPaymentInfo())
 		customer.POST("/payment",              middleware.RateLimitMiddleware(orderLimiter), store.HandlerCreatePayment(database))
 		customer.GET("/payment-status/:id",    store.HandlerPaymentStatus(database))
+		customer.POST("/payment/:id/cancel",   store.HandlerCancelPayment(database))
 		customer.GET("/orders",            store.HandlerGetMyOrders(database))
 		customer.GET("/recharges",         store.HandlerGetMyRecharges(database))
 		customer.PUT("/profile",           store.HandlerUpdateProfile(database, cfg.SecretKey))

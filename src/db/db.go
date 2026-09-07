@@ -1291,6 +1291,24 @@ func GetPaymentTransaction(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, 
 	return t, err
 }
 
+// CancelPendingPayment marca como "failed" una transacción propia del cliente
+// que siga "pending" — se usa cuando el propio frontend detecta que la
+// pasarela redirigió con status=failure (el cliente canceló el pago), para no
+// dejarla mostrando "pendiente" en su historial hasta que el barrido
+// automático la expire a los 30 min. La condición WHERE customer_id=$2 AND
+// status='pending' hace que sea imposible cancelar un pago ajeno o uno que ya
+// se aprobó (p. ej. si el webhook llegó justo en ese instante).
+func CancelPendingPayment(db *sql.DB, id uuid.UUID, customerID uuid.UUID) (bool, error) {
+	result, err := db.Exec(`
+		UPDATE payment_transactions SET status='failed', updated_at=NOW()
+		WHERE id=$1 AND customer_id=$2 AND status='pending'`, id, customerID)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n > 0, err
+}
+
 func UpdatePaymentStatus(db *sql.DB, id uuid.UUID, status string, externalID string) error {
 	_, err := db.Exec(`UPDATE payment_transactions SET status=$1, external_id=$2, updated_at=NOW() WHERE id=$3`,
 		status, externalID, id)
