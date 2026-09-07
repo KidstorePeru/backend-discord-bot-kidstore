@@ -22,12 +22,25 @@ type EnvConfig struct {
 	EpicClient string `envconfig:"EPIC_CLIENT"`
 	EpicSecret string `envconfig:"EPIC_SECRET"`
 
-	// Discord
+	// Google OAuth (login/registro)
+	GoogleClientID     string `envconfig:"GOOGLE_CLIENT_ID"`
+	GoogleClientSecret string `envconfig:"GOOGLE_CLIENT_SECRET"`
+	GoogleRedirectURL  string `envconfig:"GOOGLE_REDIRECT_URL"`
+
+	// Discord OAuth (login/registro)
 	DiscordClientID     string `envconfig:"DISCORD_CLIENT_ID"`
 	DiscordClientSecret string `envconfig:"DISCORD_CLIENT_SECRET"`
 	DiscordRedirectURL  string `envconfig:"DISCORD_REDIRECT_URL"`
-	DiscordBotToken     string `envconfig:"DISCORD_BOT_TOKEN"`
-	DiscordGuildID      string `envconfig:"DISCORD_GUILD_ID"`
+
+	// Discord Bot (notificaciones + /slot)
+	DiscordBotToken          string `envconfig:"DISCORD_BOT_TOKEN"`
+	DiscordGuildID           string `envconfig:"DISCORD_GUILD_ID"`
+	DiscordWelcomeChannelID  string `envconfig:"DISCORD_WELCOME_CHANNEL_ID"`
+	DiscordRechargeChannelID string `envconfig:"DISCORD_RECHARGE_CHANNEL_ID"`
+	DiscordPurchaseChannelID string `envconfig:"DISCORD_PURCHASE_CHANNEL_ID"`
+	DiscordSlotChannelID     string `envconfig:"DISCORD_SLOT_CHANNEL_ID"`
+	DiscordFriend48hChannelID string `envconfig:"DISCORD_FRIEND_48H_CHANNEL_ID"`
+	DiscordAdminUserID        string `envconfig:"DISCORD_ADMIN_USER_ID"`
 
 	// App
 	FrontendURL      string `envconfig:"FRONTEND_URL" default:"http://localhost:5173"`
@@ -41,16 +54,17 @@ type EnvConfig struct {
 	// Payment Info (JSON string)
 	PaymentInfoJSON string `envconfig:"PAYMENT_INFO_JSON"`
 
-	// Autobuyer
-	AutobuyerURL    string `envconfig:"AUTOBUYER_URL"`
-	AutobuyerAPIKey string `envconfig:"AUTOBUYER_API_KEY"`
-
 	// Payment Gateways
 	MercadoPagoAccessToken string `envconfig:"MERCADOPAGO_ACCESS_TOKEN"`
 	PayPalClientID         string `envconfig:"PAYPAL_CLIENT_ID"`
 	PayPalClientSecret     string `envconfig:"PAYPAL_CLIENT_SECRET"`
 	PayPalMode             string `envconfig:"PAYPAL_MODE" default:"sandbox"`
 	NOWPaymentsAPIKey      string `envconfig:"NOWPAYMENTS_API_KEY"`
+
+	// dLocal Go (tarjetas y metodos locales fuera de Peru)
+	DLocalGoAPIKey    string `envconfig:"DLOCALGO_API_KEY"`
+	DLocalGoSecretKey string `envconfig:"DLOCALGO_SECRET_KEY"`
+	DLocalGoSandbox   bool   `envconfig:"DLOCALGO_SANDBOX" default:"true"`
 
 	// Email (Resend API preferred, SMTP fallback for local dev)
 	ResendAPIKey string `envconfig:"RESEND_API_KEY"`
@@ -64,18 +78,57 @@ type EnvConfig struct {
 // ==================== CUSTOMER ====================
 
 type Customer struct {
-	ID              uuid.UUID `json:"id"`
-	EpicUsername    string    `json:"epic_username"`
-	Email           *string   `json:"email,omitempty"`
-	PasswordHash    string    `json:"-"`
-	KCBalance       int       `json:"kc_balance"`
-	DiscordID       *string   `json:"discord_id,omitempty"`
-	DiscordUsername *string   `json:"discord_username,omitempty"`
-	IsActive        bool      `json:"is_active"`
-	IsVerified      bool      `json:"is_verified"`
-	IsAdmin         bool      `json:"is_admin"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID              uuid.UUID  `json:"id"`
+	EpicUsername    string     `json:"epic_username"`
+	Email           *string    `json:"email,omitempty"`
+	PasswordHash    string     `json:"-"`
+	HasPassword     bool       `json:"has_password"`
+	KCBalance       int        `json:"kc_balance"`
+	AvatarURL       *string    `json:"avatar_url,omitempty"`
+	Phone           *string    `json:"phone,omitempty"`
+	GoogleID        *string    `json:"google_id,omitempty"`
+	DiscordID       *string    `json:"discord_id,omitempty"`
+	DiscordUsername *string    `json:"discord_username,omitempty"`
+	EmailChangedAt  *time.Time `json:"-"`
+	IsActive        bool       `json:"is_active"`
+	IsVerified      bool       `json:"is_verified"`
+	IsAdmin         bool       `json:"is_admin"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+// EmailChangeCooldown es el tiempo minimo que debe pasar entre dos cambios de email.
+const EmailChangeCooldown = 90 * 24 * time.Hour
+
+// MaxEmailChangeAttempts es el numero maximo de intentos de codigo OTP antes
+// de invalidar la solicitud de cambio de email.
+const MaxEmailChangeAttempts = 5
+
+// NextEmailChangeAt devuelve la fecha en la que el cliente podra volver a
+// cambiar su email, o nil si ya puede hacerlo ahora mismo. El cooldown solo
+// aplica despues de un cambio real — la creacion de la cuenta no cuenta como
+// un cambio de email.
+func (c Customer) NextEmailChangeAt() *time.Time {
+	if c.EmailChangedAt == nil {
+		return nil
+	}
+	next := c.EmailChangedAt.Add(EmailChangeCooldown)
+	if next.After(time.Now()) {
+		return &next
+	}
+	return nil
+}
+
+// Public convierte un Customer (con campos privados) en la version segura
+// para exponer al cliente por la API.
+func (c Customer) Public() CustomerPublic {
+	return CustomerPublic{
+		ID: c.ID, EpicUsername: c.EpicUsername, Email: c.Email, KCBalance: c.KCBalance,
+		AvatarURL: c.AvatarURL, Phone: c.Phone, HasPassword: c.HasPassword,
+		GoogleLinked: c.GoogleID != nil, DiscordLinked: c.DiscordID != nil, DiscordUsername: c.DiscordUsername,
+		NextEmailChangeAt: c.NextEmailChangeAt(),
+		IsVerified:        c.IsVerified, IsAdmin: c.IsAdmin, CreatedAt: c.CreatedAt,
+	}
 }
 
 // ==================== GAME ACCOUNT (Bot) ====================
@@ -216,16 +269,46 @@ type ForgotPasswordRequest struct {
 	Email string `json:"email" binding:"required,email"`
 }
 
+type CompleteOAuthRegistrationRequest struct {
+	Token        string `json:"token" binding:"required"`
+	EpicUsername string `json:"epic_username" binding:"required,min=3,max=50"`
+}
+
 type ResetPasswordRequest struct {
 	Token    string `json:"token" binding:"required"`
 	Password string `json:"password" binding:"required,min=8"`
 }
 
 type UpdateProfileRequest struct {
-	EpicUsername    string `json:"epic_username" binding:"omitempty,min=3,max=50"`
-	Email           string `json:"email" binding:"omitempty,email"`
+	EpicUsername    string  `json:"epic_username" binding:"omitempty,min=3,max=50"`
+	Phone           *string `json:"phone"`
+	CurrentPassword string  `json:"current_password"`
+	NewPassword     string  `json:"new_password" binding:"omitempty,min=8"`
+}
+
+type UpdateAvatarRequest struct {
+	Avatar string `json:"avatar" binding:"required"`
+}
+
+// ==================== CAMBIO DE EMAIL (2FA / OTP) ====================
+
+type EmailChangeRequest struct {
+	ID         uuid.UUID `json:"id"`
+	CustomerID uuid.UUID `json:"customer_id"`
+	NewEmail   string    `json:"new_email"`
+	CodeHash   string    `json:"-"`
+	Attempts   int       `json:"-"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type RequestEmailChangeRequest struct {
+	NewEmail        string `json:"new_email" binding:"required,email"`
 	CurrentPassword string `json:"current_password"`
-	NewPassword     string `json:"new_password" binding:"omitempty,min=8"`
+}
+
+type ConfirmEmailChangeRequest struct {
+	Code string `json:"code" binding:"required,len=6"`
 }
 
 // ==================== EPIC GAMES API RESPONSES ====================
@@ -269,15 +352,20 @@ type EpicFriendEntry struct {
 // ==================== RESPONSES ====================
 
 type CustomerPublic struct {
-	ID              uuid.UUID `json:"id"`
-	EpicUsername    string    `json:"epic_username"`
-	Email           *string   `json:"email,omitempty"`
-	KCBalance       int       `json:"kc_balance"`
-	DiscordID       *string   `json:"discord_id,omitempty"`
-	DiscordUsername *string   `json:"discord_username,omitempty"`
-	IsVerified      bool      `json:"is_verified"`
-	IsAdmin         bool      `json:"is_admin"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID                uuid.UUID  `json:"id"`
+	EpicUsername      string     `json:"epic_username"`
+	Email             *string    `json:"email,omitempty"`
+	KCBalance         int        `json:"kc_balance"`
+	AvatarURL         *string    `json:"avatar_url,omitempty"`
+	Phone             *string    `json:"phone,omitempty"`
+	HasPassword       bool       `json:"has_password"`
+	GoogleLinked      bool       `json:"google_linked"`
+	DiscordLinked     bool       `json:"discord_linked"`
+	DiscordUsername   *string    `json:"discord_username,omitempty"`
+	NextEmailChangeAt *time.Time `json:"next_email_change_at,omitempty"`
+	IsVerified        bool       `json:"is_verified"`
+	IsAdmin           bool       `json:"is_admin"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 type AuthResponse struct {
@@ -296,6 +384,8 @@ type PaymentTransaction struct {
 	ProductName string    `json:"product_name"`
 	AmountPEN   float64   `json:"amount_pen"`
 	AmountUSD   float64   `json:"amount_usd"`
+	CurrencyCode string   `json:"currency_code,omitempty"` // divisa real cobrada por dLocal Go (si no es PEN/USD)
+	AmountLocal  float64  `json:"amount_local,omitempty"`  // monto en CurrencyCode
 	KCAmount    int       `json:"kc_amount"`
 	ExternalID      string    `json:"external_id"`
 	Status          string    `json:"status"` // pending, approved, failed, expired, fulfilled
@@ -309,7 +399,7 @@ type PaymentTransaction struct {
 type CreatePaymentRequest struct {
 	Gateway     string `json:"gateway" binding:"required"`      // mercadopago, paypal, binance_pay
 	PaymentType string `json:"payment_type" binding:"required"` // kc_recharge, product_purchase
-	ProductID   string `json:"product_id" binding:"required"`   // vb-800, pack-koi, starter, etc.
+	ProductID   string `json:"product_id" binding:"required"`   // starter, gamer, pro, legend
 }
 
 // ==================== REFRESH TOKEN ====================

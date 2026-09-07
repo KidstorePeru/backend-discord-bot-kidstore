@@ -4,7 +4,10 @@ import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/middleware"
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +31,9 @@ type PaymentConfig struct {
 	PayPalClientSecret  string
 	PayPalMode          string // sandbox or live
 	NOWPaymentsAPIKey   string
+	DLocalGoAPIKey      string
+	DLocalGoSecretKey   string
+	DLocalGoSandbox     bool
 	FrontendURL         string
 	BackendURL          string
 }
@@ -46,27 +52,11 @@ var productPrices = map[string]struct {
 	PricePEN float64
 	KCAmount int // only for kc_recharge
 }{
-	// KC packages (online prices with MP commission)
-	"starter": {Name: "Starter 800 KC", PricePEN: 14.70, KCAmount: 800},
-	"gamer":   {Name: "Gamer 2,400 KC", PricePEN: 41.60, KCAmount: 2400},
-	"pro":     {Name: "Pro 4,500 KC", PricePEN: 76.80, KCAmount: 4500},
-	"legend":  {Name: "Legend 12,500 KC", PricePEN: 211.30, KCAmount: 12500},
-	// V-Bucks (names MUST match autobuyer products.json)
-	"vb-800":   {Name: "800 V-Bucks", PricePEN: 23.20},
-	"vb-2400":  {Name: "2400 V-Bucks", PricePEN: 53.60},
-	"vb-4500":  {Name: "4500 V-Bucks", PricePEN: 79.80},
-	"vb-12500": {Name: "12500 V-Bucks", PricePEN: 190.00},
-	// Packs
-	"pack-koi":   {Name: "Pack de Reino Koi", PricePEN: 23.20},
-	"pack-drift": {Name: "Pack de Deriva Infinita", PricePEN: 23.20},
-	"pack-brite": {Name: "Operation Brite", PricePEN: 13.70},
-	// Club (name MUST match autobuyer card_products.json)
-	"club-monthly": {Name: "Fortnite Crew", PricePEN: 22.10},
-	// Rocket League (names MUST match autobuyer products.json with em dash)
-	"rl-500":  {Name: "500 \u2014 RL Credits", PricePEN: 13.70},
-	"rl-1100": {Name: "1100 \u2014 RL Credits", PricePEN: 26.30},
-	"rl-3000": {Name: "3000 \u2014 RL Credits", PricePEN: 59.90},
-	"rl-6500": {Name: "6500 \u2014 RL Credits", PricePEN: 116.50},
+	// KC packages — mismo precio para pago manual y automático (S/1.30 cada 100 KC)
+	"starter": {Name: "Starter 800 KC", PricePEN: 10.40, KCAmount: 800},
+	"gamer":   {Name: "Gamer 2,400 KC", PricePEN: 31.20, KCAmount: 2400},
+	"pro":     {Name: "Pro 4,500 KC", PricePEN: 58.50, KCAmount: 4500},
+	"legend":  {Name: "Legend 12,500 KC", PricePEN: 162.50, KCAmount: 12500},
 }
 
 // ==================== CREATE PAYMENT ====================
@@ -87,6 +77,10 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			CustomName  string  `json:"custom_name"`
 			CustomPrice float64 `json:"custom_price"`
 			CustomKC    int     `json:"custom_kc"`
+			// Currency: divisa de referencia del cliente (ISO 4217). Solo la usa
+			// dLocal Go, para cobrar en la moneda real del cliente en vez de
+			// forzar PEN/USD. Las demas pasarelas la ignoran.
+			Currency string `json:"currency"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
@@ -94,7 +88,7 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		}
 
 		// Validate gateway
-		if req.Gateway != "mercadopago" && req.Gateway != "paypal" && req.Gateway != "nowpayments" {
+		if req.Gateway != "mercadopago" && req.Gateway != "paypal" && req.Gateway != "nowpayments" && req.Gateway != "dlocalgo" {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "gateway invalido"})
 			return
 		}
@@ -105,7 +99,7 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		var kcAmount int
 
 		if req.CustomPrice > 0 && req.CustomName != "" {
-			// Custom product (bulk V-Bucks, custom KC, bulk RL credits)
+			// Custom amount (e.g. recarga de KC personalizada)
 			productName = req.CustomName
 			pricePEN = req.CustomPrice
 			kcAmount = req.CustomKC
@@ -147,6 +141,18 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			checkoutURL, externalID, err = createPayPalOrder(tx)
 		case "nowpayments":
 			checkoutURL, externalID, err = createNOWPaymentsInvoice(tx)
+		case "dlocalgo":
+			currencyCode := req.Currency
+			if currencyCode == "" {
+				currencyCode = "USD"
+			}
+			var amountLocal float64
+			amountLocal, err = convertPENToCurrency(pricePEN, currencyCode)
+			if err == nil {
+				tx.CurrencyCode = currencyCode
+				tx.AmountLocal = amountLocal
+				checkoutURL, externalID, err = createDLocalGoPayment(tx)
+			}
 		}
 
 		if err != nil {
@@ -191,10 +197,7 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 		// If payment is pending, check with MercadoPago directly (for localhost without webhooks)
 		if tx.Status == "pending" && tx.Gateway == "mercadopago" && tx.ExternalID != "" && paymentCfg.MercadoPagoToken != "" {
 			go func() {
-				req, _ := http.NewRequest("GET",
-					"https://api.mercadopago.com/checkout/preferences/"+tx.ExternalID, nil)
-				req.Header.Set("Authorization", "Bearer "+paymentCfg.MercadoPagoToken)
-				// Also check payments by external_reference
+				// Check payments by external_reference
 				reqPay, _ := http.NewRequest("GET",
 					"https://api.mercadopago.com/v1/payments/search?external_reference="+tx.ID.String(), nil)
 				reqPay.Header.Set("Authorization", "Bearer "+paymentCfg.MercadoPagoToken)
@@ -208,7 +211,6 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 					} `json:"results"`
 				}
 				json.NewDecoder(resp.Body).Decode(&result)
-				_ = req // suppress unused
 				if len(result.Results) > 0 && result.Results[0].Status == "approved" {
 					processApprovedPayment(database, tx.ID)
 				}
@@ -437,4 +439,128 @@ func createNOWPaymentsInvoice(tx db.PaymentTransactionInput) (string, string, er
 	}
 
 	return result.InvoiceURL, fmt.Sprintf("%v", result.ID), nil
+}
+
+// ==================== DLOCAL GO ====================
+// Pasarela para clientes fuera de Peru — cobra tarjetas internacionales y
+// metodos locales en la divisa real del cliente (no solo PEN/USD).
+// Docs: https://docs.dlocalgo.com/integration-api/welcome-to-dlocal-go-api
+
+func dlocalGoBaseURL() string {
+	if paymentCfg.DLocalGoSandbox {
+		return "https://api-sbx.dlocalgo.com"
+	}
+	return "https://api.dlocalgo.com"
+}
+
+// convertPENToCurrency convierte un precio en PEN a la divisa indicada,
+// usando el mismo tipo de cambio que ya usa el sitio para mostrar precios
+// de referencia — así el monto que se cobra coincide con lo que el cliente
+// vio en pantalla.
+func convertPENToCurrency(pricePEN float64, currencyCode string) (float64, error) {
+	if currencyCode == "PEN" {
+		return pricePEN, nil
+	}
+	rates := currentConversionRates()
+	rate, ok := rates[currencyCode]
+	if !ok || rate <= 0 {
+		return 0, fmt.Errorf("no se pudo obtener el tipo de cambio para %s", currencyCode)
+	}
+	return roundCents(pricePEN * rate), nil
+}
+
+func roundCents(n float64) float64 {
+	return float64(int64(n*100+0.5)) / 100
+}
+
+func createDLocalGoPayment(tx db.PaymentTransactionInput) (string, string, error) {
+	if paymentCfg.DLocalGoAPIKey == "" || paymentCfg.DLocalGoSecretKey == "" {
+		return "", "", fmt.Errorf("dLocal Go aún no está configurado")
+	}
+
+	payload := map[string]interface{}{
+		"amount":            tx.AmountLocal,
+		"currency":          tx.CurrencyCode,
+		"order_id":          tx.ID.String(),
+		"description":       tx.ProductName,
+		"notification_url":  fmt.Sprintf("%s/store/webhook/dlocalgo", paymentCfg.BackendURL),
+		"success_url":       fmt.Sprintf("%s/payment/return?id=%s&status=success", paymentCfg.FrontendURL, tx.ID),
+		"back_url":          fmt.Sprintf("%s/payment/return?id=%s&status=failure", paymentCfg.FrontendURL, tx.ID),
+	}
+
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", dlocalGoBaseURL()+"/v1/payments", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s:%s", paymentCfg.DLocalGoAPIKey, paymentCfg.DLocalGoSecretKey))
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("dLocal Go request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		return "", "", fmt.Errorf("dLocal Go error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		ID          string `json:"id"`
+		RedirectURL string `json:"redirect_url"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", "", fmt.Errorf("dLocal Go: respuesta inesperada: %s", string(respBody))
+	}
+	if result.RedirectURL == "" {
+		return "", "", fmt.Errorf("dLocal Go no devolvió redirect_url: %s", string(respBody))
+	}
+
+	return result.RedirectURL, result.ID, nil
+}
+
+// dlocalGoPaymentStatus consulta el estado real de un pago — se usa tras
+// recibir la notificación (que solo trae el ID de dLocal, sin más datos).
+// order_id es el nuestro (el que mandamos al crear el pago), y nos permite
+// ubicar la transacción interna sin necesitar una tabla de mapeo aparte —
+// igual que hace MercadoPago con su external_reference.
+func dlocalGoPaymentStatus(paymentID string) (status string, orderID string, err error) {
+	req, _ := http.NewRequest("GET", dlocalGoBaseURL()+"/v1/payments/"+paymentID, nil)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s:%s", paymentCfg.DLocalGoAPIKey, paymentCfg.DLocalGoSecretKey))
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("dLocal Go status request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", "", fmt.Errorf("dLocal Go status error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Status  string `json:"status"` // PENDING, PAID, REJECTED, CANCELLED, EXPIRED
+		OrderID string `json:"order_id"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", "", fmt.Errorf("dLocal Go: respuesta de estado inesperada: %s", string(respBody))
+	}
+	return result.Status, result.OrderID, nil
+}
+
+// verifyDLocalGoSignature valida la firma HMAC-SHA256 de una notificación:
+// HMAC-SHA256(secretKey, apiKey + payload) debe coincidir con la firma recibida.
+func verifyDLocalGoSignature(rawBody []byte, signatureHeader string) bool {
+	const prefix = "V2-HMAC-SHA256, Signature: "
+	if !strings.HasPrefix(signatureHeader, prefix) {
+		return false
+	}
+	receivedSig := strings.TrimPrefix(signatureHeader, prefix)
+
+	mac := hmac.New(sha256.New, []byte(paymentCfg.DLocalGoSecretKey))
+	mac.Write([]byte(paymentCfg.DLocalGoAPIKey))
+	mac.Write(rawBody)
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(receivedSig), []byte(expectedSig))
 }

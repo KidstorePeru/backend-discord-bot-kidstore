@@ -66,7 +66,7 @@ func SetSMTPConfig(cfg types.EnvConfig) {
 
 // ==================== PAYMENT APPROVED EMAIL ====================
 
-func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, lang, activationCode string) {
+func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, lang string) {
 	if cfg.SMTPHost == "" { return }
 	es := lang != "en"
 
@@ -82,24 +82,6 @@ func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, 
 				<td style="padding:8px 16px;color:#555;">%s</td>
 				<td style="padding:8px 16px;font-weight:bold;color:#2ecc71;">%d KC</td>
 			</tr>`, label, kcAmount)
-	}
-
-	activationLine := ""
-	if activationCode != "" {
-		codeLabel := "Codigo de activacion"
-		codeInstr := "Para activar tu producto escribe en el chatbot de la web: <strong>!activar " + activationCode + "</strong> o en Discord: <strong>/activar " + activationCode + "</strong>"
-		if !es {
-			codeLabel = "Activation code"
-			codeInstr = "To activate your product type in the web chatbot: <strong>!activar " + activationCode + "</strong> or on Discord: <strong>/activar " + activationCode + "</strong>"
-		}
-		activationLine = fmt.Sprintf(`
-			<tr>
-				<td style="padding:8px 16px;color:#555;">%s</td>
-				<td style="padding:8px 16px;font-weight:bold;color:#6c5ce7;font-size:18px;letter-spacing:2px;">%s</td>
-			</tr>
-			<tr>
-				<td colspan="2" style="padding:8px 16px;color:#888;font-size:12px;">%s</td>
-			</tr>`, codeLabel, activationCode, codeInstr)
 	}
 
 	title := "Pago Aprobado"
@@ -141,7 +123,7 @@ func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, 
 			<tr>
 				<td style="padding:8px 16px;color:#555;">%s</td>
 				<td style="padding:8px 16px;color:#333;">%s</td>
-			</tr>%s%s
+			</tr>%s
 		</table>
 		<p style="margin:16px 0 0;color:#888;font-size:13px;">%s</p>
 	</td></tr>
@@ -152,7 +134,7 @@ func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, 
 </td></tr>
 </table>
 </body>
-</html>`, title, intro, productLabel, productName, amountLabel, amountPEN, gatewayLabel, gateway, kcLine, activationLine, footer)
+</html>`, title, intro, productLabel, productName, amountLabel, amountPEN, gatewayLabel, gateway, kcLine, footer)
 
 	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: payment approved send error", "to", toEmail, "error", err)

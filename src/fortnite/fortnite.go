@@ -2,6 +2,7 @@ package fortnite
 
 import (
 	"KidStoreStore/src/db"
+	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/types"
 	"bytes"
 	"database/sql"
@@ -56,9 +57,30 @@ func HandlerConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 		}
 		defer respToken.Body.Close()
 
+		tokenBodyBytes, err := io.ReadAll(respToken.Body)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Error leyendo la respuesta del token de cliente"})
+			return
+		}
+		slog.Info("Epic client_credentials", "status", respToken.StatusCode, "body", string(tokenBodyBytes))
+
+		// Si Epic rechazó las credenciales de cliente (EPIC_CLIENT/EPIC_SECRET
+		// mal configuradas o vacías), cortar aquí — antes esto seguía de largo
+		// con un access_token vacío y el verdadero error se ocultaba detrás de
+		// un genérico "Epic Games rechazó la solicitud" en deviceAuthorization.
+		if respToken.StatusCode != 200 {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"success": false,
+				"error":   "Epic Games rechazó las credenciales EPIC_CLIENT/EPIC_SECRET configuradas en el servidor",
+				"details": string(tokenBodyBytes),
+				"status":  respToken.StatusCode,
+			})
+			return
+		}
+
 		var tokenResult types.EpicAccessTokenResult
-		if err := json.NewDecoder(respToken.Body).Decode(&tokenResult); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Respuesta inválida del token de cliente"})
+		if err := json.Unmarshal(tokenBodyBytes, &tokenResult); err != nil || tokenResult.AccessToken == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Respuesta inválida del token de cliente", "details": string(tokenBodyBytes)})
 			return
 		}
 
@@ -376,9 +398,10 @@ func refreshWithDeviceSecrets(database *sql.DB, account types.GameAccount) (type
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		// Cuenta inservible — desactivar
-		db.DeactivateGameAccount(database, account.ID)
-		return account, fmt.Errorf("device auth failed with status %d — account deactivated", resp.StatusCode)
+		// No desactivar aquí directamente — devolver el error y dejar que quien
+		// llama (el health check, con su contador de fallos seguidos) decida
+		// si esto ya pasó suficientes veces como para ser un problema real.
+		return account, fmt.Errorf("device auth failed with status %d", resp.StatusCode)
 	}
 
 	var result types.EpicLoginResult
@@ -501,6 +524,66 @@ func CheckFriendship(database *sql.DB, account types.GameAccount, receiverAccoun
 	return true, createdAt, nil
 }
 
+// ListFriends devuelve la lista completa de amigos de una cuenta bot
+// (accountId + fecha en que se hicieron amigos).
+func ListFriends(database *sql.DB, account types.GameAccount) ([]types.EpicFriendEntry, error) {
+	botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
+	req, _ := http.NewRequest("GET",
+		fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/friends", botIDClean),
+		nil)
+
+	resp, _, err := executeWithRefresh(database, account, req)
+	if err != nil {
+		return nil, fmt.Errorf("error listando amigos: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("error listando amigos: status %d", resp.StatusCode)
+	}
+
+	var friends []types.EpicFriendEntry
+	if err := json.NewDecoder(resp.Body).Decode(&friends); err != nil {
+		return nil, fmt.Errorf("error decodificando lista de amigos: %w", err)
+	}
+	return friends, nil
+}
+
+// ResolveDisplayNames resuelve en un solo request los displayName de varios
+// accountId (usa la sesión de una cuenta bot cualquiera, no importa cuál).
+func ResolveDisplayNames(database *sql.DB, account types.GameAccount, accountIDs []string) (map[string]string, error) {
+	result := make(map[string]string)
+	if len(accountIDs) == 0 {
+		return result, nil
+	}
+	params := url.Values{}
+	for _, id := range accountIDs {
+		params.Add("accountId", id)
+	}
+	req, _ := http.NewRequest("GET",
+		"https://account-public-service-prod.ol.epicgames.com/account/api/public/account?"+params.Encode(),
+		nil)
+
+	resp, _, err := executeWithRefresh(database, account, req)
+	if err != nil {
+		return nil, fmt.Errorf("error resolviendo cuentas: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("error resolviendo cuentas: status %d", resp.StatusCode)
+	}
+
+	var accounts []types.EpicPublicAccount
+	if err := json.NewDecoder(resp.Body).Decode(&accounts); err != nil {
+		return nil, fmt.Errorf("error decodificando cuentas: %w", err)
+	}
+	for _, a := range accounts {
+		result[a.AccountId] = a.DisplayName
+	}
+	return result, nil
+}
+
 // ==================== SEND GIFT ====================
 
 func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, offerID string, priceVBucks int, itemName, message string) error {
@@ -604,6 +687,73 @@ func acceptPendingFriendRequests(database *sql.DB) {
 				acceptResp.Body.Close()
 				slog.Info("Bots: solicitud aceptada", "friendAccountId", friend.AccountId, "bot", account.DisplayName)
 			}
+		}
+	}
+}
+
+// ==================== GOROUTINE: Aviso de 48h de amistad cumplidas ====================
+
+func StartFriendship48hChecker(database *sql.DB, intervalSeconds int) {
+	go func() {
+		ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			checkFriendship48h(database)
+		}
+	}()
+	slog.Info("Bots: verificación de 48h de amistad", "intervalSeconds", intervalSeconds)
+}
+
+func checkFriendship48h(database *sql.DB) {
+	accounts, err := db.GetActiveGameAccounts(database, encryptionKey)
+	if err != nil || len(accounts) == 0 {
+		return
+	}
+
+	type eligibleFriend struct {
+		accountID string
+		createdAt time.Time
+	}
+
+	for _, account := range accounts {
+		friends, err := ListFriends(database, account)
+		if err != nil || len(friends) == 0 {
+			continue
+		}
+
+		var eligibleIDs []string
+		var eligible []eligibleFriend
+		for _, f := range friends {
+			createdAt, err := time.Parse(time.RFC3339, f.Created)
+			if err != nil || time.Since(createdAt) < 48*time.Hour {
+				continue
+			}
+			eligibleIDs = append(eligibleIDs, f.AccountId)
+			eligible = append(eligible, eligibleFriend{f.AccountId, createdAt})
+		}
+		if len(eligibleIDs) == 0 {
+			continue
+		}
+
+		names, err := ResolveDisplayNames(database, account, eligibleIDs)
+		if err != nil {
+			continue
+		}
+
+		for _, f := range eligible {
+			displayName, ok := names[f.accountID]
+			if !ok {
+				continue
+			}
+			customer, err := db.GetCustomerByEpicUsername(database, displayName)
+			if err != nil {
+				continue // no es un cliente nuestro
+			}
+			if db.HasBeenNotified48h(database, customer.ID, account.ID) {
+				continue
+			}
+			discordbot.NotifyFriendship48h(customer)
+			db.MarkNotified48h(database, customer.ID, account.ID)
 		}
 	}
 }

@@ -1,29 +1,19 @@
 package store
 
 import (
-	"KidStoreStore/src/autobuyer"
 	"KidStoreStore/src/db"
-	"crypto/rand"
+	"KidStoreStore/src/discordbot"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
-
-
-var notifyProductPurchase func(productName, epicUsername, gateway string, amountPEN float64)
-
-func SetProductPurchaseNotifier(fn func(productName, epicUsername, gateway string, amountPEN float64)) {
-	notifyProductPurchase = fn
-}
 
 // ==================== COMMON ====================
 
@@ -51,61 +41,14 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 		slog.Info("KC credited via payment", "customer", tx.CustomerID, "kc", tx.KCAmount, "gateway", tx.Gateway)
 	}
 
-	// For product purchases, generate activation code and notify
-	if tx.PaymentType == "product_purchase" {
-		// Generate 8-char activation code
-		codeBytes := make([]byte, 4)
-		rand.Read(codeBytes)
-		activationCode := strings.ToUpper(hex.EncodeToString(codeBytes))
-		if err := db.SetActivationCode(database, txID, activationCode); err != nil {
-			slog.Error("Failed to set activation code", "txID", txID, "error", err)
-		}
-		tx.ActivationCode = activationCode
-
-		// Register the code in the autobuyer so !activar works in the chatbot
-		epicUsername := ""
-		if cust, err := db.GetCustomerByID(database, tx.CustomerID); err == nil {
-			epicUsername = cust.EpicUsername
-		}
-		if autobuyer.IsConfigured() {
-			go func() {
-				if err := autobuyer.RegisterCode(activationCode, tx.ProductName, "razer", epicUsername, tx.ID.String()); err != nil {
-					slog.Error("Failed to register code in autobuyer", "code", activationCode, "error", err)
-				} else {
-					slog.Info("Code registered in autobuyer", "code", activationCode, "product", tx.ProductName)
-				}
-			}()
-		}
-
-		slog.Info("Product payment approved — pending fulfillment", "customer", tx.CustomerID, "product", tx.ProductID, "gateway", tx.Gateway)
-		db.AddAuditLog(database, &tx.CustomerID, "PRODUCT_PAID",
-			fmt.Sprintf("pago aprobado: %s via %s (S/%.2f)", tx.ProductName, tx.Gateway, tx.AmountPEN), "webhook")
-
-		// Notify customer via Discord DM
-		customer, err := db.GetCustomerByID(database, tx.CustomerID)
-		if err == nil && customer.DiscordID != nil && *customer.DiscordID != "" {
-			lang, _ := db.GetDiscordLang(database, *customer.DiscordID)
-			if lang == "" { lang = "es" }
-			if notifyDiscord != nil {
-				go notifyDiscord(*customer.DiscordID, "product_paid", tx.ProductName, 0, lang)
-			}
-		}
-
-		// Notify admin via Discord (product needs manual fulfillment)
-		if notifyProductPurchase != nil {
-			epicUsername := ""
-			if err == nil { epicUsername = customer.EpicUsername }
-			go notifyProductPurchase(tx.ProductName, epicUsername, tx.Gateway, tx.AmountPEN)
-		}
-	}
-
 	// Send payment approved email notification
-	if customer, err := db.GetCustomerByID(database, tx.CustomerID); err == nil && customer.Email != nil && *customer.Email != "" {
-		emailLang := "es"
-		if customer.DiscordID != nil {
-			if dl, err := db.GetDiscordLang(database, *customer.DiscordID); err == nil && dl != "" { emailLang = dl }
+	if customer, err := db.GetCustomerByID(database, tx.CustomerID); err == nil {
+		if customer.Email != nil && *customer.Email != "" {
+			go SendPaymentApprovedEmail(smtpConfig, *customer.Email, tx.ProductName, tx.AmountPEN, tx.KCAmount, tx.Gateway, "es")
 		}
-		go SendPaymentApprovedEmail(smtpConfig, *customer.Email, tx.ProductName, tx.AmountPEN, tx.KCAmount, tx.Gateway, emailLang, tx.ActivationCode)
+		if tx.PaymentType == "kc_recharge" && tx.KCAmount > 0 {
+			discordbot.NotifyRecharge(customer, tx.KCAmount, customer.KCBalance, tx.Gateway)
+		}
 	}
 
 	return nil
@@ -298,6 +241,51 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("NOWPayments processing failed", "txID", txID, "error", err)
+			}
+		}()
+
+		c.JSON(http.StatusOK, gin.H{"received": true})
+	}
+}
+
+// ==================== DLOCAL GO WEBHOOK ====================
+
+func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		slog.Info("dLocal Go webhook received", "body", string(body))
+
+		if !verifyDLocalGoSignature(body, c.GetHeader("Authorization")) {
+			slog.Warn("dLocal Go webhook: firma inválida, ignorando")
+			c.JSON(http.StatusOK, gin.H{"received": true})
+			return
+		}
+
+		var notification struct {
+			PaymentID string `json:"payment_id"`
+		}
+		if err := json.Unmarshal(body, &notification); err != nil || notification.PaymentID == "" {
+			c.JSON(http.StatusOK, gin.H{"received": true})
+			return
+		}
+
+		go func() {
+			status, orderID, err := dlocalGoPaymentStatus(notification.PaymentID)
+			if err != nil {
+				slog.Error("dLocal Go status query failed", "paymentID", notification.PaymentID, "error", err)
+				return
+			}
+			if status != "PAID" {
+				return
+			}
+
+			txID, err := uuid.Parse(orderID)
+			if err != nil {
+				slog.Error("dLocal Go invalid order_id", "id", orderID)
+				return
+			}
+			if err := processApprovedPayment(database, txID); err != nil {
+				slog.Error("dLocal Go processing failed", "txID", txID, "error", err)
 			}
 		}()
 

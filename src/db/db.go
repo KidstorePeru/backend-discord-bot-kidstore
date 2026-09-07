@@ -213,6 +213,85 @@ func CreateTables(db *sql.DB) error {
 		END $$`,
 		`DELETE FROM pending_registrations WHERE expires_at < NOW()`,
 		`DELETE FROM refresh_tokens WHERE expires_at < NOW()`,
+		// Add google_id column to customers (OAuth login)
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='customers' AND column_name='google_id') THEN
+				ALTER TABLE customers ADD COLUMN google_id VARCHAR(255) UNIQUE;
+			END IF;
+		END $$`,
+		`CREATE TABLE IF NOT EXISTS pending_oauth_registrations (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			provider VARCHAR(20) NOT NULL,
+			provider_id VARCHAR(255) NOT NULL,
+			email VARCHAR(255),
+			display_name VARCHAR(255),
+			token VARCHAR(255) NOT NULL UNIQUE,
+			expires_at TIMESTAMP NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			UNIQUE(provider, provider_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_oauth_token ON pending_oauth_registrations(token)`,
+		`DELETE FROM pending_oauth_registrations WHERE expires_at < NOW()`,
+		// Perfil ampliado: avatar, telefono, control de cambio de email, y si
+		// el cliente tiene una contrasena real (falso para cuentas creadas por OAuth)
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='customers' AND column_name='avatar_url') THEN
+				ALTER TABLE customers ADD COLUMN avatar_url TEXT;
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='customers' AND column_name='phone') THEN
+				ALTER TABLE customers ADD COLUMN phone VARCHAR(30);
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='customers' AND column_name='email_changed_at') THEN
+				ALTER TABLE customers ADD COLUMN email_changed_at TIMESTAMP;
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='customers' AND column_name='has_password') THEN
+				ALTER TABLE customers ADD COLUMN has_password BOOLEAN NOT NULL DEFAULT true;
+			END IF;
+		END $$`,
+		// Verificacion 2FA/OTP por correo para confirmar el cambio de email
+		`CREATE TABLE IF NOT EXISTS email_change_requests (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+			new_email VARCHAR(255) NOT NULL,
+			code_hash VARCHAR(255) NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			expires_at TIMESTAMP NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_email_change_customer ON email_change_requests(customer_id)`,
+		`DELETE FROM email_change_requests WHERE expires_at < NOW()`,
+		// Historial de tiradas del /slot de Discord (auditoria)
+		`CREATE TABLE IF NOT EXISTS slot_plays (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+			bet_amount INTEGER NOT NULL,
+			won BOOLEAN NOT NULL,
+			payout_amount INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_slot_plays_customer ON slot_plays(customer_id)`,
+		// dLocal Go cobra en la divisa real del cliente (no solo PEN/USD) —
+		// se guarda aparte para no romper el significado de amount_pen/amount_usd
+		// que usan las demas pasarelas.
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payment_transactions' AND column_name='currency_code') THEN
+				ALTER TABLE payment_transactions ADD COLUMN currency_code VARCHAR(10);
+				ALTER TABLE payment_transactions ADD COLUMN amount_local NUMERIC(14,2);
+			END IF;
+		END $$`,
+		// Evita repetir el aviso de "ya cumpliste 48h de amistad" para el mismo par cliente-bot
+		`CREATE TABLE IF NOT EXISTS friendship_48h_notified (
+			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+			bot_id UUID NOT NULL REFERENCES game_accounts(id) ON DELETE CASCADE,
+			notified_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (customer_id, bot_id)
+		)`,
 	}
 
 	for _, q := range queries {
@@ -472,6 +551,35 @@ func EpicUsernameExists(db *sql.DB, epicUsername string) bool {
 	return count > 0
 }
 
+// GetCustomerByEpicUsername busca por usuario Epic sin distinguir mayúsculas/minúsculas.
+func GetCustomerByEpicUsername(db *sql.DB, epicUsername string) (types.Customer, error) {
+	var c types.Customer
+	err := db.QueryRow(`
+		SELECT id, epic_username, email, password_hash, kc_balance,
+		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
+		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		FROM customers WHERE LOWER(epic_username) = LOWER($1) AND is_active = true`, epicUsername).
+		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
+			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+	return c, err
+}
+
+// HasBeenNotified48h indica si ya se le avisó a este cliente que cumplió 48h
+// de amistad con este bot (para no repetir el aviso en cada ciclo del worker).
+func HasBeenNotified48h(db *sql.DB, customerID uuid.UUID, botID uuid.UUID) bool {
+	var count int
+	db.QueryRow(`SELECT COUNT(*) FROM friendship_48h_notified WHERE customer_id=$1 AND bot_id=$2`, customerID, botID).Scan(&count)
+	return count > 0
+}
+
+func MarkNotified48h(db *sql.DB, customerID uuid.UUID, botID uuid.UUID) error {
+	_, err := db.Exec(`
+		INSERT INTO friendship_48h_notified (customer_id, bot_id, notified_at)
+		VALUES ($1, $2, NOW()) ON CONFLICT (customer_id, bot_id) DO NOTHING`, customerID, botID)
+	return err
+}
+
 func CreateVerifiedCustomer(db *sql.DB, c types.Customer) error {
 	_, err := db.Exec(`
 		INSERT INTO customers (id, epic_username, email, password_hash, kc_balance, is_verified, created_at, updated_at)
@@ -480,22 +588,16 @@ func CreateVerifiedCustomer(db *sql.DB, c types.Customer) error {
 	return err
 }
 
-func CreateCustomer(db *sql.DB, c types.Customer) error {
-	_, err := db.Exec(`
-		INSERT INTO customers (id, epic_username, email, password_hash, kc_balance, is_verified, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 0, false, NOW(), NOW())`,
-		c.ID, c.EpicUsername, c.Email, c.PasswordHash)
-	return err
-}
-
 func GetCustomerByEmail(db *sql.DB, email string) (types.Customer, error) {
 	var c types.Customer
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
-		       discord_id, discord_username, is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
+		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
 		FROM customers WHERE email = $1 AND is_active = true`, email).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
-			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -503,11 +605,60 @@ func GetCustomerByID(db *sql.DB, id uuid.UUID) (types.Customer, error) {
 	var c types.Customer
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
-		       discord_id, discord_username, is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
+		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
 		FROM customers WHERE id = $1 AND is_active = true`, id).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
-			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
+}
+
+func GetCustomerByGoogleID(db *sql.DB, googleID string) (types.Customer, error) {
+	var c types.Customer
+	err := db.QueryRow(`
+		SELECT id, epic_username, email, password_hash, kc_balance,
+		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
+		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		FROM customers WHERE google_id = $1 AND is_active = true`, googleID).
+		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
+			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+	return c, err
+}
+
+func GetCustomerByDiscordID(db *sql.DB, discordID string) (types.Customer, error) {
+	var c types.Customer
+	err := db.QueryRow(`
+		SELECT id, epic_username, email, password_hash, kc_balance,
+		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
+		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		FROM customers WHERE discord_id = $1 AND is_active = true`, discordID).
+		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
+			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+	return c, err
+}
+
+func LinkGoogleID(db *sql.DB, customerID uuid.UUID, googleID string) error {
+	_, err := db.Exec(`UPDATE customers SET google_id=$1, updated_at=NOW() WHERE id=$2`, googleID, customerID)
+	return err
+}
+
+func LinkDiscordID(db *sql.DB, customerID uuid.UUID, discordID, discordUsername string) error {
+	_, err := db.Exec(`UPDATE customers SET discord_id=$1, discord_username=$2, updated_at=NOW() WHERE id=$3`,
+		discordID, discordUsername, customerID)
+	return err
+}
+
+func UnlinkGoogleID(db *sql.DB, customerID uuid.UUID) error {
+	_, err := db.Exec(`UPDATE customers SET google_id=NULL, updated_at=NOW() WHERE id=$1`, customerID)
+	return err
+}
+
+func UnlinkDiscordID(db *sql.DB, customerID uuid.UUID) error {
+	_, err := db.Exec(`UPDATE customers SET discord_id=NULL, discord_username=NULL, updated_at=NOW() WHERE id=$1`, customerID)
+	return err
 }
 
 func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error) {
@@ -520,7 +671,8 @@ func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error)
 
 	rows, err := db.Query(`
     SELECT id, epic_username, email, kc_balance,
-           discord_id, discord_username, is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+           google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
+           is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
     FROM customers WHERE is_active=true ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
@@ -528,7 +680,8 @@ func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error)
 	for rows.Next() {
 		var c types.Customer
 		if err := rows.Scan(&c.ID, &c.EpicUsername, &c.Email, &c.KCBalance,
-			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		customers = append(customers, c)
@@ -536,30 +689,98 @@ func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error)
 	return customers, total, nil
 }
 
+func SetAvatar(db *sql.DB, customerID uuid.UUID, avatarURL string) error {
+	_, err := db.Exec(`UPDATE customers SET avatar_url=$1, updated_at=NOW() WHERE id=$2`, avatarURL, customerID)
+	return err
+}
+
 func VerifyCustomerEmail(db *sql.DB, customerID uuid.UUID) error {
 	_, err := db.Exec(`UPDATE customers SET is_verified=true, updated_at=NOW() WHERE id=$1`, customerID)
 	return err
 }
 
-func LinkDiscord(db *sql.DB, customerID uuid.UUID, discordID, discordUsername string) error {
-	_, err := db.Exec(`UPDATE customers SET discord_id=$1, discord_username=$2, updated_at=NOW() WHERE id=$3`,
-		discordID, discordUsername, customerID)
+// ==================== OAUTH REGISTRATION (Google / Discord) ====================
+
+type PendingOAuthRegistration struct {
+	ID          uuid.UUID
+	Provider    string
+	ProviderID  string
+	Email       *string
+	DisplayName *string
+	Token       string
+	ExpiresAt   time.Time
+	CreatedAt   time.Time
+}
+
+// CreatePendingOAuthRegistration guarda (o renueva) el registro pendiente de un
+// login OAuth de una cuenta nueva. Si el proveedor+provider_id ya tenia un
+// registro pendiente (el usuario cerro la pantalla sin terminar), se reemplaza
+// el token para que el enlace anterior deje de servir.
+func CreatePendingOAuthRegistration(db *sql.DB, provider, providerID string, email, displayName *string, token string) error {
+	_, err := db.Exec(`
+		INSERT INTO pending_oauth_registrations (id, provider, provider_id, email, display_name, token, expires_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '30 minutes', NOW())
+		ON CONFLICT (provider, provider_id) DO UPDATE SET
+			email=EXCLUDED.email, display_name=EXCLUDED.display_name,
+			token=EXCLUDED.token, expires_at=EXCLUDED.expires_at, created_at=NOW()`,
+		uuid.New(), provider, providerID, email, displayName, token)
 	return err
 }
 
-func UpdateProfile(db *sql.DB, customerID uuid.UUID, epicUsername, email, passwordHash string) error {
+func GetPendingOAuthRegistration(db *sql.DB, token string) (PendingOAuthRegistration, error) {
+	var p PendingOAuthRegistration
+	err := db.QueryRow(`
+		SELECT id, provider, provider_id, email, display_name, token, expires_at, created_at
+		FROM pending_oauth_registrations
+		WHERE token=$1 AND expires_at > NOW()`, token).
+		Scan(&p.ID, &p.Provider, &p.ProviderID, &p.Email, &p.DisplayName, &p.Token, &p.ExpiresAt, &p.CreatedAt)
+	return p, err
+}
+
+func DeletePendingOAuthRegistration(db *sql.DB, token string) {
+	db.Exec(`DELETE FROM pending_oauth_registrations WHERE token=$1`, token)
+}
+
+// CreateOAuthCustomer crea una cuenta ya verificada (el proveedor OAuth ya
+// confirmo el correo) con una contrasena aleatoria inutilizable — el cliente
+// solo puede entrar via el proveedor OAuth hasta que configure una contrasena
+// propia desde su perfil.
+func CreateOAuthCustomer(db *sql.DB, epicUsername string, email *string, randomPasswordHash string, provider, providerID, displayName string) (types.Customer, error) {
+	customerID := uuid.New()
+	var err error
+	switch provider {
+	case "google":
+		_, err = db.Exec(`
+			INSERT INTO customers (id, epic_username, email, password_hash, kc_balance, google_id, has_password, is_verified, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, 0, $5, false, true, NOW(), NOW())`,
+			customerID, epicUsername, email, randomPasswordHash, providerID)
+	case "discord":
+		_, err = db.Exec(`
+			INSERT INTO customers (id, epic_username, email, password_hash, kc_balance, discord_id, discord_username, has_password, is_verified, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, 0, $5, $6, false, true, NOW(), NOW())`,
+			customerID, epicUsername, email, randomPasswordHash, providerID, displayName)
+	default:
+		return types.Customer{}, fmt.Errorf("proveedor OAuth desconocido: %s", provider)
+	}
+	if err != nil {
+		return types.Customer{}, err
+	}
+	return GetCustomerByID(db, customerID)
+}
+
+func UpdateProfile(db *sql.DB, customerID uuid.UUID, epicUsername, passwordHash string, phone *string) error {
 	if epicUsername != "" {
 		if _, err := db.Exec(`UPDATE customers SET epic_username=$1, updated_at=NOW() WHERE id=$2`, epicUsername, customerID); err != nil {
 			return err
 		}
 	}
-	if email != "" {
-		if _, err := db.Exec(`UPDATE customers SET email=$1, updated_at=NOW() WHERE id=$2`, email, customerID); err != nil {
+	if passwordHash != "" {
+		if _, err := db.Exec(`UPDATE customers SET password_hash=$1, has_password=true, updated_at=NOW() WHERE id=$2`, passwordHash, customerID); err != nil {
 			return err
 		}
 	}
-	if passwordHash != "" {
-		if _, err := db.Exec(`UPDATE customers SET password_hash=$1, updated_at=NOW() WHERE id=$2`, passwordHash, customerID); err != nil {
+	if phone != nil {
+		if _, err := db.Exec(`UPDATE customers SET phone=$1, updated_at=NOW() WHERE id=$2`, *phone, customerID); err != nil {
 			return err
 		}
 	}
@@ -620,6 +841,43 @@ func MarkResetTokenUsed(db *sql.DB, token string) error {
 	return err
 }
 
+// ==================== CAMBIO DE EMAIL (2FA / OTP) ====================
+
+// Reemplaza cualquier solicitud pendiente del cliente por una nueva
+func CreateEmailChangeRequest(db *sql.DB, customerID uuid.UUID, newEmail, codeHash string) error {
+	db.Exec(`DELETE FROM email_change_requests WHERE customer_id=$1`, customerID)
+	_, err := db.Exec(`
+		INSERT INTO email_change_requests (id, customer_id, new_email, code_hash, expires_at, created_at)
+		VALUES ($1, $2, $3, $4, NOW() + INTERVAL '15 minutes', NOW())`,
+		uuid.New(), customerID, newEmail, codeHash)
+	return err
+}
+
+func GetEmailChangeRequest(db *sql.DB, customerID uuid.UUID) (types.EmailChangeRequest, error) {
+	var r types.EmailChangeRequest
+	err := db.QueryRow(`
+		SELECT id, customer_id, new_email, code_hash, attempts, expires_at, created_at
+		FROM email_change_requests
+		WHERE customer_id=$1 AND expires_at > NOW()`, customerID).
+		Scan(&r.ID, &r.CustomerID, &r.NewEmail, &r.CodeHash, &r.Attempts, &r.ExpiresAt, &r.CreatedAt)
+	return r, err
+}
+
+func IncrementEmailChangeAttempts(db *sql.DB, id uuid.UUID) error {
+	_, err := db.Exec(`UPDATE email_change_requests SET attempts=attempts+1 WHERE id=$1`, id)
+	return err
+}
+
+func DeleteEmailChangeRequest(db *sql.DB, customerID uuid.UUID) error {
+	_, err := db.Exec(`DELETE FROM email_change_requests WHERE customer_id=$1`, customerID)
+	return err
+}
+
+func ConfirmEmailChange(db *sql.DB, customerID uuid.UUID, newEmail string) error {
+	_, err := db.Exec(`UPDATE customers SET email=$1, email_changed_at=NOW(), updated_at=NOW() WHERE id=$2`, newEmail, customerID)
+	return err
+}
+
 // ==================== KC — TRANSACCIONES ATÓMICAS ====================
 
 func RechargeKC(db *sql.DB, customerID uuid.UUID, amountKC int, amountSoles *float64, note *string, approvedBy string, method string) error {
@@ -637,6 +895,23 @@ func RechargeKC(db *sql.DB, customerID uuid.UUID, amountKC int, amountSoles *flo
 		uuid.New(), customerID, amountKC, amountSoles, method, note, approvedBy)
 	if err != nil { return err }
 	return tx.Commit()
+}
+
+// DeductKCManual quita KC del balance de un cliente (corrección administrativa,
+// no una compra) — devuelve el nuevo balance.
+func DeductKCManual(db *sql.DB, customerID uuid.UUID, amount int) (int, error) {
+	if amount <= 0 { return 0, fmt.Errorf("amount must be positive") }
+	tx, err := db.Begin()
+	if err != nil { return 0, err }
+	defer tx.Rollback()
+	var currentBalance int
+	err = tx.QueryRow(`SELECT kc_balance FROM customers WHERE id=$1 AND is_active=true FOR UPDATE`, customerID).Scan(&currentBalance)
+	if err != nil { return 0, fmt.Errorf("cliente no encontrado") }
+	if currentBalance < amount { return 0, fmt.Errorf("balance insuficiente: tiene %d KC, se quiere quitar %d", currentBalance, amount) }
+	_, err = tx.Exec(`UPDATE customers SET kc_balance=kc_balance-$1, updated_at=NOW() WHERE id=$2`, amount, customerID)
+	if err != nil { return 0, err }
+	if err := tx.Commit(); err != nil { return 0, err }
+	return currentBalance - amount, nil
 }
 
 func DeductKCAndCreateOrder(db *sql.DB, customerID uuid.UUID, epicUsername string, req types.CreateOrderRequest) (types.Order, error) {
@@ -664,6 +939,32 @@ func DeductKCAndCreateOrder(db *sql.DB, customerID uuid.UUID, epicUsername strin
 		PriceKC: req.PriceKC, PriceVBucks: req.PriceVBucks, Status: "pending",
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}, nil
+}
+
+// PlaceSlotBet descuenta la apuesta y, si ganó, acredita el pago — todo en
+// una sola transacción atómica con row lock, igual que DeductKCAndCreateOrder.
+func PlaceSlotBet(db *sql.DB, customerID uuid.UUID, betAmount, payoutAmount int, won bool) (int, error) {
+	tx, err := db.Begin()
+	if err != nil { return 0, err }
+	defer tx.Rollback()
+	var currentBalance int
+	err = tx.QueryRow(`SELECT kc_balance FROM customers WHERE id=$1 AND is_active=true FOR UPDATE`, customerID).Scan(&currentBalance)
+	if err != nil { return 0, fmt.Errorf("cliente no encontrado") }
+	if currentBalance < betAmount { return 0, fmt.Errorf("balance insuficiente: tienes %d, necesitas %d", currentBalance, betAmount) }
+	delta := -betAmount
+	if won { delta += payoutAmount }
+	_, err = tx.Exec(`UPDATE customers SET kc_balance=kc_balance+$1, updated_at=NOW() WHERE id=$2`, delta, customerID)
+	if err != nil { return 0, err }
+	if err := tx.Commit(); err != nil { return 0, err }
+	return currentBalance + delta, nil
+}
+
+func RecordSlotPlay(db *sql.DB, customerID uuid.UUID, betAmount int, won bool, payoutAmount int) error {
+	_, err := db.Exec(`
+		INSERT INTO slot_plays (id, customer_id, bet_amount, won, payout_amount, created_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())`,
+		uuid.New(), customerID, betAmount, won, payoutAmount)
+	return err
 }
 
 func RefundOrder(db *sql.DB, orderID uuid.UUID) error {
@@ -698,6 +999,25 @@ func UpdateOrderStatus(db *sql.DB, orderID uuid.UUID, status string, gameAccount
 	_, err := db.Exec(`UPDATE orders SET status=$1, game_account_id=$2, error_msg=$3, updated_at=NOW() WHERE id=$4`,
 		status, gameAccountID, errMsg, orderID)
 	return err
+}
+
+// CountActiveCustomers devuelve cuántos clientes activos hay registrados —
+// se usa para mostrar "eres el miembro #N" en la bienvenida de Discord.
+func CountActiveCustomers(db *sql.DB) (int, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM customers WHERE is_active=true`).Scan(&count)
+	return count, err
+}
+
+// GetCustomerOrderStats resume pedidos totales, entregados y KC gastado en
+// entregados — para mostrar el nivel/progreso del cliente en /perfil.
+func GetCustomerOrderStats(db *sql.DB, customerID uuid.UUID) (totalOrders, sentOrders, totalSpentKC int, err error) {
+	err = db.QueryRow(`
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE status = 'sent'),
+		       COALESCE(SUM(price_kc) FILTER (WHERE status = 'sent'), 0)
+		FROM orders WHERE customer_id=$1`, customerID).Scan(&totalOrders, &sentOrders, &totalSpentKC)
+	return
 }
 
 func GetOrdersByCustomer(db *sql.DB, customerID uuid.UUID, page, limit int) ([]types.Order, int, error) {
@@ -893,73 +1213,41 @@ func GetGameAccountSecrets(db *sql.DB, accountID uuid.UUID, encKey string) (type
 // ==================== PAYMENT TRANSACTIONS ====================
 
 type PaymentTransactionInput struct {
-	ID          uuid.UUID
-	CustomerID  uuid.UUID
-	Gateway     string
-	PaymentType string
-	ProductID   string
-	ProductName string
-	AmountPEN   float64
-	AmountUSD   float64
-	KCAmount    int
-	ExternalID  string
+	ID           uuid.UUID
+	CustomerID   uuid.UUID
+	Gateway      string
+	PaymentType  string
+	ProductID    string
+	ProductName  string
+	AmountPEN    float64
+	AmountUSD    float64
+	CurrencyCode string  // divisa real cobrada por dLocal Go (vacio para las demas pasarelas)
+	AmountLocal  float64 // monto en CurrencyCode
+	KCAmount     int
+	ExternalID   string
 }
 
 func CreatePaymentTransaction(db *sql.DB, tx PaymentTransactionInput) error {
+	var currencyCode *string
+	if tx.CurrencyCode != "" {
+		currencyCode = &tx.CurrencyCode
+	}
 	_, err := db.Exec(`
-		INSERT INTO payment_transactions (id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',NOW(),NOW())`,
-		tx.ID, tx.CustomerID, tx.Gateway, tx.PaymentType, tx.ProductID, tx.ProductName, tx.AmountPEN, tx.AmountUSD, tx.KCAmount, tx.ExternalID)
+		INSERT INTO payment_transactions (id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, currency_code, amount_local, kc_amount, external_id, status, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',NOW(),NOW())`,
+		tx.ID, tx.CustomerID, tx.Gateway, tx.PaymentType, tx.ProductID, tx.ProductName, tx.AmountPEN, tx.AmountUSD, currencyCode, tx.AmountLocal, tx.KCAmount, tx.ExternalID)
 	return err
 }
 
 func GetPaymentTransaction(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, error) {
 	var t types.PaymentTransaction
+	var currencyCode sql.NullString
 	err := db.QueryRow(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions WHERE id=$1`, id).
-		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
+		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
+	t.CurrencyCode = currencyCode.String
 	return t, err
-}
-
-func GetPaymentTransactionByExternalID(db *sql.DB, externalID string) (types.PaymentTransaction, error) {
-	var t types.PaymentTransaction
-	err := db.QueryRow(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
-		FROM payment_transactions WHERE external_id=$1`, externalID).
-		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
-	return t, err
-}
-
-func SetActivationCode(db *sql.DB, id uuid.UUID, code string) error {
-	_, err := db.Exec(`UPDATE payment_transactions SET activation_code=$1, updated_at=NOW() WHERE id=$2`, code, id)
-	return err
-}
-
-func GetPaymentByActivationCode(db *sql.DB, code string) (types.PaymentTransaction, error) {
-	var t types.PaymentTransaction
-	err := db.QueryRow(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
-		FROM payment_transactions WHERE activation_code=$1`, code).
-		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
-	return t, err
-}
-
-func UpdatePaymentActivation(db *sql.DB, id uuid.UUID, taskID, status string) error {
-	_, err := db.Exec(`UPDATE payment_transactions SET autobuyer_task_id=$1, status=$2, updated_at=NOW() WHERE id=$3`, taskID, status, id)
-	return err
-}
-
-func UpdatePaymentProgress(db *sql.DB, taskID, progress string) error {
-	_, err := db.Exec(`UPDATE payment_transactions SET progress=$1, updated_at=NOW() WHERE autobuyer_task_id=$2`, progress, taskID)
-	return err
-}
-
-func GetPaymentProgress(db *sql.DB, taskID string) string {
-	var progress sql.NullString
-	db.QueryRow(`SELECT progress FROM payment_transactions WHERE autobuyer_task_id=$1`, taskID).Scan(&progress)
-	if progress.Valid { return progress.String }
-	return ""
 }
 
 func UpdatePaymentStatus(db *sql.DB, id uuid.UUID, status string, externalID string) error {
@@ -1032,11 +1320,6 @@ func DeleteRefreshToken(db *sql.DB, tokenHash string) error {
 	return err
 }
 
-func DeleteCustomerRefreshTokens(db *sql.DB, customerID uuid.UUID) error {
-	_, err := db.Exec(`DELETE FROM refresh_tokens WHERE customer_id=$1`, customerID)
-	return err
-}
-
 // ==================== AUDIT LOG ====================
 
 func AddAuditLog(db *sql.DB, customerID *uuid.UUID, action, details, ip string) {
@@ -1064,85 +1347,6 @@ func GetRechargesByCustomer(db *sql.DB, customerID uuid.UUID) ([]types.KCRecharg
 		recharges = append(recharges, r)
 	}
 	return recharges, nil
-}
-
-func GetCustomerByDiscordID(db *sql.DB, discordID string) (types.Customer, error) {
-	var c types.Customer
-	err := db.QueryRow(`
-		SELECT id, epic_username, email, password_hash, kc_balance,
-		       discord_id, discord_username, is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
-		FROM customers WHERE discord_id = $1 AND is_active = true`, discordID).
-		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
-			&c.DiscordID, &c.DiscordUsername, &c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
-	return c, err
-}
-
-// ==================== DISCORD LANG ====================
-
-func GetDiscordLang(db *sql.DB, discordID string) (string, error) {
-	// 1. Try discord_user_prefs first (works for all users, even unlinked)
-	var lang string
-	err := db.QueryRow(`SELECT lang FROM discord_user_prefs WHERE discord_id = $1`, discordID).Scan(&lang)
-	if err == nil && lang != "" {
-		return lang, nil
-	}
-	// 2. Fallback to customers table (legacy)
-	err = db.QueryRow(`SELECT discord_lang FROM customers WHERE discord_id = $1`, discordID).Scan(&lang)
-	return lang, err
-}
-
-func SetDiscordLang(db *sql.DB, discordID string, lang string) {
-	// Save in discord_user_prefs (works for all users, even unlinked)
-	db.Exec(`INSERT INTO discord_user_prefs (discord_id, lang) VALUES ($1, $2)
-		ON CONFLICT (discord_id) DO UPDATE SET lang = $2`, discordID, lang)
-	// Also update customers table if linked
-	db.Exec(`UPDATE customers SET discord_lang = $1 WHERE discord_id = $2`, lang, discordID)
-}
-
-// ==================== BOT CONFIG ====================
-
-func GetBotPrefix(db *sql.DB) (string, error) {
-	var prefix string
-	err := db.QueryRow(`SELECT value FROM bot_config WHERE key = 'prefix'`).Scan(&prefix)
-	return prefix, err
-}
-
-func SetBotPrefix(db *sql.DB, prefix string) {
-	db.Exec(`INSERT INTO bot_config (key, value) VALUES ('prefix', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, prefix)
-}
-
-func GetBotAdmins(db *sql.DB) ([]string, error) {
-	rows, err := db.Query(`SELECT value FROM bot_config WHERE key = 'admin'`)
-	if err != nil { return nil, err }
-	defer rows.Close()
-	var admins []string
-	for rows.Next() {
-		var v string
-		if err := rows.Scan(&v); err == nil { admins = append(admins, v) }
-	}
-	return admins, nil
-}
-
-func AddBotAdmin(db *sql.DB, discordID string) {
-	db.Exec(`INSERT INTO bot_config (key, value) VALUES ('admin', $1) ON CONFLICT DO NOTHING`, discordID)
-}
-
-func DeductKCAdmin(db *sql.DB, customerID uuid.UUID, amount int, note string) error {
-	tx, err := db.Begin()
-	if err != nil { return err }
-	defer tx.Rollback()
-	result, err := tx.Exec(`UPDATE customers SET kc_balance=kc_balance-$1, updated_at=NOW() WHERE id=$2 AND is_active=true AND kc_balance >= $1`, amount, customerID)
-	if err != nil { return err }
-	rows, _ := result.RowsAffected()
-	if rows == 0 { return fmt.Errorf("saldo insuficiente o cliente no encontrado") }
-	tx.Exec(`INSERT INTO kc_recharges (id, customer_id, amount_kc, method, note, approved_by, created_at) VALUES ($1,$2,$3,'admin_deduct',$4,'discord-admin',NOW())`,
-		uuid.New(), customerID, -amount, note)
-	return tx.Commit()
-}
-
-func UnlinkDiscord(db *sql.DB, customerID uuid.UUID) error {
-	_, err := db.Exec(`UPDATE customers SET discord_id=NULL, discord_username=NULL, discord_lang='es', updated_at=NOW() WHERE id=$1`, customerID)
-	return err
 }
 
 func CountPendingOrdersByCustomer(db *sql.DB, customerID uuid.UUID) (int, error) {
@@ -1178,12 +1382,6 @@ func GetPaymentByID(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, error) 
 }
 
 // ==================== ADMIN ROLE ====================
-
-func IsCustomerAdmin(db *sql.DB, customerID uuid.UUID) bool {
-	var isAdmin bool
-	db.QueryRow(`SELECT COALESCE(is_admin, false) FROM customers WHERE id=$1`, customerID).Scan(&isAdmin)
-	return isAdmin
-}
 
 func SetCustomerAdmin(db *sql.DB, customerID uuid.UUID, isAdmin bool) error {
 	_, err := db.Exec(`UPDATE customers SET is_admin=$1, updated_at=NOW() WHERE id=$2`, isAdmin, customerID)

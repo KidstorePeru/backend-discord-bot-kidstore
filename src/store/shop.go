@@ -2,7 +2,7 @@ package store
 
 import (
 	"KidStoreStore/src/db"
-	"KidStoreStore/src/discord"
+	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/fortnite"
 	"KidStoreStore/src/middleware"
 	"KidStoreStore/src/types"
@@ -60,30 +60,43 @@ func SetExchangeRateAPIKey(key string) {
 	exchangeRateAPIKey = key
 }
 
-func HandlerGetExchangeRates(c *gin.Context) {
+// fallbackRates se usa cuando no hay API key configurada o la API falla y
+// tampoco hay nada en caché — deja el sitio funcional (aunque con tasas
+// desactualizadas) en vez de romper precios/pagos.
+var fallbackRates = map[string]float64{"PEN": 1, "USD": 0.27, "EUR": 0.25}
+
+// currentConversionRates devuelve el mapa de conversion (1 PEN = X <divisa>)
+// usando el mismo caché de 24h que HandlerGetExchangeRates — la usan tanto
+// el endpoint público como los cobros de dLocal Go (que necesitan saber
+// cuánto es el precio en la divisa real del cliente).
+func currentConversionRates() map[string]float64 {
 	ratesCacheMu.RLock()
 	cached := ratesCacheVal
 	ratesCacheMu.RUnlock()
 
 	if cached != nil && time.Since(cached.fetchedAt) < ratesTTL {
-		c.Data(http.StatusOK, "application/json", cached.body)
-		return
+		var parsed struct {
+			Rates map[string]float64 `json:"rates"`
+		}
+		if json.Unmarshal(cached.body, &parsed) == nil && len(parsed.Rates) > 0 {
+			return parsed.Rates
+		}
 	}
 
 	if exchangeRateAPIKey == "" {
-		c.JSON(http.StatusOK, gin.H{"USD": 0.27, "EUR": 0.25, "fetchedAt": 0})
-		return
+		return fallbackRates
 	}
 
 	apiURL := fmt.Sprintf("https://v6.exchangerate-api.com/v6/%s/latest/PEN", exchangeRateAPIKey)
 	resp, err := ratesClient.Get(apiURL)
 	if err != nil {
 		if cached != nil {
-			c.Data(http.StatusOK, "application/json", cached.body)
-			return
+			var parsed struct{ Rates map[string]float64 `json:"rates"` }
+			if json.Unmarshal(cached.body, &parsed) == nil {
+				return parsed.Rates
+			}
 		}
-		c.JSON(http.StatusOK, gin.H{"USD": 0.27, "EUR": 0.25, "fetchedAt": 0})
-		return
+		return fallbackRates
 	}
 	defer resp.Body.Close()
 
@@ -92,17 +105,18 @@ func HandlerGetExchangeRates(c *gin.Context) {
 		ConversionRates map[string]float64 `json:"conversion_rates"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil || apiResp.Result != "success" {
-		if cached != nil {
-			c.Data(http.StatusOK, "application/json", cached.body)
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"USD": 0.27, "EUR": 0.25, "fetchedAt": 0})
-		return
+		return fallbackRates
 	}
 
+	// "rates" trae las ~160 divisas que devuelve la API (1 PEN = X divisa) —
+	// se usa para mostrar el precio de referencia en la moneda local del
+	// cliente y para cobrar con dLocal Go en esa misma divisa. USD/EUR se
+	// mantienen también en el nivel superior por compatibilidad con el
+	// código existente que ya los usa directo.
 	result := gin.H{
 		"USD":       apiResp.ConversionRates["USD"],
 		"EUR":       apiResp.ConversionRates["EUR"],
+		"rates":     apiResp.ConversionRates,
 		"fetchedAt": time.Now().UnixMilli(),
 	}
 	body, _ := json.Marshal(result)
@@ -111,7 +125,19 @@ func HandlerGetExchangeRates(c *gin.Context) {
 	ratesCacheVal = &ratesCacheEntry{body: body, fetchedAt: time.Now()}
 	ratesCacheMu.Unlock()
 
-	c.Data(http.StatusOK, "application/json", body)
+	return apiResp.ConversionRates
+}
+
+func HandlerGetExchangeRates(c *gin.Context) {
+	rates := currentConversionRates()
+	ratesCacheMu.RLock()
+	cached := ratesCacheVal
+	ratesCacheMu.RUnlock()
+	if cached != nil {
+		c.Data(http.StatusOK, "application/json", cached.body)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"USD": rates["USD"], "EUR": rates["EUR"], "rates": rates, "fetchedAt": 0})
 }
 
 // ==================== CACHÉ DE TIENDA ====================
@@ -283,12 +309,7 @@ func HandlerGetMyOrders(database *sql.DB) gin.HandlerFunc {
 
 // ==================== WORKER ====================
 
-var notifyDiscord func(discordID, status, itemName string, priceKC int, lang string)
 var encryptionKey string
-
-func SetDiscordNotifier(fn func(discordID, status, itemName string, priceKC int, lang string)) {
-	notifyDiscord = fn
-}
 
 func SetEncryptionKey(key string) {
 	encryptionKey = key
@@ -326,7 +347,6 @@ func processOrders(database *sql.DB) {
 			db.RefundOrder(database, order.ID)
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 				fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, noBotsMsg), "worker")
-			sendDiscordNotification(database, order, "refunded")
 		}
 		return
 	}
@@ -366,7 +386,6 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			db.RefundOrder(database, order.ID)
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 				fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
-			sendDiscordNotification(database, order, "refunded")
 			return
 		}
 		receiverAccountID = id
@@ -432,17 +451,12 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_SENT",
 				fmt.Sprintf("pedido %s enviado por bot %s → %s", order.ID, bot.DisplayName, order.EpicUsername), "worker")
-			sendDiscordNotification(database, order, "sent")
 
 			if customer, custErr := db.GetCustomerByID(database, order.CustomerID); custErr == nil {
-				go discord.SendGiftLogEmbed(order.EpicUsername, order.ItemName, order.PriceKC, customer.KCBalance)
 				if customer.Email != nil && *customer.Email != "" {
-					emailLang := "es"
-					if customer.DiscordID != nil {
-						if dl, dlErr := db.GetDiscordLang(database, *customer.DiscordID); dlErr == nil && dl != "" { emailLang = dl }
-					}
-					go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, emailLang)
+					go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, "es")
 				}
+				discordbot.NotifyPurchase(customer, order.EpicUsername, order.ItemName, order.ItemImage, order.PriceKC, order.PriceVBucks)
 			}
 
 			slog.Info("Worker: pedido enviado", "orderID", order.ID, "bot", bot.DisplayName,
@@ -494,7 +508,6 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
 		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 			fmt.Sprintf("pedido %s falló: %s — KC reembolsados", order.ID, errMsg), "worker")
-		sendDiscordNotification(database, order, "refunded")
 		return
 	}
 
@@ -512,50 +525,9 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		db.RefundOrder(database, order.ID)
 		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 			fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, errMsg), "worker")
-		sendDiscordNotification(database, order, "refunded")
 	} else {
 		// Otro motivo (ej: amistad reciente en todos los bots) → mantener pending
 		slog.Warn("Worker: ningún bot pudo enviar el regalo en este ciclo, reintentando", "orderID", order.ID)
 		db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
 	}
-}
-
-// sendDiscordNotification envía UNA sola notificación por pedido.
-// Usa go para no bloquear el worker, pero la lógica de deduplicación
-// está garantizada porque se llama en un único punto por cada caso.
-func sendDiscordNotification(database *sql.DB, order types.Order, status string) {
-	if notifyDiscord == nil {
-		slog.Debug("Discord notifier not configured, skipping notification", "orderID", order.ID, "status", status)
-		return
-	}
-	customer, err := db.GetCustomerByID(database, order.CustomerID)
-	if err != nil {
-		slog.Warn("Discord notify: customer not found", "orderID", order.ID, "customerID", order.CustomerID)
-		return
-	}
-	if customer.DiscordID == nil || *customer.DiscordID == "" {
-		slog.Debug("Discord notify: customer has no Discord linked", "orderID", order.ID, "user", order.EpicUsername)
-		return
-	}
-	lang, _ := db.GetDiscordLang(database, *customer.DiscordID)
-	if lang == "" { lang = "es" }
-	go notifyDiscord(*customer.DiscordID, status, order.ItemName, order.PriceKC, lang)
-}
-
-// ==================== PARSE SHOP RESPONSE ====================
-
-func ParseShopEntry(data []byte, offerID string) (int, error) {
-	var resp struct {
-		Data struct {
-			Entries []struct {
-				OfferId    string `json:"offerId"`
-				FinalPrice int    `json:"finalPrice"`
-			} `json:"entries"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil { return 0, err }
-	for _, e := range resp.Data.Entries {
-		if e.OfferId == offerID { return e.FinalPrice, nil }
-	}
-	return 0, fmt.Errorf("offer %s not found in shop", offerID)
 }

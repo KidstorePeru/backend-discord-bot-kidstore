@@ -52,7 +52,6 @@ func HashRefreshToken(token string) string {
 }
 
 // ParseCustomerToken valida y parsea un JWT de cliente.
-// Usado por el OAuth de Discord para verificar el state.
 func ParseCustomerToken(tokenStr string, secretKey string) (*types.CustomerClaims, error) {
 	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {

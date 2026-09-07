@@ -6,14 +6,29 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
+)
+
+// maxConsecutiveFailures — cuántas veces seguidas debe fallar la verificación
+// (perfil + refresh) antes de desactivar la cuenta de verdad. Un solo fallo
+// puede ser un hipo de red o un rate-limit momentáneo de Epic — no significa
+// que la sesión realmente se invalidó. Solo se desactiva tras fallar varias
+// veces SEGUIDAS, y el contador se resetea apenas una verificación funciona.
+const maxConsecutiveFailures = 5
+
+var (
+	failureCounts   = map[uuid.UUID]int{}
+	failureCountsMu sync.Mutex
 )
 
 // StartTokenHealthCheck verifica periódicamente que los tokens de cada cuenta
 // bot sigan siendo válidos. Si Epic devuelve 401/403, intenta refrescar.
-// Si el refresco también falla, marca la cuenta como inactiva.
-// Esto detecta cuando el dueño inició sesión directamente en el juego,
-// lo que invalida todos los tokens existentes.
+// Si el refresco también falla varias veces seguidas, marca la cuenta como
+// inactiva. Esto detecta cuando el dueño inició sesión directamente en el
+// juego, lo que invalida todos los tokens existentes.
 func StartTokenHealthCheck(database *sql.DB, intervalMinutes int) {
 	go func() {
 		// Primera verificación al iniciar (esperar 30s para que el servidor arranque)
@@ -52,13 +67,28 @@ func checkAllTokens(database *sql.DB) {
 		client := &http.Client{Timeout: 8 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			slog.Warn("HealthCheck: error de red verificando token", "bot", account.DisplayName, "error", err)
+			// Error de red — no significa que el token esté mal, no cuenta como fallo.
+			slog.Warn("HealthCheck: error de red verificando token, se reintentará luego", "bot", account.DisplayName, "error", err)
 			continue
 		}
 		resp.Body.Close()
 
 		if resp.StatusCode == 200 {
 			slog.Info("HealthCheck: token OK", "bot", account.DisplayName)
+			failureCountsMu.Lock()
+			delete(failureCounts, account.ID) // se recuperó — resetear contador
+			failureCountsMu.Unlock()
+			continue
+		}
+
+		// Solo un 401/403 significa "el token realmente ya no sirve". Cualquier
+		// otra cosa (429 rate-limit de Epic, 5xx, etc.) NO es un problema del
+		// token — no hay que intentar refresh ni contar como fallo, porque un
+		// refresh en ese momento probablemente también choque con el mismo
+		// límite de tasa y termine desactivando una cuenta que en realidad
+		// está perfectamente bien.
+		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+			slog.Warn("HealthCheck: respuesta inesperada de Epic, no se toca el token", "bot", account.DisplayName, "status", resp.StatusCode)
 			continue
 		}
 
@@ -67,12 +97,27 @@ func checkAllTokens(database *sql.DB) {
 
 		_, err = refreshAccessToken(database, account)
 		if err != nil {
-			// Refresh también falló → cuenta inutilizable
-			// (el dueño inició sesión directamente en el juego)
-			slog.Warn("HealthCheck: refresh fallo, marcando como inactiva", "bot", account.DisplayName, "error", err)
-			db.DeactivateGameAccount(database, account.ID)
+			failureCountsMu.Lock()
+			failureCounts[account.ID]++
+			count := failureCounts[account.ID]
+			failureCountsMu.Unlock()
+
+			if count >= maxConsecutiveFailures {
+				// Refresh falló varias veces seguidas → cuenta realmente inutilizable
+				// (el dueño inició sesión directamente en el juego, o algo la invalidó)
+				slog.Warn("HealthCheck: refresh falló repetidamente, marcando como inactiva", "bot", account.DisplayName, "error", err, "fallos_seguidos", count)
+				db.DeactivateGameAccount(database, account.ID)
+				failureCountsMu.Lock()
+				delete(failureCounts, account.ID)
+				failureCountsMu.Unlock()
+			} else {
+				slog.Warn("HealthCheck: refresh falló, se reintentará en la próxima verificación", "bot", account.DisplayName, "error", err, "fallos_seguidos", count, "max", maxConsecutiveFailures)
+			}
 		} else {
 			slog.Info("HealthCheck: token refrescado correctamente", "bot", account.DisplayName)
+			failureCountsMu.Lock()
+			delete(failureCounts, account.ID)
+			failureCountsMu.Unlock()
 		}
 
 		// Pequeña pausa entre cuentas para no saturar la API de Epic

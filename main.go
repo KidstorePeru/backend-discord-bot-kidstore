@@ -2,11 +2,11 @@ package main
 
 import (
 	"KidStoreStore/src/admin"
-	"KidStoreStore/src/autobuyer"
 	"KidStoreStore/src/db"
-	"KidStoreStore/src/discord"
+	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/fortnite"
 	"KidStoreStore/src/middleware"
+	"KidStoreStore/src/oauth"
 	"KidStoreStore/src/store"
 	"KidStoreStore/src/types"
 	"context"
@@ -57,12 +57,12 @@ func main() {
 		PayPalClientSecret:  cfg.PayPalClientSecret,
 		PayPalMode:          cfg.PayPalMode,
 		NOWPaymentsAPIKey:   cfg.NOWPaymentsAPIKey,
+		DLocalGoAPIKey:      cfg.DLocalGoAPIKey,
+		DLocalGoSecretKey:   cfg.DLocalGoSecretKey,
+		DLocalGoSandbox:     cfg.DLocalGoSandbox,
 		FrontendURL:         cfg.FrontendURL,
 		BackendURL:          backendURL,
 	})
-
-	autobuyer.Init(cfg.AutobuyerURL, cfg.AutobuyerAPIKey)
-	store.SetActivationBackendURL(backendURL)
 
 	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName)
@@ -129,18 +129,6 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"service": "KidStore Store API", "status": "ok"})
 	})
 
-	// ── Discord OAuth ──
-	discordCfg := discord.Config{
-		ClientID:     cfg.DiscordClientID,
-		ClientSecret: cfg.DiscordClientSecret,
-		RedirectURL:  cfg.DiscordRedirectURL,
-		FrontendURL:  cfg.FrontendURL,
-		BotToken:     cfg.DiscordBotToken,
-		SecretKey:    cfg.SecretKey,
-	}
-	router.GET("/discord/auth",     discord.HandlerGetAuthURL(discordCfg))
-	router.GET("/discord/callback", discord.HandlerCallback(database, discordCfg))
-
 	// ── Verificación de email (pública) ──
 	router.GET("/store/verify-email", store.HandlerVerifyEmail(database, cfg.SecretKey))
 
@@ -156,44 +144,39 @@ func main() {
 		authGroup.POST("/refresh-token",      store.HandlerRefreshToken(database, cfg.SecretKey))
 	}
 
+	// ── OAuth: login/registro con Google y Discord (con rate limit) ──
+	oauthCfg := oauth.Config{
+		GoogleClientID:      cfg.GoogleClientID,
+		GoogleClientSecret:  cfg.GoogleClientSecret,
+		GoogleRedirectURL:   cfg.GoogleRedirectURL,
+		DiscordClientID:     cfg.DiscordClientID,
+		DiscordClientSecret: cfg.DiscordClientSecret,
+		DiscordRedirectURL:  cfg.DiscordRedirectURL,
+		FrontendURL:         cfg.FrontendURL,
+		SecretKey:           cfg.SecretKey,
+	}
+	authRateLimited := router.Group("/auth")
+	authRateLimited.Use(middleware.RateLimitMiddleware(authLimiter))
+	{
+		authRateLimited.GET("/google",                oauth.HandlerGoogleAuth(oauthCfg))
+		authRateLimited.GET("/discord",                oauth.HandlerDiscordAuth(oauthCfg))
+		authRateLimited.POST("/complete-registration", oauth.HandlerCompleteRegistration(database, oauthCfg))
+	}
+	// Los callbacks los invoca el navegador redirigido por Google/Discord — sin rate limit por IP del cliente
+	router.GET("/auth/google/callback", oauth.HandlerGoogleCallback(database, oauthCfg))
+	router.GET("/auth/discord/callback", oauth.HandlerDiscordCallback(database, oauthCfg))
+	router.GET("/auth/pending/:token", oauth.HandlerGetPendingRegistration(database))
+
 	// Payment webhooks (public, no auth — called by gateways)
 	router.POST("/store/webhook/mercadopago", store.HandlerMercadoPagoWebhook(database))
 	router.POST("/store/webhook/paypal",      store.HandlerPayPalWebhook(database))
 	router.POST("/store/webhook/nowpayments", store.HandlerNOWPaymentsWebhook(database))
+	router.POST("/store/webhook/dlocalgo",    store.HandlerDLocalGoWebhook(database))
 	router.POST("/store/paypal-capture",       store.HandlerPayPalCapture(database))
-	router.POST("/store/webhook/autobuyer",   store.HandlerAutobuyerWebhook(database))
 	router.GET("/store/shop",            store.HandlerGetShop)
 	router.GET("/store/bots-status",     store.HandlerBotsStatus(database))
 	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
 	router.GET("/store/product-available/:id", admin.HandlerCheckProductAvailable(database))
-	router.GET("/store/discord-lang/:discord_id", func(c *gin.Context) {
-		lang, err := db.GetDiscordLang(database, c.Param("discord_id"))
-		if err != nil || lang == "" { lang = "es" }
-		c.JSON(200, gin.H{"lang": lang})
-	})
-
-	// ── Chat proxy (public — no auth, session-based) ──
-	router.POST("/store/chat/start",    store.HandlerChatStart())
-	router.POST("/store/chat/message",  store.HandlerChatMessage())
-	router.GET("/store/chat/poll/:sid", store.HandlerChatPoll())
-
-	// ── Autobuyer self-registration (called by Autobuyer on startup) ──
-	router.POST("/store/autobuyer-connect", func(c *gin.Context) {
-		if cfg.AutobuyerAPIKey == "" || c.GetHeader("X-API-Key") != cfg.AutobuyerAPIKey {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-			return
-		}
-		var body struct {
-			URL string `json:"url"`
-		}
-		if err := c.ShouldBindJSON(&body); err != nil || body.URL == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "url required"})
-			return
-		}
-		autobuyer.UpdateURL(body.URL)
-		slog.Info("Autobuyer URL updated via self-registration", "url", body.URL)
-		c.JSON(http.StatusOK, gin.H{"ok": true})
-	})
 
 	// ── Rutas de cliente (JWT requerido) ──
 	customer := router.Group("/store")
@@ -203,14 +186,14 @@ func main() {
 		customer.GET("/payment-info",      store.HandlerGetPaymentInfo())
 		customer.POST("/payment",              middleware.RateLimitMiddleware(orderLimiter), store.HandlerCreatePayment(database))
 		customer.GET("/payment-status/:id",    store.HandlerPaymentStatus(database))
-		customer.POST("/activate",             store.HandlerActivate(database))
-		customer.GET("/activation-status/:code", store.HandlerActivationStatus(database))
-		customer.POST("/activation-input/:code", store.HandlerActivationInput(database))
 		customer.GET("/orders",            store.HandlerGetMyOrders(database))
 		customer.GET("/recharges",         store.HandlerGetMyRecharges(database))
 		customer.PUT("/profile",           store.HandlerUpdateProfile(database, cfg.SecretKey))
-		customer.POST("/link-discord",     store.HandlerLinkDiscord(database))
-		customer.DELETE("/unlink-discord", store.HandlerUnlinkDiscord(database))
+		customer.PUT("/avatar",            store.HandlerUpdateAvatar(database))
+		customer.POST("/email/request-change", middleware.RateLimitMiddleware(authLimiter), store.HandlerRequestEmailChange(database, cfg))
+		customer.POST("/email/confirm-change", middleware.RateLimitMiddleware(authLimiter), store.HandlerConfirmEmailChange(database, cfg.SecretKey))
+		customer.POST("/link/:provider/start", oauth.HandlerStartLink(oauthCfg))
+		customer.DELETE("/link/:provider",     oauth.HandlerUnlinkProvider(database))
 		customer.POST("/order",
 			middleware.RateLimitMiddleware(orderLimiter),
 			store.HandlerCreateOrder(database),
@@ -258,26 +241,15 @@ func main() {
 		}
 	}()
 
-	// ── Discord Bot ──
-	var discordSession interface{ Close() error }
-	if cfg.DiscordBotToken != "" {
-		session, err := discord.StartBot(database, cfg.DiscordBotToken, cfg.DiscordGuildID)
-		if err != nil {
-			slog.Warn("Error iniciando bot de Discord", "error", err)
-		} else {
-			discordSession = session
-			store.SetDiscordNotifier(discord.SendOrderNotification)
-			store.SetProductPurchaseNotifier(discord.SendProductPurchaseNotification)
-			slog.Info("Bot de Discord iniciado")
-		}
-	}
-
 	// ── Workers ──
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	store.StartOrderWorker(workerCtx, database)
 	fortnite.StartFriendRequestAcceptor(database, 300)
+	fortnite.StartFriendship48hChecker(database, 900)
 	fortnite.StartTokenHealthCheck(database, cfg.BotCheckInterval)
 	slog.Info("Workers iniciados", "workers", "pedidos, amigos, health check")
+
+	discordbot.Start(cfg, database)
 
 	port := cfg.Port
 	if port == "" { port = "8081" }
@@ -295,10 +267,7 @@ func main() {
 	<-quit
 	slog.Info("Apagando servidor...")
 	workerCancel()
-	if discordSession != nil {
-		discordSession.Close()
-		slog.Info("Bot de Discord desconectado")
-	}
+	discordbot.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)

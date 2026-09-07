@@ -2,6 +2,7 @@ package admin
 
 import (
 	"KidStoreStore/src/db"
+	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/types"
 	"database/sql"
 	"fmt"
@@ -83,13 +84,23 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 		email := ""
 		if req.Email != nil { email = strings.ToLower(strings.TrimSpace(*req.Email)) }
 
-		if err := db.UpdateProfile(database, id, epic, email, ""); err != nil {
+		if err := db.UpdateProfile(database, id, epic, "", nil); err != nil {
 			if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
 				c.JSON(http.StatusConflict, gin.H{"success": false, "error": "email o usuario Epic ya en uso"})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando cliente"})
 			return
+		}
+		if email != "" {
+			if _, err := database.Exec(`UPDATE customers SET email=$1, email_changed_at=NOW(), updated_at=NOW() WHERE id=$2`, email, id); err != nil {
+				if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+					c.JSON(http.StatusConflict, gin.H{"success": false, "error": "email o usuario Epic ya en uso"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando cliente"})
+				return
+			}
 		}
 
 		// Actualizar balance KC si se especificó
@@ -173,6 +184,7 @@ func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
 		customer, _ := db.GetCustomerByID(database, customerID)
 		db.AddAuditLog(database, &customerID, "KC_RECHARGED",
 			fmt.Sprintf("recarga de %d KC por %s", req.AmountKC, approvedBy), c.ClientIP())
+		discordbot.NotifyRecharge(customer, req.AmountKC, customer.KCBalance, "Manual (admin)")
 
 		c.JSON(http.StatusOK, gin.H{
 			"success": true, "message": "KC recargados correctamente",
@@ -312,6 +324,14 @@ func HandlerGetStats(database *sql.DB) gin.HandlerFunc {
 		var newCustomersWeek int
 		database.QueryRow(`SELECT COUNT(*) FROM customers WHERE is_active=true AND created_at >= CURRENT_DATE - INTERVAL '7 days'`).Scan(&newCustomersWeek)
 
+		slotStats := gin.H{
+			"all_time": fetchSlotPeriodStats(database, ""),
+			"today":    fetchSlotPeriodStats(database, "CURRENT_DATE"),
+			"week":     fetchSlotPeriodStats(database, "CURRENT_DATE - INTERVAL '7 days'"),
+			"month":    fetchSlotPeriodStats(database, "CURRENT_DATE - INTERVAL '30 days'"),
+			"top_winners": fetchSlotTopWinners(database),
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"success":            true,
 			"total_customers":    totalCustomers,
@@ -335,8 +355,82 @@ func HandlerGetStats(database *sql.DB) gin.HandlerFunc {
 			// Breakdowns
 			"gateway_stats":      gwStats,
 			"recent_payments":    recentPayments,
+			// Slot (/slot en Discord) — ganancia/pérdida de la casa
+			"slot_stats": slotStats,
 		})
 	}
+}
+
+// ==================== SLOT (/slot) — ESTADÍSTICAS DE LA CASA ====================
+// Convención: cuando un cliente PIERDE, ese KC queda "ganado" para la casa
+// (nunca sale de circulación a su favor). Cuando un cliente GANA, la casa le
+// acredita el pago completo (payout_amount, que ya incluye devolverle lo
+// apostado) — eso es lo que "pierde" la casa en cada jugada ganadora.
+
+type slotPeriodStats struct {
+	Plays      int     `json:"plays"`
+	Wagered    int     `json:"wagered"`     // KC total apostado
+	Gain       int     `json:"gain"`        // KC ganado por la casa (jugadas perdidas)
+	Loss       int     `json:"loss"`        // KC pagado a ganadores (jugadas ganadas)
+	Net        int     `json:"net"`         // gain - loss (positivo = a favor de la casa)
+	Wins       int     `json:"wins"`
+	WinRatePct float64 `json:"win_rate_pct"` // tasa de victoria real observada
+}
+
+func fetchSlotPeriodStats(database *sql.DB, since string) slotPeriodStats {
+	var s slotPeriodStats
+	query := `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(bet_amount),0),
+			COALESCE(SUM(bet_amount) FILTER (WHERE NOT won),0),
+			COALESCE(SUM(payout_amount) FILTER (WHERE won),0),
+			COALESCE(SUM(CASE WHEN won THEN 1 ELSE 0 END),0)
+		FROM slot_plays`
+	if since != "" {
+		query += ` WHERE created_at >= ` + since
+	}
+	database.QueryRow(query).Scan(&s.Plays, &s.Wagered, &s.Gain, &s.Loss, &s.Wins)
+	s.Net = s.Gain - s.Loss
+	if s.Plays > 0 {
+		s.WinRatePct = float64(s.Wins) / float64(s.Plays) * 100
+	}
+	return s
+}
+
+// fetchSlotTopWinners lista a los clientes que más KC neto le han ganado a
+// la casa jugando /slot (pagado - apostado), para detectar rachas de suerte
+// o comportamiento sospechoso.
+func fetchSlotTopWinners(database *sql.DB) []gin.H {
+	rows, err := database.Query(`
+		SELECT c.epic_username, c.id,
+			COUNT(*) as plays,
+			COALESCE(SUM(sp.payout_amount) FILTER (WHERE sp.won),0) - COALESCE(SUM(sp.bet_amount),0) as net_kc
+		FROM slot_plays sp
+		JOIN customers c ON c.id = sp.customer_id
+		GROUP BY c.id, c.epic_username
+		HAVING COALESCE(SUM(sp.payout_amount) FILTER (WHERE sp.won),0) - COALESCE(SUM(sp.bet_amount),0) > 0
+		ORDER BY net_kc DESC
+		LIMIT 5`)
+	if err != nil {
+		return []gin.H{}
+	}
+	defer rows.Close()
+	result := []gin.H{}
+	for rows.Next() {
+		var epicUsername string
+		var customerID uuid.UUID
+		var plays, netKC int
+		if err := rows.Scan(&epicUsername, &customerID, &plays, &netKC); err == nil {
+			result = append(result, gin.H{
+				"epic_username": epicUsername,
+				"customer_id":   customerID,
+				"plays":         plays,
+				"net_kc":        netKC,
+			})
+		}
+	}
+	return result
 }
 
 func HandlerGetBotSchedule(database *sql.DB) gin.HandlerFunc {

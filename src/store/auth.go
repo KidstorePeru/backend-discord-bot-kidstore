@@ -2,13 +2,16 @@ package store
 
 import (
 	"KidStoreStore/src/db"
+	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/middleware"
 	"KidStoreStore/src/types"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -111,11 +114,7 @@ func HandlerVerifyEmail(database *sql.DB, secretKey string) gin.HandlerFunc {
 				"success": true,
 				"message": "¡Cuenta verificada correctamente!",
 				"token":   jwtToken,
-				"customer": types.CustomerPublic{
-					ID: customer.ID, EpicUsername: customer.EpicUsername,
-					Email: customer.Email, KCBalance: customer.KCBalance,
-					IsVerified: true, CreatedAt: customer.CreatedAt,
-				},
+				"customer": customer.Public(),
 			})
 			return
 		}
@@ -127,6 +126,7 @@ func HandlerVerifyEmail(database *sql.DB, secretKey string) gin.HandlerFunc {
 			EpicUsername: pending.EpicUsername,
 			Email:        &pending.Email,
 			PasswordHash: pending.PasswordHash,
+			HasPassword:  true,
 			IsVerified:   true,
 		}
 
@@ -144,11 +144,7 @@ func HandlerVerifyEmail(database *sql.DB, secretKey string) gin.HandlerFunc {
 					"success": true,
 					"message": "¡Cuenta ya verificada! Iniciando sesión...",
 					"token":   jwtToken,
-					"customer": types.CustomerPublic{
-						ID: existing.ID, EpicUsername: existing.EpicUsername,
-						Email: existing.Email, KCBalance: existing.KCBalance,
-						IsVerified: true, CreatedAt: existing.CreatedAt,
-					},
+					"customer": existing.Public(),
 				})
 				return
 			}
@@ -160,6 +156,7 @@ func HandlerVerifyEmail(database *sql.DB, secretKey string) gin.HandlerFunc {
 		db.DeletePendingRegistration(database, token)
 		db.AddAuditLog(database, &customerID, "REGISTER", "cuenta creada via verificación: "+pending.EpicUsername, c.ClientIP())
 		db.AddAuditLog(database, &customerID, "EMAIL_VERIFIED", "email verificado en registro", c.ClientIP())
+		discordbot.NotifyWelcome(customer)
 
 		jwtToken, err := middleware.GenerateCustomerToken(customer, secretKey)
 		if err != nil {
@@ -171,11 +168,7 @@ func HandlerVerifyEmail(database *sql.DB, secretKey string) gin.HandlerFunc {
 			"success": true,
 			"message": "¡Cuenta creada y verificada! Bienvenido a KidStorePeru 🎮",
 			"token":   jwtToken,
-			"customer": types.CustomerPublic{
-				ID: customerID, EpicUsername: pending.EpicUsername,
-				Email: &pending.Email, KCBalance: 0,
-				IsVerified: true, CreatedAt: customer.CreatedAt,
-			},
+			"customer": customer.Public(),
 		})
 	}
 }
@@ -289,13 +282,7 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 			"success":       true,
 			"token":         token,
 			"refresh_token": refreshPlain,
-			"customer": types.CustomerPublic{
-				ID: customer.ID, EpicUsername: customer.EpicUsername,
-				Email: customer.Email, KCBalance: customer.KCBalance,
-				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
-				IsVerified: customer.IsVerified, IsAdmin: customer.IsAdmin,
-				CreatedAt: customer.CreatedAt,
-			},
+			"customer": customer.Public(),
 		})
 	}
 }
@@ -344,13 +331,7 @@ func HandlerRefreshToken(database *sql.DB, secretKey string) gin.HandlerFunc {
 			"success":       true,
 			"token":         newAccessToken,
 			"refresh_token": newRefreshPlain,
-			"customer": types.CustomerPublic{
-				ID: customer.ID, EpicUsername: customer.EpicUsername,
-				Email: customer.Email, KCBalance: customer.KCBalance,
-				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
-				IsVerified: customer.IsVerified, IsAdmin: customer.IsAdmin,
-				CreatedAt: customer.CreatedAt,
-			},
+			"customer": customer.Public(),
 		})
 	}
 }
@@ -376,13 +357,7 @@ func HandlerMe(database *sql.DB) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
-			"customer": types.CustomerPublic{
-				ID: customer.ID, EpicUsername: customer.EpicUsername,
-				Email: customer.Email, KCBalance: customer.KCBalance,
-				DiscordID: customer.DiscordID, DiscordUsername: customer.DiscordUsername,
-				IsVerified: customer.IsVerified, IsAdmin: customer.IsAdmin,
-				CreatedAt: customer.CreatedAt,
-			},
+			"customer": customer.Public(),
 		})
 	}
 }
@@ -443,9 +418,14 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 			return
 		}
 
-		if req.Email != "" || req.NewPassword != "" {
+		newEpic := strings.TrimSpace(req.EpicUsername)
+
+		// Cambiar el usuario Epic requiere confirmar identidad con la
+		// contraseña actual — salvo que la cuenta no tenga una (registrada por
+		// Google/Discord), en cuyo caso la sesion OAuth ya es suficiente prueba.
+		if newEpic != "" && customer.HasPassword {
 			if req.CurrentPassword == "" {
-				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "se requiere la contraseña actual para cambiar email o contraseña"})
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "se requiere la contraseña actual para cambiar el usuario Epic"})
 				return
 			}
 			if err := bcrypt.CompareHashAndPassword([]byte(customer.PasswordHash), []byte(req.CurrentPassword)); err != nil {
@@ -456,6 +436,18 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 
 		var newHash string
 		if req.NewPassword != "" {
+			// Cambiar una contraseña existente exige la actual; si la cuenta
+			// no tiene una (OAuth), esto es "configurar contraseña" por primera vez.
+			if customer.HasPassword {
+				if req.CurrentPassword == "" {
+					c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "se requiere la contraseña actual para cambiarla"})
+					return
+				}
+				if err := bcrypt.CompareHashAndPassword([]byte(customer.PasswordHash), []byte(req.CurrentPassword)); err != nil {
+					c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "contraseña actual incorrecta"})
+					return
+				}
+			}
 			h, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error generando contraseña"})
@@ -464,12 +456,9 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 			newHash = string(h)
 		}
 
-		newEmail := strings.ToLower(strings.TrimSpace(req.Email))
-		newEpic := strings.TrimSpace(req.EpicUsername)
-
-		if err := db.UpdateProfile(database, customerID, newEpic, newEmail, newHash); err != nil {
+		if err := db.UpdateProfile(database, customerID, newEpic, newHash, req.Phone); err != nil {
 			if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
-				c.JSON(http.StatusConflict, gin.H{"success": false, "error": "email o usuario Epic ya en uso"})
+				c.JSON(http.StatusConflict, gin.H{"success": false, "error": "usuario Epic ya en uso"})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando perfil"})
@@ -481,15 +470,215 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 		db.AddAuditLog(database, &customerID, "PROFILE_UPDATED", "perfil actualizado", c.ClientIP())
 
 		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "perfil actualizado",
-			"token":   token,
-			"customer": types.CustomerPublic{
-				ID: updatedCustomer.ID, EpicUsername: updatedCustomer.EpicUsername,
-				Email: updatedCustomer.Email, KCBalance: updatedCustomer.KCBalance,
-				DiscordID: updatedCustomer.DiscordID, DiscordUsername: updatedCustomer.DiscordUsername,
-				IsVerified: updatedCustomer.IsVerified, CreatedAt: updatedCustomer.CreatedAt,
-			},
+			"success":  true,
+			"message":  "perfil actualizado",
+			"token":    token,
+			"customer": updatedCustomer.Public(),
+		})
+	}
+}
+
+// ==================== UPDATE AVATAR ====================
+
+const maxAvatarBytes = 400 * 1024 // ~400KB decoded — el cliente redimensiona antes de subir
+
+func HandlerUpdateAvatar(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, _ := uuid.Parse(customerIDStr)
+
+		var req types.UpdateAvatarRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		if !strings.HasPrefix(req.Avatar, "data:image/") {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "formato de imagen inválido"})
+			return
+		}
+		commaIdx := strings.Index(req.Avatar, ",")
+		if commaIdx == -1 {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "formato de imagen inválido"})
+			return
+		}
+		decoded, err := base64.StdEncoding.DecodeString(req.Avatar[commaIdx+1:])
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no se pudo decodificar la imagen"})
+			return
+		}
+		if len(decoded) > maxAvatarBytes {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"success": false, "error": "la imagen es muy grande (máx. 400KB)"})
+			return
+		}
+
+		if err := db.SetAvatar(database, customerID, req.Avatar); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error guardando la foto"})
+			return
+		}
+		db.AddAuditLog(database, &customerID, "AVATAR_UPDATED", "foto de perfil actualizada", c.ClientIP())
+
+		updatedCustomer, err := db.GetCustomerByID(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "customer": updatedCustomer.Public()})
+	}
+}
+
+// ==================== CAMBIO DE EMAIL (2FA / OTP) ====================
+
+func generateOTPCode() string {
+	max := big.NewInt(1000000)
+	n, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		n = big.NewInt(0)
+	}
+	return fmt.Sprintf("%06d", n.Int64())
+}
+
+// HandlerRequestEmailChange envia un codigo OTP al nuevo correo. El email
+// del cliente solo se actualiza cuando el codigo es confirmado.
+func HandlerRequestEmailChange(database *sql.DB, cfg types.EnvConfig) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, _ := uuid.Parse(customerIDStr)
+
+		var req types.RequestEmailChangeRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+		newEmail := strings.ToLower(strings.TrimSpace(req.NewEmail))
+
+		customer, err := db.GetCustomerByID(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado"})
+			return
+		}
+
+		if customer.Email != nil && newEmail == *customer.Email {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "ese ya es tu correo actual"})
+			return
+		}
+
+		if next := customer.NextEmailChangeAt(); next != nil {
+			days := int(time.Until(*next).Hours()/24) + 1
+			c.JSON(http.StatusForbidden, gin.H{
+				"success":               false,
+				"error":                 fmt.Sprintf("solo puedes cambiar tu email cada 90 días — inténtalo de nuevo en %d día(s)", days),
+				"code":                  "EMAIL_COOLDOWN",
+				"next_email_change_at":  next,
+			})
+			return
+		}
+
+		// Confirmar identidad con la contraseña actual — salvo que la cuenta
+		// no tenga una (registrada por Google/Discord).
+		if customer.HasPassword {
+			if req.CurrentPassword == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "se requiere la contraseña actual para cambiar el correo"})
+				return
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(customer.PasswordHash), []byte(req.CurrentPassword)); err != nil {
+				c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "contraseña actual incorrecta"})
+				return
+			}
+		}
+
+		if db.EmailExists(database, newEmail) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "error": "ese correo ya está en uso"})
+			return
+		}
+
+		code := generateOTPCode()
+		codeHash, err := bcrypt.GenerateFromPassword([]byte(code), bcrypt.DefaultCost)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error interno"})
+			return
+		}
+
+		if err := db.CreateEmailChangeRequest(database, customerID, newEmail, string(codeHash)); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error creando solicitud"})
+			return
+		}
+
+		lang := c.GetHeader("X-Lang")
+		if lang == "" { lang = "es" }
+		go sendEmailChangeOTP(cfg, newEmail, code, customer.EpicUsername, lang)
+		db.AddAuditLog(database, &customerID, "EMAIL_CHANGE_REQUESTED", "solicitud de cambio de correo: "+newEmail, c.ClientIP())
+
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "código enviado al nuevo correo"})
+	}
+}
+
+func HandlerConfirmEmailChange(database *sql.DB, secretKey string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, _ := uuid.Parse(customerIDStr)
+
+		var req types.ConfirmEmailChangeRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		pending, err := db.GetEmailChangeRequest(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no hay una solicitud de cambio de correo activa"})
+			return
+		}
+
+		if pending.Attempts >= types.MaxEmailChangeAttempts {
+			db.DeleteEmailChangeRequest(database, customerID)
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "demasiados intentos fallidos — solicita un nuevo código"})
+			return
+		}
+
+		if err := bcrypt.CompareHashAndPassword([]byte(pending.CodeHash), []byte(req.Code)); err != nil {
+			db.IncrementEmailChangeAttempts(database, pending.ID)
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "código incorrecto"})
+			return
+		}
+
+		if db.EmailExists(database, pending.NewEmail) {
+			db.DeleteEmailChangeRequest(database, customerID)
+			c.JSON(http.StatusConflict, gin.H{"success": false, "error": "ese correo ya está en uso"})
+			return
+		}
+
+		if err := db.ConfirmEmailChange(database, customerID, pending.NewEmail); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando el correo"})
+			return
+		}
+		db.DeleteEmailChangeRequest(database, customerID)
+		db.AddAuditLog(database, &customerID, "EMAIL_CHANGED", "correo actualizado a "+pending.NewEmail, c.ClientIP())
+
+		updatedCustomer, err := db.GetCustomerByID(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
+			return
+		}
+		token, _ := middleware.GenerateCustomerToken(updatedCustomer, secretKey)
+
+		c.JSON(http.StatusOK, gin.H{
+			"success":  true,
+			"message":  "correo actualizado",
+			"token":    token,
+			"customer": updatedCustomer.Public(),
 		})
 	}
 }
@@ -551,7 +740,7 @@ func HandlerResetPassword(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		if err := db.UpdateProfile(database, resetToken.CustomerID, "", "", string(hash)); err != nil {
+		if err := db.UpdateProfile(database, resetToken.CustomerID, "", string(hash), nil); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando contraseña"})
 			return
 		}
@@ -560,57 +749,6 @@ func HandlerResetPassword(database *sql.DB) gin.HandlerFunc {
 		db.AddAuditLog(database, &resetToken.CustomerID, "PASSWORD_RESET", "contraseña restablecida", c.ClientIP())
 
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "contraseña actualizada correctamente"})
-	}
-}
-
-// ==================== LINK DISCORD ====================
-
-func HandlerLinkDiscord(database *sql.DB) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		customerIDStr, ok := middleware.GetCustomerID(c)
-		if !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
-			return
-		}
-		customerID, _ := uuid.Parse(customerIDStr)
-
-		var body struct {
-			DiscordID       string `json:"discord_id" binding:"required"`
-			DiscordUsername string `json:"discord_username" binding:"required"`
-		}
-		if err := c.ShouldBindJSON(&body); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
-			return
-		}
-
-		if err := db.LinkDiscord(database, customerID, body.DiscordID, body.DiscordUsername); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error vinculando Discord"})
-			return
-		}
-
-		db.AddAuditLog(database, &customerID, "DISCORD_LINKED", "discord: "+body.DiscordUsername, c.ClientIP())
-		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Discord vinculado correctamente"})
-	}
-}
-
-// ==================== UNLINK DISCORD ====================
-
-func HandlerUnlinkDiscord(database *sql.DB) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		customerIDStr, ok := middleware.GetCustomerID(c)
-		if !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
-			return
-		}
-		customerID, _ := uuid.Parse(customerIDStr)
-
-		if err := db.UnlinkDiscord(database, customerID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error desvinculando Discord"})
-			return
-		}
-
-		db.AddAuditLog(database, &customerID, "DISCORD_UNLINKED", "discord desvinculado por el usuario", c.ClientIP())
-		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Discord desvinculado correctamente"})
 	}
 }
 
@@ -664,6 +802,30 @@ func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) 
 		slog.Error("Email: error enviando reset", "to", toEmail, "error", err)
 	} else {
 		slog.Info("Email: reset enviado", "to", toEmail)
+	}
+}
+
+func sendEmailChangeOTP(cfg types.EnvConfig, toEmail, code, username, lang string) {
+	if cfg.ResendAPIKey == "" && cfg.SMTPHost == "" {
+		slog.Info("Email: codigo de cambio de correo (sin proveedor de email configurado)", "to", toEmail, "code", code)
+		return
+	}
+
+	es := lang != "en"
+	subject := "Tu código de verificación — KidStorePeru"
+	if !es { subject = "Your verification code — KidStorePeru" }
+
+	var htmlBody string
+	if es {
+		htmlBody = buildOTPEmailES(username, code)
+	} else {
+		htmlBody = buildOTPEmailEN(username, code)
+	}
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: error enviando codigo de cambio de correo", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: codigo de cambio de correo enviado", "to", toEmail)
 	}
 }
 
@@ -779,4 +941,32 @@ func buildResetEmailEN(username, resetURL string) string {
   <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ This link expires in <strong style="color:#6b6b8a;">10 minutes</strong>. If you didn't request this, ignore this email — your password won't change.</p>
 </div>`, username, resetURL, resetURL, resetURL)
 	return emailBase("Reset your password — KidStorePeru", "Reset your KidStorePeru password", content)
+}
+
+func buildOTPEmailES(username, code string) string {
+	content := fmt.Sprintf(`
+<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Verifica tu nuevo correo</h1>
+<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Hola <strong style="color:#ffffff;">%s</strong>, usa este código para confirmar el cambio de correo en tu cuenta de KidStorePeru.</p>
+<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:28px;margin:0 0 24px;text-align:center;">
+  <p style="margin:0 0 14px;font-size:13px;color:#6b6b8a;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Tu código de verificación</p>
+  <span style="display:inline-block;font-size:34px;font-weight:900;letter-spacing:8px;color:#ffffff;font-family:monospace;">%s</span>
+</div>
+<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
+  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ Este código expira en <strong style="color:#6b6b8a;">15 minutos</strong>. Si no solicitaste este cambio, ignora este correo — tu email no cambiará.</p>
+</div>`, username, code)
+	return emailBase("Tu código de verificación — KidStorePeru", "Confirma el cambio de correo de tu cuenta", content)
+}
+
+func buildOTPEmailEN(username, code string) string {
+	content := fmt.Sprintf(`
+<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Verify your new email</h1>
+<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Hi <strong style="color:#ffffff;">%s</strong>, use this code to confirm the email change on your KidStorePeru account.</p>
+<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:28px;margin:0 0 24px;text-align:center;">
+  <p style="margin:0 0 14px;font-size:13px;color:#6b6b8a;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Your verification code</p>
+  <span style="display:inline-block;font-size:34px;font-weight:900;letter-spacing:8px;color:#ffffff;font-family:monospace;">%s</span>
+</div>
+<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
+  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ This code expires in <strong style="color:#6b6b8a;">15 minutes</strong>. If you didn't request this change, ignore this email — your email won't change.</p>
+</div>`, username, code)
+	return emailBase("Your verification code — KidStorePeru", "Confirm your account's email change", content)
 }
