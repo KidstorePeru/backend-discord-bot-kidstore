@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/smtp"
+	"strings"
 	"time"
 )
 
@@ -23,8 +24,24 @@ func esc(s string) string {
 	return htmlpkg.EscapeString(s)
 }
 
+// hasCRLF detecta un salto de línea crudo — sendViaSMTP arma las cabeceras
+// del correo con fmt.Sprintf directo sobre "to" y "subject". Si cualquiera
+// de los dos llegara a traer un \r o \n, alguien podría inyectar cabeceras
+// SMTP extra (p. ej. un Bcc oculto) — esto es "email header injection", una
+// vulnerabilidad clásica. Los formularios de registro/cambio de correo ya
+// validan el formato del email antes de llegar acá, pero no hay que confiar
+// en que TODO llamador futuro lo haga bien — se corta acá, en el único punto
+// por el que pasan todos los correos que manda la web.
+func hasCRLF(s string) bool {
+	return strings.ContainsAny(s, "\r\n")
+}
+
 // sendEmail sends an HTML email using Resend API (production) or SMTP (local dev).
 func sendEmail(cfg types.EnvConfig, to, subject, htmlBody string) error {
+	if hasCRLF(to) || hasCRLF(subject) {
+		slog.Error("Email: to/subject con salto de línea, bloqueado (posible inyección de cabeceras)", "to", to, "subject", subject)
+		return fmt.Errorf("destinatario o asunto inválido")
+	}
 	if cfg.ResendAPIKey != "" {
 		return sendViaResend(cfg.ResendAPIKey, cfg.SMTPFrom, to, subject, htmlBody)
 	}
