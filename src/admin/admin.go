@@ -173,7 +173,8 @@ func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
 		approvedBy := strings.TrimSpace(c.GetHeader("X-Approved-By"))
 		if approvedBy == "" { approvedBy = "admin" }
 
-		if err := db.RechargeKC(database, customerID, req.AmountKC, req.AmountSoles, req.Note, approvedBy, "manual"); err != nil {
+		rechargeID, err := db.RechargeKC(database, customerID, req.AmountKC, req.AmountSoles, req.Note, approvedBy, "manual")
+		if err != nil {
 			if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "inactive") {
 				c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado o inactivo"})
 			} else {
@@ -194,7 +195,8 @@ func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
 			if req.AmountSoles != nil { amountSoles = *req.AmountSoles }
 			productName := "Recarga manual de KC"
 			if req.Note != nil && *req.Note != "" { productName = *req.Note }
-			go store.SendPaymentApprovedEmail(store.GetSMTPConfig(), *customer.Email, productName, amountSoles, req.AmountKC, "Recarga manual", "es")
+			voucherURL := fmt.Sprintf("https://www.kidstoreperu.net/dashboard/comprobantes/recarga/%s", rechargeID)
+			go store.SendPaymentApprovedEmail(store.GetSMTPConfig(), *customer.Email, productName, amountSoles, req.AmountKC, "Recarga manual", voucherURL, "es")
 		}
 
 		c.JSON(http.StatusOK, gin.H{

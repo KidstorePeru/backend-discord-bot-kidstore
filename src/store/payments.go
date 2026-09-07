@@ -255,6 +255,111 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// ==================== COMPROBANTE DE PAGO ====================
+
+// HandlerPaymentVoucher devuelve los datos para la página de comprobante de
+// una recarga — solo si ya está aprobada/cumplida y le pertenece al cliente
+// autenticado (mismo chequeo de propiedad que HandlerPaymentStatus).
+func HandlerPaymentVoucher(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
+			return
+		}
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
+			return
+		}
+		tx, err := db.GetPaymentTransaction(database, id)
+		if err != nil || tx.CustomerID != customerID {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "comprobante no encontrado"})
+			return
+		}
+		if tx.Status != "approved" && tx.Status != "fulfilled" {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "este pago todavía no tiene comprobante"})
+			return
+		}
+		customer, err := db.GetCustomerByID(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"voucher": gin.H{
+				"type":          "payment",
+				"reference":     strings.ToUpper(id.String()[:8]),
+				"customer_name": customer.EpicUsername,
+				"product_name":  tx.ProductName,
+				"amount_pen":    tx.AmountPEN,
+				"kc_amount":     tx.KCAmount,
+				"gateway":       tx.Gateway,
+				"external_id":   tx.ExternalID,
+				"status":        tx.Status,
+				"created_at":    tx.CreatedAt,
+			},
+		})
+	}
+}
+
+// HandlerRechargeVoucher devuelve los datos para la página de comprobante de
+// una recarga manual (Yape/Plin aprobada por un admin, o /kc add de Discord)
+// — solo si le pertenece al cliente autenticado.
+func HandlerRechargeVoucher(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
+			return
+		}
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
+			return
+		}
+		r, err := db.GetKCRechargeByID(database, id)
+		if err != nil || r.CustomerID != customerID {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "comprobante no encontrado"})
+			return
+		}
+		customer, err := db.GetCustomerByID(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
+			return
+		}
+		amountSoles := 0.0
+		if r.AmountSoles != nil { amountSoles = *r.AmountSoles }
+		productName := "Recarga manual de KC"
+		if r.Note != nil && *r.Note != "" { productName = *r.Note }
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"voucher": gin.H{
+				"type":          "recharge",
+				"reference":     strings.ToUpper(id.String()[:8]),
+				"customer_name": customer.EpicUsername,
+				"product_name":  productName,
+				"amount_pen":    amountSoles,
+				"kc_amount":     r.AmountKC,
+				"gateway":       r.Method,
+				"status":        "approved",
+				"created_at":    r.CreatedAt,
+			},
+		})
+	}
+}
+
 // ==================== CANCELAR PAGO ====================
 
 // HandlerCancelPayment permite al cliente marcar su propio pago pendiente

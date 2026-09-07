@@ -921,21 +921,25 @@ func ConfirmEmailChange(db *sql.DB, customerID uuid.UUID, newEmail string) error
 
 // ==================== KC — TRANSACCIONES ATÓMICAS ====================
 
-func RechargeKC(db *sql.DB, customerID uuid.UUID, amountKC int, amountSoles *float64, note *string, approvedBy string, method string) error {
-	if amountKC <= 0 { return fmt.Errorf("amount_kc must be positive") }
+// RechargeKC devuelve el ID de la fila creada en kc_recharges — lo usan las
+// recargas manuales (admin/Discord) para armar el link al comprobante.
+func RechargeKC(db *sql.DB, customerID uuid.UUID, amountKC int, amountSoles *float64, note *string, approvedBy string, method string) (uuid.UUID, error) {
+	if amountKC <= 0 { return uuid.Nil, fmt.Errorf("amount_kc must be positive") }
 	if method == "" { method = "manual" }
 	tx, err := db.Begin()
-	if err != nil { return err }
+	if err != nil { return uuid.Nil, err }
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE customers SET kc_balance=kc_balance+$1, updated_at=NOW() WHERE id=$2 AND is_active=true`, amountKC, customerID)
-	if err != nil { return err }
+	if err != nil { return uuid.Nil, err }
 	rows, _ := result.RowsAffected()
-	if rows == 0 { return fmt.Errorf("customer not found or inactive") }
+	if rows == 0 { return uuid.Nil, fmt.Errorf("customer not found or inactive") }
+	rechargeID := uuid.New()
 	_, err = tx.Exec(`INSERT INTO kc_recharges (id, customer_id, amount_kc, amount_soles, method, note, approved_by, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
-		uuid.New(), customerID, amountKC, amountSoles, method, note, approvedBy)
-	if err != nil { return err }
-	return tx.Commit()
+		rechargeID, customerID, amountKC, amountSoles, method, note, approvedBy)
+	if err != nil { return uuid.Nil, err }
+	if err := tx.Commit(); err != nil { return uuid.Nil, err }
+	return rechargeID, nil
 }
 
 // DeductKCManual quita KC del balance de un cliente (corrección administrativa,
@@ -1110,6 +1114,17 @@ func GetOrdersByCustomer(db *sql.DB, customerID uuid.UUID, page, limit int) ([]t
 	defer rows.Close()
 	orders, err := scanOrders(rows)
 	return orders, total, err
+}
+
+func GetOrderByID(db *sql.DB, id uuid.UUID) (types.Order, error) {
+	var o types.Order
+	err := db.QueryRow(`
+		SELECT id, customer_id, epic_username, item_offer_id, item_name,
+		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, created_at, updated_at
+		FROM orders WHERE id=$1`, id).
+		Scan(&o.ID, &o.CustomerID, &o.EpicUsername, &o.ItemOfferID, &o.ItemName,
+			&o.ItemImage, &o.PriceKC, &o.PriceVBucks, &o.Status, &o.GameAccountID, &o.ErrorMsg, &o.CreatedAt, &o.UpdatedAt)
+	return o, err
 }
 
 func GetAllOrders(db *sql.DB, page, limit int) ([]types.Order, int, error) {
@@ -1461,6 +1476,15 @@ func GetRechargesByCustomer(db *sql.DB, customerID uuid.UUID) ([]types.KCRecharg
 		recharges = append(recharges, r)
 	}
 	return recharges, nil
+}
+
+func GetKCRechargeByID(db *sql.DB, id uuid.UUID) (types.KCRecharge, error) {
+	var r types.KCRecharge
+	err := db.QueryRow(`
+		SELECT id, customer_id, amount_kc, amount_soles, method, note, approved_by, created_at
+		FROM kc_recharges WHERE id=$1`, id).
+		Scan(&r.ID, &r.CustomerID, &r.AmountKC, &r.AmountSoles, &r.Method, &r.Note, &r.ApprovedBy, &r.CreatedAt)
+	return r, err
 }
 
 func CountPendingOrdersByCustomer(db *sql.DB, customerID uuid.UUID) (int, error) {

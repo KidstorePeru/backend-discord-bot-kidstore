@@ -10,7 +10,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"math/big"
 	"net/http"
 	"strings"
@@ -651,6 +650,11 @@ func HandlerConfirmEmailChange(database *sql.DB, secretKey string) gin.HandlerFu
 			return
 		}
 
+		// Capturar el correo VIEJO antes de sobreescribirlo — es a donde se
+		// manda el aviso de seguridad, no al nuevo (que ya recibió su propio
+		// código OTP).
+		previousCustomer, _ := db.GetCustomerByID(database, customerID)
+
 		if pending.Attempts >= types.MaxEmailChangeAttempts {
 			db.DeleteEmailChangeRequest(database, customerID)
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "demasiados intentos fallidos — solicita un nuevo código"})
@@ -682,6 +686,13 @@ func HandlerConfirmEmailChange(database *sql.DB, secretKey string) gin.HandlerFu
 			return
 		}
 		token, _ := middleware.GenerateCustomerToken(updatedCustomer, secretKey)
+
+		// Alerta de seguridad al correo ANTERIOR — si alguien más cambió el
+		// correo de acceso, es la única forma de que el dueño real se entere
+		// mientras todavía tenga esa bandeja vieja a mano.
+		if previousCustomer.Email != nil && *previousCustomer.Email != "" {
+			go SendEmailChangedNoticeEmail(smtpConfig, *previousCustomer.Email, updatedCustomer.EpicUsername, maskEmail(pending.NewEmail), "es")
+		}
 
 		c.JSON(http.StatusOK, gin.H{
 			"success":  true,
@@ -772,217 +783,33 @@ func HandlerResetPassword(database *sql.DB) gin.HandlerFunc {
 
 func sendVerificationEmail(cfg types.EnvConfig, toEmail, token, username, lang string) {
 	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", cfg.FrontendURL, token)
-
-	if cfg.SMTPHost == "" {
-		slog.Info("Email: verification URL (SMTP not configured)", "to", toEmail, "url", verifyURL)
-		return
-	}
-
-	es := lang != "en"
-	subject := "Verifica tu cuenta — KidStorePeru"
-	if !es { subject = "Verify your account — KidStorePeru" }
-
-	var htmlBody string
-	if es {
-		htmlBody = buildVerificationEmailES(username, verifyURL)
-	} else {
-		htmlBody = buildVerificationEmailEN(username, verifyURL)
-	}
-
-	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
-		slog.Error("Email: error enviando verificacion", "to", toEmail, "error", err)
-	} else {
-		slog.Info("Email: verificacion enviada", "to", toEmail)
-	}
+	sendVerificationEmailNew(cfg, toEmail, username, verifyURL, lang)
 }
 
 func sendResetEmail(cfg types.EnvConfig, toEmail, token, username, lang string) {
-	if cfg.ResendAPIKey == "" && cfg.SMTPHost == "" {
-		slog.Info("Email: reset token (no email provider configured)", "to", toEmail, "token", token)
-		return
-	}
-
-	es := lang != "en"
 	resetURL := fmt.Sprintf("%s/reset-password?token=%s", cfg.FrontendURL, token)
-	subject := "Recuperar contraseña — KidStorePeru"
-	if !es { subject = "Reset your password — KidStorePeru" }
+	sendResetEmailNew(cfg, toEmail, username, resetURL, lang)
+}
 
-	var htmlBody string
-	if es {
-		htmlBody = buildResetEmailES(username, resetURL)
-	} else {
-		htmlBody = buildResetEmailEN(username, resetURL)
+// maskEmail oculta la mayor parte de un correo para mostrarlo en avisos de
+// seguridad sin exponerlo completo — "kidplayer123@gmail.com" -> "k•••••••••3@gmail.com".
+func maskEmail(email string) string {
+	at := strings.Index(email, "@")
+	if at <= 1 {
+		return email
 	}
-
-	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
-		slog.Error("Email: error enviando reset", "to", toEmail, "error", err)
-	} else {
-		slog.Info("Email: reset enviado", "to", toEmail)
+	local, domain := email[:at], email[at:]
+	if len(local) <= 2 {
+		return local[:1] + "•••" + domain
 	}
+	masked := local[:1]
+	for i := 1; i < len(local)-1; i++ {
+		masked += "•"
+	}
+	masked += local[len(local)-1:]
+	return masked + domain
 }
 
 func sendEmailChangeOTP(cfg types.EnvConfig, toEmail, code, username, lang string) {
-	if cfg.ResendAPIKey == "" && cfg.SMTPHost == "" {
-		slog.Info("Email: codigo de cambio de correo (sin proveedor de email configurado)", "to", toEmail, "code", code)
-		return
-	}
-
-	es := lang != "en"
-	subject := "Tu código de verificación — KidStorePeru"
-	if !es { subject = "Your verification code — KidStorePeru" }
-
-	var htmlBody string
-	if es {
-		htmlBody = buildOTPEmailES(username, code)
-	} else {
-		htmlBody = buildOTPEmailEN(username, code)
-	}
-
-	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
-		slog.Error("Email: error enviando codigo de cambio de correo", "to", toEmail, "error", err)
-	} else {
-		slog.Info("Email: codigo de cambio de correo enviado", "to", toEmail)
-	}
-}
-
-// ── Templates HTML de emails ──
-
-func emailBase(title, preheader, content string) string {
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>%s</title>
-</head>
-<body style="margin:0;padding:0;background:#0a0a0f;font-family:'Segoe UI',Arial,sans-serif;">
-<span style="display:none;max-height:0;overflow:hidden;">%s</span>
-<table width="100%%" cellpadding="0" cellspacing="0" style="background:#0a0a0f;padding:40px 20px;">
-  <tr><td align="center">
-    <table width="100%%" cellpadding="0" cellspacing="0" style="max-width:560px;">
-      <!-- Header -->
-      <tr><td align="center" style="background:linear-gradient(135deg,#1a0a2e 0%%,#0d1117 100%%);border-radius:20px 20px 0 0;padding:40px 40px 32px;">
-        <img src="https://www.kidstoreperu.net/logotipo.png" alt="KidStorePeru" width="160" style="display:block;margin:0 auto 20px;max-width:160px;"/>
-        <div style="width:48px;height:3px;background:linear-gradient(90deg,#7c3aed,#a855f7);border-radius:2px;margin:0 auto;"></div>
-      </td></tr>
-      <!-- Body -->
-      <tr><td style="background:#0f0f1a;padding:40px;border-left:1px solid #1e1e3a;border-right:1px solid #1e1e3a;">
-        %s
-      </td></tr>
-      <!-- Footer -->
-      <tr><td align="center" style="background:#080810;border-radius:0 0 20px 20px;padding:24px 40px;border:1px solid #1e1e3a;border-top:none;">
-        <p style="margin:0 0 8px;font-size:12px;color:#4a4a6a;">KidStorePeru — La tienda de Fortnite más confiable 🎮</p>
-        <p style="margin:0;font-size:11px;color:#3a3a5a;">
-          <a href="https://www.kidstoreperu.net" style="color:#7c3aed;text-decoration:none;">kidstoreperu.net</a>
-          &nbsp;·&nbsp;
-          <a href="https://www.kidstoreperu.net/privacy" style="color:#4a4a6a;text-decoration:none;">Privacidad</a>
-        </p>
-      </td></tr>
-    </table>
-  </td></tr>
-</table>
-</body>
-</html>`, title, preheader, content)
-}
-
-func buildVerificationEmailES(username, verifyURL string) string {
-	content := fmt.Sprintf(`
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">¡Hola, %s! 👋</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Gracias por registrarte en <strong style="color:#a855f7;">KidStorePeru</strong>. Para activar tu cuenta y empezar a comprar items de Fortnite, verifica tu correo electrónico.</p>
-<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:24px;margin:0 0 24px;text-align:center;">
-  <p style="margin:0 0 6px;font-size:13px;color:#6b6b8a;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Tu cuenta está lista</p>
-  <p style="margin:0 0 20px;font-size:14px;color:#8b8ba7;">Un solo clic para activarla</p>
-  <a href="%s" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;padding:14px 36px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px;">✓ Verificar mi cuenta</a>
-</div>
-<p style="margin:0 0 12px;font-size:13px;color:#6b6b8a;">¿El botón no funciona? Copia y pega este enlace:</p>
-<div style="background:#080810;border:1px solid #1e1e3a;border-radius:10px;padding:12px 16px;margin:0 0 24px;word-break:break-all;">
-  <a href="%s" style="font-size:12px;color:#7c3aed;text-decoration:none;">%s</a>
-</div>
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ Este enlace expira en <strong style="color:#6b6b8a;">24 horas</strong>. Si no creaste esta cuenta, puedes ignorar este correo.</p>
-</div>`, username, verifyURL, verifyURL, verifyURL)
-	return emailBase("Verifica tu cuenta — KidStorePeru", "Activa tu cuenta en KidStorePeru con un clic", content)
-}
-
-func buildVerificationEmailEN(username, verifyURL string) string {
-	content := fmt.Sprintf(`
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Hey, %s! 👋</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Thanks for signing up at <strong style="color:#a855f7;">KidStorePeru</strong>. To activate your account and start buying Fortnite items, please verify your email address.</p>
-<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:24px;margin:0 0 24px;text-align:center;">
-  <p style="margin:0 0 6px;font-size:13px;color:#6b6b8a;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Your account is ready</p>
-  <p style="margin:0 0 20px;font-size:14px;color:#8b8ba7;">One click to activate it</p>
-  <a href="%s" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;padding:14px 36px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px;">✓ Verify my account</a>
-</div>
-<p style="margin:0 0 12px;font-size:13px;color:#6b6b8a;">Button not working? Copy and paste this link:</p>
-<div style="background:#080810;border:1px solid #1e1e3a;border-radius:10px;padding:12px 16px;margin:0 0 24px;word-break:break-all;">
-  <a href="%s" style="font-size:12px;color:#7c3aed;text-decoration:none;">%s</a>
-</div>
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ This link expires in <strong style="color:#6b6b8a;">24 hours</strong>. If you didn't create this account, you can safely ignore this email.</p>
-</div>`, username, verifyURL, verifyURL, verifyURL)
-	return emailBase("Verify your account — KidStorePeru", "Activate your KidStorePeru account with one click", content)
-}
-
-func buildResetEmailES(username, resetURL string) string {
-	content := fmt.Sprintf(`
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Recuperar contraseña</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Hola <strong style="color:#ffffff;">%s</strong>, recibimos una solicitud para restablecer la contraseña de tu cuenta en KidStorePeru.</p>
-<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:24px;margin:0 0 24px;text-align:center;">
-  <p style="margin:0 0 20px;font-size:14px;color:#8b8ba7;">Haz clic en el botón para crear una nueva contraseña</p>
-  <a href="%s" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;padding:14px 36px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px;">🔑 Restablecer contraseña</a>
-</div>
-<p style="margin:0 0 12px;font-size:13px;color:#6b6b8a;">¿El botón no funciona? Copia y pega este enlace:</p>
-<div style="background:#080810;border:1px solid #1e1e3a;border-radius:10px;padding:12px 16px;margin:0 0 24px;word-break:break-all;">
-  <a href="%s" style="font-size:12px;color:#7c3aed;text-decoration:none;">%s</a>
-</div>
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ Este enlace expira en <strong style="color:#6b6b8a;">10 minutos</strong>. Si no solicitaste esto, ignora este correo — tu contraseña no cambiará.</p>
-</div>`, username, resetURL, resetURL, resetURL)
-	return emailBase("Recuperar contraseña — KidStorePeru", "Restablece tu contraseña de KidStorePeru", content)
-}
-
-func buildResetEmailEN(username, resetURL string) string {
-	content := fmt.Sprintf(`
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Reset your password</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Hi <strong style="color:#ffffff;">%s</strong>, we received a request to reset the password for your KidStorePeru account.</p>
-<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:24px;margin:0 0 24px;text-align:center;">
-  <p style="margin:0 0 20px;font-size:14px;color:#8b8ba7;">Click the button below to create a new password</p>
-  <a href="%s" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;padding:14px 36px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px;">🔑 Reset password</a>
-</div>
-<p style="margin:0 0 12px;font-size:13px;color:#6b6b8a;">Button not working? Copy and paste this link:</p>
-<div style="background:#080810;border:1px solid #1e1e3a;border-radius:10px;padding:12px 16px;margin:0 0 24px;word-break:break-all;">
-  <a href="%s" style="font-size:12px;color:#7c3aed;text-decoration:none;">%s</a>
-</div>
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ This link expires in <strong style="color:#6b6b8a;">10 minutes</strong>. If you didn't request this, ignore this email — your password won't change.</p>
-</div>`, username, resetURL, resetURL, resetURL)
-	return emailBase("Reset your password — KidStorePeru", "Reset your KidStorePeru password", content)
-}
-
-func buildOTPEmailES(username, code string) string {
-	content := fmt.Sprintf(`
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Verifica tu nuevo correo</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Hola <strong style="color:#ffffff;">%s</strong>, usa este código para confirmar el cambio de correo en tu cuenta de KidStorePeru.</p>
-<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:28px;margin:0 0 24px;text-align:center;">
-  <p style="margin:0 0 14px;font-size:13px;color:#6b6b8a;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Tu código de verificación</p>
-  <span style="display:inline-block;font-size:34px;font-weight:900;letter-spacing:8px;color:#ffffff;font-family:monospace;">%s</span>
-</div>
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ Este código expira en <strong style="color:#6b6b8a;">15 minutos</strong>. Si no solicitaste este cambio, ignora este correo — tu email no cambiará.</p>
-</div>`, username, code)
-	return emailBase("Tu código de verificación — KidStorePeru", "Confirma el cambio de correo de tu cuenta", content)
-}
-
-func buildOTPEmailEN(username, code string) string {
-	content := fmt.Sprintf(`
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">Verify your new email</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">Hi <strong style="color:#ffffff;">%s</strong>, use this code to confirm the email change on your KidStorePeru account.</p>
-<div style="background:linear-gradient(135deg,#1a0a2e,#0d1117);border:1px solid #2d1f4e;border-radius:14px;padding:28px;margin:0 0 24px;text-align:center;">
-  <p style="margin:0 0 14px;font-size:13px;color:#6b6b8a;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Your verification code</p>
-  <span style="display:inline-block;font-size:34px;font-weight:900;letter-spacing:8px;color:#ffffff;font-family:monospace;">%s</span>
-</div>
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">⏰ This code expires in <strong style="color:#6b6b8a;">15 minutes</strong>. If you didn't request this change, ignore this email — your email won't change.</p>
-</div>`, username, code)
-	return emailBase("Your verification code — KidStorePeru", "Confirm your account's email change", content)
+	sendEmailChangeOTPNew(cfg, toEmail, username, code, lang)
 }

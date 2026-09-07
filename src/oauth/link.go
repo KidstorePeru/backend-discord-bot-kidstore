@@ -3,6 +3,7 @@ package oauth
 import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/middleware"
+	"KidStoreStore/src/store"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -149,6 +150,11 @@ func HandlerUnlinkProvider(database *sql.DB) gin.HandlerFunc {
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
 			return
+		}
+		// Alerta de seguridad — si alguien más entró a la cuenta y quitó esta
+		// protección, el dueño real debe enterarse igual.
+		if updatedCustomer.Email != nil && *updatedCustomer.Email != "" {
+			go store.SendAccountUnlinkedEmail(store.GetSMTPConfig(), *updatedCustomer.Email, updatedCustomer.EpicUsername, provider, "es")
 		}
 		c.JSON(http.StatusOK, gin.H{"success": true, "customer": updatedCustomer.Public()})
 	}

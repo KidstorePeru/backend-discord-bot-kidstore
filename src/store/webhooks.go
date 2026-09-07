@@ -47,7 +47,7 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 	if tx.PaymentType == "kc_recharge" && tx.KCAmount > 0 {
 		soles := tx.AmountPEN
 		note := fmt.Sprintf("Pago automatico via %s (ID: %s)", tx.Gateway, tx.ExternalID)
-		if err := db.RechargeKC(database, tx.CustomerID, tx.KCAmount, &soles, &note, tx.Gateway, tx.Gateway); err != nil {
+		if _, err := db.RechargeKC(database, tx.CustomerID, tx.KCAmount, &soles, &note, tx.Gateway, tx.Gateway); err != nil {
 			slog.Error("KC recharge failed after payment", "txID", txID, "error", err)
 			return fmt.Errorf("recharge failed: %w", err)
 		}
@@ -57,7 +57,8 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 	// Send payment approved email notification
 	if customer, err := db.GetCustomerByID(database, tx.CustomerID); err == nil {
 		if customer.Email != nil && *customer.Email != "" {
-			go SendPaymentApprovedEmail(smtpConfig, *customer.Email, tx.ProductName, tx.AmountPEN, tx.KCAmount, tx.Gateway, "es")
+			voucherURL := fmt.Sprintf("https://www.kidstoreperu.net/dashboard/comprobantes/pago/%s", tx.ID)
+			go SendPaymentApprovedEmail(smtpConfig, *customer.Email, tx.ProductName, tx.AmountPEN, tx.KCAmount, tx.Gateway, voucherURL, "es")
 		}
 		if tx.PaymentType == "kc_recharge" && tx.KCAmount > 0 {
 			discordbot.NotifyRecharge(customer, tx.KCAmount, customer.KCBalance, tx.Gateway)

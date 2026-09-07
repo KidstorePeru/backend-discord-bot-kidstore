@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/google/uuid"
 )
 
 // isAdmin solo autoriza al Discord ID configurado como administrador — se
@@ -120,7 +121,8 @@ func handleKCCommand(s *discordgo.Session, i *discordgo.InteractionCreate, data 
 		if note != "" {
 			notePtr = &note
 		}
-		opErr = db.RechargeKC(database, target.ID, int(amount), nil, notePtr, approvedBy, "manual_discord")
+		var rechargeID uuid.UUID
+		rechargeID, opErr = db.RechargeKC(database, target.ID, int(amount), nil, notePtr, approvedBy, "manual_discord")
 		if opErr == nil {
 			updated, _ := db.GetCustomerByID(database, target.ID)
 			newBalance = updated.KCBalance
@@ -130,7 +132,8 @@ func handleKCCommand(s *discordgo.Session, i *discordgo.InteractionCreate, data 
 			if emailSender != nil && updated.Email != nil && *updated.Email != "" {
 				productName := "Recarga manual de KC"
 				if note != "" { productName = note }
-				go emailSender(cfg, *updated.Email, productName, 0, int(amount), "Recarga manual (Discord)", "es")
+				voucherURL := fmt.Sprintf("https://www.kidstoreperu.net/dashboard/comprobantes/recarga/%s", rechargeID)
+				go emailSender(cfg, *updated.Email, productName, 0, int(amount), "Recarga manual (Discord)", voucherURL, "es")
 			}
 		}
 	} else {

@@ -365,6 +365,61 @@ func HandlerGetMyOrders(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// ==================== COMPROBANTE DE PEDIDO ====================
+
+// HandlerOrderVoucher devuelve los datos para la página de comprobante de un
+// pedido — solo si ya se entregó ("sent") y le pertenece al cliente autenticado.
+func HandlerOrderVoucher(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		order, err := db.GetOrderByID(database, id)
+		if err != nil || order.CustomerID != customerID {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "comprobante no encontrado"})
+			return
+		}
+		if order.Status != "sent" {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "este pedido todavía no tiene comprobante"})
+			return
+		}
+		customer, err := db.GetCustomerByID(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
+			return
+		}
+		itemImage := ""
+		if order.ItemImage != nil { itemImage = *order.ItemImage }
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"voucher": gin.H{
+				"type":          "order",
+				"reference":     strings.ToUpper(id.String()[:8]),
+				"customer_name": customer.EpicUsername,
+				"item_name":     order.ItemName,
+				"item_image":    itemImage,
+				"epic_username": order.EpicUsername,
+				"price_kc":      order.PriceKC,
+				"price_vbucks":  order.PriceVBucks,
+				"status":        order.Status,
+				"created_at":    order.CreatedAt,
+			},
+		})
+	}
+}
+
 // ==================== WORKER ====================
 
 var encryptionKey string
@@ -429,7 +484,9 @@ func notifyOrderFailed(database *sql.DB, order types.Order, reason string) {
 		return
 	}
 	if customer.Email != nil && *customer.Email != "" {
-		go SendOrderFailedEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, reason, "es")
+		itemImage := ""
+		if order.ItemImage != nil { itemImage = *order.ItemImage }
+		go SendOrderFailedEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, itemImage, order.PriceKC, reason, "es")
 	}
 }
 
@@ -532,7 +589,9 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 
 			if customer, custErr := db.GetCustomerByID(database, order.CustomerID); custErr == nil {
 				if customer.Email != nil && *customer.Email != "" {
-					go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, order.PriceKC, "es")
+					itemImage := ""
+					if order.ItemImage != nil { itemImage = *order.ItemImage }
+					go SendOrderSentEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, itemImage, order.ID.String(), order.PriceKC, "es")
 				}
 				discordbot.NotifyPurchase(customer, order.EpicUsername, order.ItemName, order.ItemImage, order.PriceKC, order.PriceVBucks)
 			}

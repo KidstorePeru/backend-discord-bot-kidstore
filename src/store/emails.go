@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/smtp"
+	"time"
 )
 
 // sendEmail sends an HTML email using Resend API (production) or SMTP (local dev).
@@ -71,102 +72,187 @@ func GetSMTPConfig() types.EnvConfig {
 	return smtpConfig
 }
 
-// hasEmailProvider evita construir el HTML si no hay forma de mandarlo —
-// igual chequeo que ya usan sendVerificationEmail/sendResetEmail en auth.go,
-// repetido acá para que TODOS los correos transaccionales sean consistentes
-// (antes algunos solo revisaban SMTP_HOST y se saltaban Resend por error).
 func hasEmailProvider(cfg types.EnvConfig) bool {
 	return cfg.ResendAPIKey != "" || cfg.SMTPHost != ""
 }
 
-// ==================== COMPONENTES VISUALES COMPARTIDOS ====================
-// Estos helpers arman el mismo "look" oscuro de marca (fondo #0a0a0f,
-// acentos morados, logo en el header) que ya usan los correos de
-// verificación/reset/OTP en auth.go (ver emailBase) — así todos los correos
-// que manda la web se ven como parte de la misma marca profesional, en vez
-// de tener cada tipo de correo su propio diseño suelto.
+// SupportEmail — dirección de contacto que aparece en el pie de todos los correos.
+const SupportEmail = "contacto@kidstoreperu.com"
 
-// emailBadge — insignia de estado arriba del título (✅ pago, ↩️ reembolso, 🔐 seguridad).
-func emailBadge(emoji, text, bg, color string) string {
-	return fmt.Sprintf(`<div style="display:inline-block;background:%s;color:%s;padding:6px 16px;border-radius:20px;font-size:12px;font-weight:700;letter-spacing:0.3px;margin:0 0 16px;">%s %s</div>`,
-		bg, color, emoji, text)
+// ==================== SISTEMA DE DISEÑO — "Extracto" ====================
+// Un solo tema (claro), logo y KC reales, tipografía Fraunces (cifras/títulos)
+// + Work Sans (cuerpo). Todos los correos transaccionales de la web se arman
+// con estos mismos bloques para que se vean consistentes entre sí.
+
+const (
+	logoURL    = "https://www.kidstoreperu.net/logotipo.png"
+	kcIconURL  = "https://www.kidstoreperu.net/kidcoin.png"
+	fontsLink  = `<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500&family=Work+Sans:wght@400;500;600;700&display=swap">`
+)
+
+// emailShell envuelve el contenido de cualquier correo en el mismo cascarón:
+// fuentes, logo arriba, la fecha, y un pie con el link a kidstoreperu.net y
+// el correo de soporte.
+func emailShell(subject, preheader, dateStr, bodyHTML string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+%s
+<title>%s</title>
+</head>
+<body style="margin:0;padding:0;background:#f7f6f3;font-family:'Work Sans',Arial,sans-serif;">
+<span style="display:none;max-height:0;overflow:hidden;">%s</span>
+<table width="100%%" cellpadding="0" cellspacing="0" style="background:#f7f6f3;padding:36px 16px;">
+<tr><td align="center">
+<table width="100%%" cellpadding="0" cellspacing="0" style="max-width:400px;background:#ffffff;border:1px solid #e4e3dd;border-radius:16px;">
+<tr><td style="padding:30px 28px 26px;">
+
+  <table width="100%%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;">
+    <tr>
+      <td><img src="%s" alt="KidStorePeru" height="26" style="display:block;height:26px;width:auto;"/></td>
+      <td align="right" style="font-size:11px;color:#6d716f;">%s</td>
+    </tr>
+  </table>
+
+  %s
+
+  <table width="100%%" cellpadding="0" cellspacing="0" style="margin-top:22px;padding-top:16px;border-top:1px solid #e6e6e2;">
+    <tr><td style="font-size:11px;color:#6d716f;line-height:1.7;">
+      ¿Alguna duda? Escríbenos a <a href="mailto:%s" style="color:#33396b;text-decoration:none;font-weight:600;">%s</a>
+      o por <a href="https://discord.gg/kidstore" style="color:#33396b;text-decoration:none;font-weight:600;">Discord</a>.<br/>
+      <span style="color:#9a9d97;">KidStorePeru · <a href="https://www.kidstoreperu.net" style="color:#9a9d97;text-decoration:none;">kidstoreperu.net</a></span>
+    </td></tr>
+  </table>
+
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>`, fontsLink, subject, preheader, logoURL, dateStr, bodyHTML, SupportEmail, SupportEmail)
 }
 
-// emailInfoRow — una fila "etiqueta: valor" dentro de la tabla de detalles.
-func emailInfoRow(label, value, valueColor string) string {
-	if valueColor == "" {
-		valueColor = "#ffffff"
+func emailEyebrow(text string) string {
+	return fmt.Sprintf(`<p style="margin:0 0 4px;font-size:11.5px;color:#6d716f;">%s</p>`, text)
+}
+
+// emailHero — el dato principal del correo, en Fraunces grande. iconHTML es
+// opcional (el ícono de KC antes de la cifra).
+func emailHero(iconHTML, text string, small bool) string {
+	size := "32px"
+	if small {
+		size = "23px"
+	}
+	return fmt.Sprintf(`<h1 style="margin:0 0 8px;font-family:'Fraunces',Georgia,serif;font-weight:500;font-size:%s;line-height:1.15;color:#14161a;">%s%s</h1>`,
+		size, iconHTML, text)
+}
+
+func emailCopy(text string) string {
+	return fmt.Sprintf(`<p style="margin:0 0 18px;font-size:13px;color:#6d716f;line-height:1.65;">%s</p>`, text)
+}
+
+func emailKCIcon(size int) string {
+	return fmt.Sprintf(`<img src="%s" alt="KC" width="%d" height="%d" style="display:inline-block;vertical-align:-4px;margin-right:8px;"/>`, kcIconURL, size, size)
+}
+
+// emailItemRow — miniatura del producto + nombre, usado en correos de pedido.
+func emailItemRow(imageURL, name, sub string) string {
+	img := imageURL
+	if img == "" {
+		img = kcIconURL // si el item no tiene imagen, evita un <img> roto
 	}
 	return fmt.Sprintf(`
-		<tr>
-			<td style="padding:10px 16px;color:#8b8ba7;font-size:13px;border-bottom:1px solid #14142a;">%s</td>
-			<td style="padding:10px 16px;color:%s;font-size:13px;font-weight:700;text-align:right;border-bottom:1px solid #14142a;">%s</td>
-		</tr>`, label, valueColor, value)
+	<table width="100%%" cellpadding="0" cellspacing="0" style="background:#faf9f7;border:1px solid #e6e6e2;border-radius:12px;margin:0 0 16px;">
+	<tr>
+		<td width="52" style="padding:12px 0 12px 12px;">
+			<img src="%s" alt="" width="52" height="52" style="display:block;border-radius:9px;object-fit:cover;background:#eee;"/>
+		</td>
+		<td style="padding:12px;">
+			<div style="font-size:13px;font-weight:600;color:#14161a;line-height:1.35;">%s</div>
+			<div style="font-size:11.5px;color:#6d716f;margin-top:2px;">%s</div>
+		</td>
+	</tr>
+	</table>`, img, name, sub)
 }
 
-// emailInfoTable — envuelve varias emailInfoRow en una tarjeta con bordes redondeados.
-func emailInfoTable(rows string) string {
-	return fmt.Sprintf(`<table width="100%%" cellpadding="0" cellspacing="0" style="background:#080810;border:1px solid #1e1e3a;border-radius:12px;margin:0 0 24px;overflow:hidden;">%s
-	</table>`, rows)
+func emailRow(label, value string) string {
+	return fmt.Sprintf(`
+	<tr><td style="padding:10px 0;border-bottom:1px solid #e6e6e2;font-size:12.5px;color:#6d716f;">%s</td>
+	    <td style="padding:10px 0;border-bottom:1px solid #e6e6e2;font-size:12.5px;color:#14161a;font-weight:600;text-align:right;">%s</td></tr>`, label, value)
 }
 
-// emailWarningBox — caja de advertencia roja para alertas de seguridad
-// ("si no fuiste tú, cambia tu contraseña").
-func emailWarningBox(text string) string {
-	return fmt.Sprintf(`<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);border-radius:12px;padding:16px 20px;margin:0 0 24px;">
-  <p style="margin:0;font-size:13px;color:#fca5a5;line-height:1.6;">⚠️ %s</p>
-</div>`, text)
+func emailRows(rows string) string {
+	return fmt.Sprintf(`<table width="100%%" cellpadding="0" cellspacing="0" style="margin-bottom:8px;">%s</table>`, rows)
+}
+
+func emailButton(text, url string) string {
+	return fmt.Sprintf(`
+	<table width="100%%" cellpadding="0" cellspacing="0" style="margin-top:20px;">
+	<tr><td>
+		<a href="%s" style="display:block;text-align:center;background:#14161a;color:#ffffff;font-weight:600;font-size:13.5px;padding:13px;border-radius:8px;text-decoration:none;">%s</a>
+	</td></tr>
+	</table>`, url, text)
+}
+
+// emailNotice — aviso al pie (expiración de enlaces, o alertas de seguridad
+// con tag en color ámbar). tag es opcional.
+func emailNotice(tag, text string) string {
+	tagHTML := ""
+	if tag != "" {
+		tagHTML = fmt.Sprintf(`<span style="display:block;font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#a15c1f;margin-bottom:6px;">%s</span>`, tag)
+	}
+	return fmt.Sprintf(`
+	<table width="100%%" cellpadding="0" cellspacing="0" style="margin-top:20px;padding-top:14px;border-top:1px solid #a15c1f;">
+	<tr><td>%s<p style="margin:0;font-size:11.5px;color:#6d716f;line-height:1.6;">%s</p></td></tr>
+	</table>`, tagHTML, text)
+}
+
+var spanishMonths = [...]string{"ene.", "feb.", "mar.", "abr.", "may.", "jun.", "jul.", "ago.", "sep.", "oct.", "nov.", "dic."}
+
+// fmtDateEs devuelve la fecha de hoy como "7 sep. 2026" — el formato que
+// aparece arriba a la derecha en cada correo.
+func fmtDateEs() string {
+	now := time.Now()
+	return fmt.Sprintf("%d %s %d", now.Day(), spanishMonths[now.Month()-1], now.Year())
 }
 
 // ==================== PAGO APROBADO (automático o manual) ====================
-// Se usa tanto para pagos automáticos confirmados por una pasarela
-// (MercadoPago, PayPal, NOWPayments, dLocal Go) como para recargas manuales
-// aprobadas por un administrador (Yape/Plin/transferencia) — el parámetro
-// "gateway" simplemente identifica el método usado en ambos casos.
 
-func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, lang string) {
+func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, voucherURL, lang string) {
 	if !hasEmailProvider(cfg) {
 		return
 	}
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
-	title, intro, productLabel, amountLabel, gatewayLabel, kcLabel, badgeText, footer := "", "", "", "", "", "", "", ""
+	intro, productLabel, amountLabel, gatewayLabel, kcLabel, btnText := "", "", "", "", "", ""
 	if es {
-		subject += "Pago aprobado ✅"
-		title = "¡Pago aprobado!"
+		subject += "Pago aprobado"
 		intro = "Tu recarga fue confirmada y el KC ya está disponible en tu cuenta."
 		productLabel, amountLabel, gatewayLabel, kcLabel = "Producto", "Monto pagado", "Método", "KC acreditado"
-		badgeText = "PAGO CONFIRMADO"
-		footer = "Ya puedes usar tu KC para comprar en la tienda. Cualquier duda, escríbenos por Discord."
+		btnText = "Ver comprobante"
 	} else {
-		subject += "Payment approved ✅"
-		title = "Payment approved!"
+		subject += "Payment approved"
 		intro = "Your recharge was confirmed and the KC is now available in your account."
 		productLabel, amountLabel, gatewayLabel, kcLabel = "Product", "Amount paid", "Method", "KC credited"
-		badgeText = "PAYMENT CONFIRMED"
-		footer = "You can now use your KC to shop in the store. Any questions, message us on Discord."
+		btnText = "View receipt"
 	}
 
-	rows := emailInfoRow(productLabel, productName, "")
+	rows := emailRow(productLabel, productName)
 	if amountPEN > 0 {
-		rows += emailInfoRow(amountLabel, fmt.Sprintf("S/ %.2f", amountPEN), "")
+		rows += emailRow(amountLabel, fmt.Sprintf("S/ %.2f", amountPEN))
 	}
-	rows += emailInfoRow(gatewayLabel, gateway, "")
-	if kcAmount > 0 {
-		rows += emailInfoRow(kcLabel, fmt.Sprintf("%d KC", kcAmount), "#4ade80")
-	}
+	rows += emailRow(gatewayLabel, gateway)
 
-	content := fmt.Sprintf(`
-%s
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">%s</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">%s</p>
-%s
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">%s</p>
-</div>`, emailBadge("✅", badgeText, "rgba(34,197,94,0.12)", "#4ade80"), title, intro, emailInfoTable(rows), footer)
+	body := emailEyebrow(kcLabel) +
+		emailHero(emailKCIcon(26), fmt.Sprintf("+%d KC", kcAmount), false) +
+		emailCopy(intro) +
+		emailRows(rows) +
+		emailButton(btnText, voucherURL)
 
-	htmlBody := emailBase(subject, intro, content)
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
 
 	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: payment approved send error", "to", toEmail, "error", err)
@@ -177,47 +263,38 @@ func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, 
 
 // ==================== PEDIDO ENVIADO ====================
 
-func SendOrderSentEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName string, priceKC int, lang string) {
+func SendOrderSentEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, itemImage, orderID string, priceKC int, lang string) {
 	if !hasEmailProvider(cfg) {
 		return
 	}
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
-	title, intro, itemLabel, accountLabel, costLabel, badgeText, check, footer := "", "", "", "", "", "", "", ""
+	intro, itemSub, accountLabel, costLabel, btnText := "", "", "", "", ""
 	if es {
-		subject += "Pedido enviado 🎁"
-		title = "¡Tu item ya está en camino!"
-		intro = "Enviamos tu item de Fortnite como regalo a tu cuenta Epic."
-		itemLabel, accountLabel, costLabel = "Item", "Cuenta Epic", "Costo"
-		badgeText = "ENTREGADO"
-		check = "Revisa tu cuenta de Fortnite para recibir el regalo."
-		footer = "¿Alguna consulta? Escríbenos por Discord."
+		subject += "Pedido enviado"
+		intro = "Ya está en tu cuenta — revisa Fortnite para recibir el regalo."
+		itemSub = "Enviado a " + epicUsername
+		accountLabel, costLabel = "Cuenta Epic", "Costo"
+		btnText = "Ver comprobante"
 	} else {
-		subject += "Order sent 🎁"
-		title = "Your item is on its way!"
-		intro = "We sent your Fortnite item as a gift to your Epic account."
-		itemLabel, accountLabel, costLabel = "Item", "Epic Account", "Cost"
-		badgeText = "DELIVERED"
-		check = "Check your Fortnite account to receive the gift."
-		footer = "Any questions? Message us on Discord."
+		subject += "Order sent"
+		intro = "It's already on your account — check Fortnite to receive the gift."
+		itemSub = "Sent to " + epicUsername
+		accountLabel, costLabel = "Epic Account", "Cost"
+		btnText = "View receipt"
 	}
 
-	rows := emailInfoRow(itemLabel, itemName, "")
-	rows += emailInfoRow(accountLabel, epicUsername, "")
-	rows += emailInfoRow(costLabel, fmt.Sprintf("%d KC", priceKC), "#a855f7")
+	rows := emailRow(accountLabel, epicUsername)
+	rows += emailRow(costLabel, emailKCIcon(14)+fmt.Sprintf("%d KC", priceKC))
 
-	content := fmt.Sprintf(`
-%s
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">%s</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">%s</p>
-%s
-<p style="margin:0 0 20px;font-size:14px;color:#ffffff;font-weight:600;">✓ %s</p>
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">%s</p>
-</div>`, emailBadge("🎁", badgeText, "rgba(168,85,247,0.12)", "#c4b5fd"), title, intro, emailInfoTable(rows), check, footer)
+	body := emailEyebrow(map[bool]string{true: "Entregado a tu cuenta Epic", false: "Delivered to your Epic account"}[es]) +
+		emailItemRow(itemImage, itemName, itemSub) +
+		emailCopy(intro) +
+		emailRows(rows) +
+		emailButton(btnText, "https://www.kidstoreperu.net/dashboard/comprobantes/pedido/"+orderID)
 
-	htmlBody := emailBase(subject, intro, content)
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
 
 	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: order sent send error", "to", toEmail, "error", err)
@@ -227,51 +304,44 @@ func SendOrderSentEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName str
 }
 
 // ==================== PEDIDO NO COMPLETADO (reembolsado) ====================
-// Antes esto no existía: si un pedido fallaba (usuario no encontrado, no es
-// amigo de ningún bot, etc.) el KC se reembolsaba automáticamente pero el
-// cliente nunca se enteraba salvo que revisara su panel manualmente.
 
-func SendOrderFailedEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName string, priceKC int, reason, lang string) {
+func SendOrderFailedEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, itemImage string, priceKC int, reason, lang string) {
 	if !hasEmailProvider(cfg) {
 		return
 	}
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
-	title, intro, itemLabel, accountLabel, refundLabel, reasonLabel, badgeText, footer := "", "", "", "", "", "", "", ""
+	intro, itemSub, accountLabel, reasonLabel, btnText, heroText := "", "", "", "", "", ""
 	if es {
 		subject += "Pedido no se pudo completar"
-		title = "Tu pedido no se pudo enviar"
-		intro = "No pudimos entregar tu item — pero no te preocupes, ya te devolvimos el KC completo a tu balance."
-		itemLabel, accountLabel, refundLabel, reasonLabel = "Item", "Cuenta Epic", "KC reembolsado", "Motivo"
-		badgeText = "KC REEMBOLSADO"
-		footer = "Puedes intentarlo de nuevo desde la tienda. Si necesitas ayuda, escríbenos por Discord."
+		intro = "No pudimos entregar tu item — ya te devolvimos el KC completo."
+		itemSub = "No se pudo entregar"
+		accountLabel, reasonLabel = "Cuenta Epic", "Motivo"
+		btnText = "Ir a la tienda"
+		heroText = fmt.Sprintf("%d KC de vuelta", priceKC)
 	} else {
 		subject += "Order could not be completed"
-		title = "Your order couldn't be sent"
-		intro = "We couldn't deliver your item — but don't worry, we already refunded the full KC to your balance."
-		itemLabel, accountLabel, refundLabel, reasonLabel = "Item", "Epic Account", "KC refunded", "Reason"
-		badgeText = "KC REFUNDED"
-		footer = "You can try again from the store. If you need help, message us on Discord."
+		intro = "We couldn't deliver your item — we already refunded the full KC."
+		itemSub = "Could not be delivered"
+		accountLabel, reasonLabel = "Epic Account", "Reason"
+		btnText = "Go to the store"
+		heroText = fmt.Sprintf("%d KC back", priceKC)
 	}
 
-	rows := emailInfoRow(itemLabel, itemName, "")
-	rows += emailInfoRow(accountLabel, epicUsername, "")
-	rows += emailInfoRow(refundLabel, fmt.Sprintf("%d KC", priceKC), "#fbbf24")
+	rows := emailRow(accountLabel, epicUsername)
 	if reason != "" {
-		rows += emailInfoRow(reasonLabel, reason, "")
+		rows += emailRow(reasonLabel, reason)
 	}
 
-	content := fmt.Sprintf(`
-%s
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">%s</h1>
-<p style="margin:0 0 24px;font-size:15px;color:#8b8ba7;line-height:1.6;">%s</p>
-%s
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">%s</p>
-</div>`, emailBadge("↩️", badgeText, "rgba(251,191,36,0.12)", "#fbbf24"), title, intro, emailInfoTable(rows), footer)
+	body := emailEyebrow(map[bool]string{true: "KC reembolsado", false: "KC refunded"}[es]) +
+		emailItemRow(itemImage, itemName, itemSub) +
+		emailHero(emailKCIcon(22), heroText, true) +
+		emailCopy(intro) +
+		emailRows(rows) +
+		emailButton(btnText, "https://www.kidstoreperu.net/store")
 
-	htmlBody := emailBase(subject, intro, content)
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
 
 	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: order failed send error", "to", toEmail, "error", err)
@@ -280,12 +350,121 @@ func SendOrderFailedEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName s
 	}
 }
 
+// ==================== VERIFICACIÓN DE CUENTA ====================
+
+func sendVerificationEmailNew(cfg types.EnvConfig, toEmail, username, verifyURL, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	es := lang != "en"
+
+	subject := "KidStorePeru — "
+	intro, hero, btnText, notice := "", "", "", ""
+	if es {
+		subject += "Verifica tu cuenta"
+		intro = fmt.Sprintf("Hola %s — gracias por registrarte. Un clic y ya puedes comprar en la tienda.", username)
+		hero = "Verifica tu correo para activarla"
+		btnText = "Verificar mi cuenta"
+		notice = "Este enlace expira en 24 horas. Si no creaste esta cuenta, ignora este correo."
+	} else {
+		subject += "Verify your account"
+		intro = fmt.Sprintf("Hi %s — thanks for signing up. One click and you can start shopping.", username)
+		hero = "Verify your email to activate it"
+		btnText = "Verify my account"
+		notice = "This link expires in 24 hours. If you didn't create this account, you can ignore this email."
+	}
+
+	body := emailEyebrow(map[bool]string{true: "Nueva cuenta", false: "New account"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailButton(btnText, verifyURL) +
+		emailNotice("", notice)
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: error enviando verificacion", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: verificacion enviada", "to", toEmail)
+	}
+}
+
+// ==================== RECUPERAR CONTRASEÑA ====================
+
+func sendResetEmailNew(cfg types.EnvConfig, toEmail, username, resetURL, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	es := lang != "en"
+
+	subject := "KidStorePeru — "
+	intro, hero, btnText, notice := "", "", "", ""
+	if es {
+		subject += "Recuperar contraseña"
+		intro = fmt.Sprintf("Hola %s, recibimos una solicitud para cambiar la contraseña de tu cuenta.", username)
+		hero = "Restablecer tu contraseña"
+		btnText = "Crear nueva contraseña"
+		notice = "Este enlace expira en 10 minutos. Si no fuiste tú, tu contraseña no cambiará."
+	} else {
+		subject += "Reset your password"
+		intro = fmt.Sprintf("Hi %s, we received a request to change your account password.", username)
+		hero = "Reset your password"
+		btnText = "Create new password"
+		notice = "This link expires in 10 minutes. If this wasn't you, your password won't change."
+	}
+
+	body := emailEyebrow(map[bool]string{true: "Solicitud de acceso", false: "Access request"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailButton(btnText, resetURL) +
+		emailNotice("", notice)
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: error enviando reset", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: reset enviado", "to", toEmail)
+	}
+}
+
+// ==================== CÓDIGO OTP (cambio de correo) ====================
+
+func sendEmailChangeOTPNew(cfg types.EnvConfig, toEmail, username, code, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	es := lang != "en"
+
+	subject := "KidStorePeru — "
+	intro, notice := "", ""
+	if es {
+		subject += "Tu código de verificación"
+		intro = fmt.Sprintf("Hola %s, usa este código para confirmar el cambio de correo en tu cuenta.", username)
+		notice = "Este código expira en 15 minutos. Si no lo solicitaste, ignora este correo."
+	} else {
+		subject += "Your verification code"
+		intro = fmt.Sprintf("Hi %s, use this code to confirm the email change on your account.", username)
+		notice = "This code expires in 15 minutes. If you didn't request it, ignore this email."
+	}
+
+	codeHTML := fmt.Sprintf(`<div style="margin:2px 0 18px;font-family:'Fraunces',Georgia,serif;font-weight:500;font-size:32px;letter-spacing:.08em;color:#14161a;">%s</div>`, code)
+
+	body := emailEyebrow(map[bool]string{true: "Confirma tu nuevo correo", false: "Confirm your new email"}[es]) +
+		codeHTML +
+		emailCopy(intro) +
+		emailNotice("", notice)
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: error enviando codigo de cambio de correo", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: codigo de cambio de correo enviado", "to", toEmail)
+	}
+}
+
 // ==================== ALERTAS DE SEGURIDAD ====================
-// Nuevas — antes no existía ningún aviso cuando cambiaba algo sensible de la
-// cuenta. Si alguien más entra a la cuenta y cambia la contraseña o vincula
-// su propio Discord/Google, el dueño real debe enterarse por correo aunque
-// el atacante ya esté adentro — es la única forma de detectar un acceso no
-// autorizado a tiempo.
 
 func sendPasswordChangedEmail(cfg types.EnvConfig, toEmail, username, lang string) {
 	if !hasEmailProvider(cfg) {
@@ -294,33 +473,25 @@ func sendPasswordChangedEmail(cfg types.EnvConfig, toEmail, username, lang strin
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
-	title, intro, warn, badgeText, closing := "", "", "", "", ""
+	intro, hero, warn := "", "", ""
 	if es {
-		subject += "Tu contraseña fue cambiada 🔐"
-		title = "Contraseña actualizada"
-		intro = fmt.Sprintf("Hola %s, la contraseña de tu cuenta en KidStorePeru se cambió correctamente.", username)
-		warn = "Si fuiste tú, no necesitas hacer nada. Si <strong>NO reconoces</strong> este cambio, contáctanos de inmediato por Discord — tu cuenta podría estar comprometida."
-		badgeText = "SEGURIDAD DE LA CUENTA"
-		closing = "KidStorePeru nunca te pedirá tu contraseña por correo, Discord o cualquier otro medio."
+		subject += "Tu contraseña fue cambiada"
+		intro = fmt.Sprintf("Hola %s, la contraseña de tu cuenta se cambió correctamente.", username)
+		hero = "Contraseña actualizada"
+		warn = fmt.Sprintf("Contáctanos de inmediato a %s — tu cuenta podría estar comprometida. Nunca te pediremos tu contraseña.", SupportEmail)
 	} else {
-		subject += "Your password was changed 🔐"
-		title = "Password updated"
-		intro = fmt.Sprintf("Hi %s, your KidStorePeru account password was successfully changed.", username)
-		warn = "If this was you, no action is needed. If you <strong>DON'T recognize</strong> this change, contact us immediately on Discord — your account may be compromised."
-		badgeText = "ACCOUNT SECURITY"
-		closing = "KidStorePeru will never ask for your password by email, Discord, or any other channel."
+		subject += "Your password was changed"
+		intro = fmt.Sprintf("Hi %s, your account password was successfully changed.", username)
+		hero = "Password updated"
+		warn = fmt.Sprintf("Contact us immediately at %s — your account may be compromised. We will never ask for your password.", SupportEmail)
 	}
 
-	content := fmt.Sprintf(`
-%s
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">%s</h1>
-<p style="margin:0 0 20px;font-size:15px;color:#8b8ba7;line-height:1.6;">%s</p>
-%s
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">%s</p>
-</div>`, emailBadge("🔐", badgeText, "rgba(124,58,237,0.15)", "#c4b5fd"), title, intro, emailWarningBox(warn), closing)
+	body := emailEyebrow(map[bool]string{true: "Seguridad de la cuenta", false: "Account security"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailNotice(map[bool]string{true: "Si no fuiste tú", false: "If this wasn't you"}[es], warn)
 
-	htmlBody := emailBase(subject, intro, content)
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
 
 	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: password changed send error", "to", toEmail, "error", err)
@@ -329,51 +500,125 @@ func sendPasswordChangedEmail(cfg types.EnvConfig, toEmail, username, lang strin
 	}
 }
 
+func providerLabel(provider string) string {
+	switch provider {
+	case "google":
+		return "Google"
+	case "discord":
+		return "Discord"
+	default:
+		return provider
+	}
+}
+
 func SendAccountLinkedEmail(cfg types.EnvConfig, toEmail, username, provider, lang string) {
 	if !hasEmailProvider(cfg) {
 		return
 	}
 	es := lang != "en"
-
-	providerLabel := provider
-	if provider == "google" {
-		providerLabel = "Google"
-	} else if provider == "discord" {
-		providerLabel = "Discord"
-	}
+	pl := providerLabel(provider)
 
 	subject := "KidStorePeru — "
-	title, intro, warn, badgeText, closing := "", "", "", "", ""
+	intro, hero, warn := "", "", ""
 	if es {
-		subject += "Nueva cuenta vinculada 🔐"
-		title = "Se vinculó una cuenta nueva"
-		intro = fmt.Sprintf("Hola %s, tu cuenta de <strong style=\"color:#ffffff;\">%s</strong> se vinculó correctamente a tu perfil de KidStorePeru.", username, providerLabel)
-		warn = "Si fuiste tú, no necesitas hacer nada. Si <strong>NO reconoces</strong> esta acción, cambia tu contraseña de inmediato y contáctanos por Discord."
-		badgeText = "SEGURIDAD DE LA CUENTA"
-		closing = "KidStorePeru nunca te pedirá tu contraseña por correo, Discord o cualquier otro medio."
+		subject += "Nueva cuenta vinculada"
+		intro = fmt.Sprintf("Hola %s, tu cuenta de %s se vinculó correctamente a tu perfil.", username, pl)
+		hero = fmt.Sprintf("Se vinculó tu cuenta de %s", pl)
+		warn = fmt.Sprintf("Cambia tu contraseña de inmediato y contáctanos a %s.", SupportEmail)
 	} else {
-		subject += "New account linked 🔐"
-		title = "A new account was linked"
-		intro = fmt.Sprintf("Hi %s, your <strong style=\"color:#ffffff;\">%s</strong> account was successfully linked to your KidStorePeru profile.", username, providerLabel)
-		warn = "If this was you, no action is needed. If you <strong>DON'T recognize</strong> this, change your password immediately and contact us on Discord."
-		badgeText = "ACCOUNT SECURITY"
-		closing = "KidStorePeru will never ask for your password by email, Discord, or any other channel."
+		subject += "New account linked"
+		intro = fmt.Sprintf("Hi %s, your %s account was successfully linked to your profile.", username, pl)
+		hero = fmt.Sprintf("Your %s account was linked", pl)
+		warn = fmt.Sprintf("Change your password immediately and contact us at %s.", SupportEmail)
 	}
 
-	content := fmt.Sprintf(`
-%s
-<h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">%s</h1>
-<p style="margin:0 0 20px;font-size:15px;color:#8b8ba7;line-height:1.6;">%s</p>
-%s
-<div style="border-top:1px solid #1e1e3a;padding-top:20px;">
-  <p style="margin:0;font-size:12px;color:#4a4a6a;">%s</p>
-</div>`, emailBadge("🔐", badgeText, "rgba(124,58,237,0.15)", "#c4b5fd"), title, intro, emailWarningBox(warn), closing)
+	body := emailEyebrow(map[bool]string{true: "Seguridad de la cuenta", false: "Account security"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailNotice(map[bool]string{true: "Si no fuiste tú", false: "If this wasn't you"}[es], warn)
 
-	htmlBody := emailBase(subject, intro, content)
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
 
 	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: account linked send error", "to", toEmail, "error", err)
 	} else {
 		slog.Info("Email: account linked notification sent", "to", toEmail)
+	}
+}
+
+// SendAccountUnlinkedEmail avisa cuando se desvincula un método de acceso
+// (Google/Discord) — cierra el mismo hueco de seguridad que "cuenta
+// vinculada" pero para el otro sentido: si alguien más entra a la cuenta y
+// quita esa protección, el dueño real debe enterarse igual.
+func SendAccountUnlinkedEmail(cfg types.EnvConfig, toEmail, username, provider, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	es := lang != "en"
+	pl := providerLabel(provider)
+
+	subject := "KidStorePeru — "
+	intro, hero, warn := "", "", ""
+	if es {
+		subject += "Cuenta desvinculada"
+		intro = fmt.Sprintf("Hola %s, tu cuenta de %s ya no está vinculada a tu perfil de KidStorePeru.", username, pl)
+		hero = fmt.Sprintf("Se desvinculó tu cuenta de %s", pl)
+		warn = fmt.Sprintf("Cambia tu contraseña de inmediato y contáctanos a %s.", SupportEmail)
+	} else {
+		subject += "Account unlinked"
+		intro = fmt.Sprintf("Hi %s, your %s account is no longer linked to your KidStorePeru profile.", username, pl)
+		hero = fmt.Sprintf("Your %s account was unlinked", pl)
+		warn = fmt.Sprintf("Change your password immediately and contact us at %s.", SupportEmail)
+	}
+
+	body := emailEyebrow(map[bool]string{true: "Seguridad de la cuenta", false: "Account security"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailNotice(map[bool]string{true: "Si no fuiste tú", false: "If this wasn't you"}[es], warn)
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: account unlinked send error", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: account unlinked notification sent", "to", toEmail)
+	}
+}
+
+// SendEmailChangedNoticeEmail va al correo ANTERIOR de la cuenta (no al
+// nuevo, que ya recibe su propio código OTP) — es la única forma de que el
+// dueño real se entere si alguien más cambió el correo de acceso y todavía
+// tiene la bandeja vieja a mano.
+func SendEmailChangedNoticeEmail(cfg types.EnvConfig, oldEmail, username, newEmailMasked, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	es := lang != "en"
+
+	subject := "KidStorePeru — "
+	intro, hero, warn := "", "", ""
+	if es {
+		subject += "Tu correo de acceso cambió"
+		intro = fmt.Sprintf(`Hola %s, el correo de tu cuenta se cambió de este a <strong style="color:#14161a;">%s</strong>.`, username, newEmailMasked)
+		hero = "Tu correo de acceso cambió"
+		warn = fmt.Sprintf("Contáctanos de inmediato a %s — con este correo antiguo verificamos que la cuenta es tuya.", SupportEmail)
+	} else {
+		subject += "Your login email changed"
+		intro = fmt.Sprintf(`Hi %s, your account email was changed from this one to <strong style="color:#14161a;">%s</strong>.`, username, newEmailMasked)
+		hero = "Your login email changed"
+		warn = fmt.Sprintf("Contact us immediately at %s — we can use this old email to verify the account is yours.", SupportEmail)
+	}
+
+	body := emailEyebrow(map[bool]string{true: "Seguridad de la cuenta", false: "Account security"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailNotice(map[bool]string{true: "Si no fuiste tú", false: "If this wasn't you"}[es], warn)
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, oldEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: email changed notice send error", "to", oldEmail, "error", err)
+	} else {
+		slog.Info("Email: email changed notice sent", "to", oldEmail)
 	}
 }
