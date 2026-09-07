@@ -59,6 +59,16 @@ var productPrices = map[string]struct {
 	"legend":  {Name: "Legend 12,500 KC", PricePEN: 162.50, KCAmount: 12500},
 }
 
+// kcRatePEN — precio oficial de 1 KC en soles (S/1.30 cada 100 KC). Debe
+// coincidir siempre con KC_RATE en Recharge.tsx del frontend. Para una
+// recarga personalizada, el precio a cobrar SIEMPRE se calcula acá con esta
+// tasa — nunca se usa el "custom_price" que mande el cliente para decidir
+// cuánto cobrar, porque eso permitiría pagar un monto ridículamente bajo
+// (p. ej. S/0.01) y pedir cualquier cantidad de KC (p. ej. 999,999,999).
+const kcRatePEN = 0.013
+const minCustomKC = 100
+const maxCustomKC = 10_000_000
+
 // ==================== CREATE PAYMENT ====================
 
 func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
@@ -99,9 +109,16 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		var kcAmount int
 
 		if req.CustomPrice > 0 && req.CustomName != "" {
-			// Custom amount (e.g. recarga de KC personalizada)
+			// Recarga de KC personalizada — el precio SIEMPRE se calcula acá con
+			// la tasa oficial a partir de custom_kc. Nunca se usa custom_price
+			// del cliente para el cobro real: si se usara tal cual, cualquiera
+			// podría pagar S/0.01 y pedir la cantidad de KC que quisiera.
+			if req.CustomKC < minCustomKC || req.CustomKC > maxCustomKC {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": fmt.Sprintf("la recarga personalizada debe ser entre %d y %d KC", minCustomKC, maxCustomKC)})
+				return
+			}
 			productName = req.CustomName
-			pricePEN = req.CustomPrice
+			pricePEN = roundCents(float64(req.CustomKC) * kcRatePEN)
 			kcAmount = req.CustomKC
 		} else {
 			product, exists := productPrices[req.ProductID]
@@ -183,6 +200,17 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 
 func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
+			return
+		}
+
 		id, err := uuid.Parse(c.Param("id"))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
@@ -190,6 +218,12 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 		}
 		tx, err := db.GetPaymentTransaction(database, id)
 		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "transaccion no encontrada"})
+			return
+		}
+		// Nunca dejar que un cliente vea el pago de otro cliente solo por
+		// adivinar o conocer un UUID ajeno.
+		if tx.CustomerID != customerID {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "transaccion no encontrada"})
 			return
 		}

@@ -36,6 +36,9 @@ func parseLinkToken(cfg Config, tokenStr, expectedProvider string) (string, erro
 		return "", fmt.Errorf("token de vinculación vacío")
 	}
 	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("método de firma inválido")
+		}
 		return []byte(cfg.SecretKey), nil
 	})
 	if err != nil || !token.Valid {
