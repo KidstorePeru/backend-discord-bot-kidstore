@@ -30,12 +30,17 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 	if err != nil {
 		return fmt.Errorf("transaction not found: %w", err)
 	}
-	if tx.Status == "approved" || tx.Status == "fulfilled" {
-		return nil // already processed (idempotent)
-	}
 
-	if err := db.UpdatePaymentStatus(database, txID, "approved", tx.ExternalID); err != nil {
+	// Reclamo atómico: si dos llamadas concurrentes llegan acá para el mismo
+	// pago (dos webhooks duplicados, alguien reenviando la misma notificación
+	// muchas veces en paralelo), solo UNA de ellas puede ganar esta carrera —
+	// la base de datos lo garantiza, no el orden en que corra este código Go.
+	claimed, err := db.ClaimPaymentForApproval(database, txID, tx.ExternalID)
+	if err != nil {
 		return fmt.Errorf("updating status: %w", err)
+	}
+	if !claimed {
+		return nil // ya estaba aprobado (o alguien más lo está procesando ahora) — idempotente
 	}
 
 	// If KC recharge, credit KC

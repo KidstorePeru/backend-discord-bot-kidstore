@@ -1315,6 +1315,28 @@ func UpdatePaymentStatus(db *sql.DB, id uuid.UUID, status string, externalID str
 	return err
 }
 
+// ClaimPaymentForApproval marca atómicamente un pago como "approved" SOLO si
+// todavía no estaba aprobado/cumplido, en una única sentencia UPDATE (Postgres
+// garantiza que es atómica incluso con muchas conexiones concurrentes). Esto
+// existe para cerrar una condición de carrera real: los webhooks de pago son
+// rutas públicas sin autenticación (los llaman las pasarelas), así que
+// cualquiera puede mandar la misma notificación muchas veces en paralelo. Sin
+// esto, un "leer estado → decidir en Go → escribir estado" no atómico permite
+// que varias llamadas concurrentes, para el mismo pago real y ya aprobado por
+// la pasarela, pasen todas el chequeo de "todavía no procesado" antes de que
+// la primera termine de escribir — acreditando el mismo pago varias veces.
+// Devuelve true solo para la llamada que efectivamente lo reclamó.
+func ClaimPaymentForApproval(db *sql.DB, id uuid.UUID, externalID string) (bool, error) {
+	result, err := db.Exec(`
+		UPDATE payment_transactions SET status='approved', external_id=$2, updated_at=NOW()
+		WHERE id=$1 AND status NOT IN ('approved','fulfilled')`, id, externalID)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n > 0, err
+}
+
 func GetAllPaymentTransactions(db *sql.DB, page, limit int) ([]types.PaymentTransaction, int, error) {
 	if page < 1 { page = 1 }
 	if limit < 1 || limit > 200 { limit = 50 }
