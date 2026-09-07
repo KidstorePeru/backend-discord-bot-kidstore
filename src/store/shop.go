@@ -154,51 +154,87 @@ var (
 	shopClient  = &http.Client{Timeout: 10 * time.Second}
 )
 
-func HandlerGetShop(c *gin.Context) {
-	lang := c.Query("lang")
-	if lang == "" { lang = "es-419" }
-	if lang != "es-419" && lang != "en" { lang = "es-419" }
-
+// fetchShopBody devuelve el JSON crudo de la tienda actual de Fortnite (desde
+// caché si sigue fresco, o pidiéndolo a fortnite-api.com si no) — lo usan
+// tanto el endpoint público /store/shop como la verificación de precios al
+// crear un pedido, para que ambos vean siempre los mismos datos.
+func fetchShopBody(ctx context.Context, lang string) ([]byte, error) {
 	shopCacheMu.RLock()
 	entry, ok := shopCache[lang]
 	shopCacheMu.RUnlock()
 	if ok && time.Since(entry.fetchedAt) < shopTTL {
-		c.Data(http.StatusOK, "application/json", entry.body)
-		return
+		return entry.body, nil
 	}
 
 	url := fmt.Sprintf("https://fortnite-api.com/v2/shop?language=%s", lang)
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error preparando request"})
-		return
+		return nil, fmt.Errorf("error preparando request: %w", err)
 	}
 
 	resp, err := shopClient.Do(req)
 	if err != nil {
-		shopCacheMu.RLock()
-		stale, hasStale := shopCache[lang]
-		shopCacheMu.RUnlock()
-		if hasStale { c.Data(http.StatusOK, "application/json", stale.body); return }
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo tienda"})
-		return
+		if ok { return entry.body, nil } // stale cache es mejor que nada
+		return nil, fmt.Errorf("error obteniendo tienda: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error leyendo respuesta"})
-		return
+		return nil, fmt.Errorf("error leyendo respuesta: %w", err)
 	}
 
 	shopCacheMu.Lock()
 	shopCache[lang] = &shopCacheEntry{body: body, fetchedAt: time.Now()}
 	shopCacheMu.Unlock()
 
+	return body, nil
+}
+
+func HandlerGetShop(c *gin.Context) {
+	lang := c.Query("lang")
+	if lang == "" { lang = "es-419" }
+	if lang != "es-419" && lang != "en" { lang = "es-419" }
+
+	body, err := fetchShopBody(c.Request.Context(), lang)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+		return
+	}
 	c.Data(http.StatusOK, "application/json", body)
+}
+
+// verifyShopPrice confirma que un offerId y su precio en VBucks corresponden
+// realmente a un item de la tienda actual de Fortnite. Nunca hay que confiar
+// en el precio que manda el cliente al crear un pedido — cualquiera podría
+// interceptar la petición y pedir un item carísimo pagando casi nada de KC,
+// mientras el bot igual gasta sus VBucks reales enviándolo. Esta es la única
+// fuente de verdad: los datos reales de fortnite-api.com.
+func verifyShopPrice(ctx context.Context, offerID string, claimedVBucks int) (bool, error) {
+	body, err := fetchShopBody(ctx, "es-419")
+	if err != nil {
+		return false, err
+	}
+	var parsed struct {
+		Data struct {
+			Entries []struct {
+				OfferID    string `json:"offerId"`
+				FinalPrice int    `json:"finalPrice"`
+			} `json:"entries"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false, fmt.Errorf("respuesta de tienda inesperada: %w", err)
+	}
+	for _, e := range parsed.Data.Entries {
+		if e.OfferID == offerID {
+			return e.FinalPrice == claimedVBucks, nil
+		}
+	}
+	return false, fmt.Errorf("item no encontrado en la tienda actual")
 }
 
 // ==================== CREAR PEDIDO ====================
@@ -221,6 +257,28 @@ func HandlerCreateOrder(database *sql.DB) gin.HandlerFunc {
 		var req types.CreateOrderRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		// ── Verificar precio contra la tienda real ──
+		// El cliente podría manipular price_kc/price_vbucks directamente en la
+		// petición (editando la request desde el navegador) para pedir un item
+		// caro pagando casi nada — el bot igual gastaría sus VBucks reales
+		// enviándolo. Nunca hay que confiar en el precio que manda el cliente:
+		// se verifica contra los datos reales de fortnite-api.com.
+		priceOK, err := verifyShopPrice(c.Request.Context(), req.ItemOfferID, req.PriceVBucks)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no se pudo verificar el item en la tienda actual: " + err.Error()})
+			return
+		}
+		// 1 VBuck = 1 KC (igual que vbucksToKC en el frontend) — si esa tasa
+		// cambia algún día, hay que actualizarla también acá.
+		expectedKC := req.PriceVBucks
+		if !priceOK || req.PriceKC != expectedKC {
+			slog.Warn("Posible manipulación de precio en pedido bloqueada",
+				"customer", customerID, "offerID", req.ItemOfferID,
+				"price_kc_reclamado", req.PriceKC, "price_vbucks_reclamado", req.PriceVBucks, "ip", c.ClientIP())
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "el precio del item no coincide con la tienda actual"})
 			return
 		}
 
