@@ -127,10 +127,12 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 		var event struct {
 			EventType string `json:"event_type"`
 			Resource  struct {
-				ID            string `json:"id"`
-				PurchaseUnits []struct {
-					ReferenceID string `json:"reference_id"`
-				} `json:"purchase_units"`
+				ID                string `json:"id"`
+				SupplementaryData struct {
+					RelatedIDs struct {
+						OrderID string `json:"order_id"`
+					} `json:"related_ids"`
+				} `json:"supplementary_data"`
 			} `json:"resource"`
 		}
 		if err := json.Unmarshal(body, &event); err != nil {
@@ -144,21 +146,39 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 		}
 
 		go func() {
-			// Capture the order if it was just approved
+			orderID := event.Resource.ID
 			if event.EventType == "CHECKOUT.ORDER.APPROVED" {
-				if err := capturePayPalOrder(event.Resource.ID); err != nil {
-					slog.Error("PayPal capture failed", "orderID", event.Resource.ID, "error", err)
+				// Capturar el pago — esto ya de por sí solo funciona si la orden
+				// es real y aprobada, PayPal la rechaza si no.
+				if err := capturePayPalOrder(orderID); err != nil {
+					slog.Error("PayPal capture failed", "orderID", orderID, "error", err)
 					return
 				}
+			} else {
+				// PAYMENT.CAPTURE.COMPLETED: resource.id es el ID del capture, no
+				// el de la orden — el order_id real viene en supplementary_data.
+				orderID = event.Resource.SupplementaryData.RelatedIDs.OrderID
+			}
+			if orderID == "" {
+				slog.Warn("PayPal webhook sin order_id resoluble")
+				return
 			}
 
-			// Find our transaction ID from reference
-			var refID string
-			if len(event.Resource.PurchaseUnits) > 0 {
-				refID = event.Resource.PurchaseUnits[0].ReferenceID
+			// El cuerpo del webhook no viene firmado — cualquiera podría forjar
+			// este POST. Nunca se confía en su contenido: se vuelve a consultar el
+			// estado real de la orden directamente en la API de PayPal con
+			// nuestras propias credenciales, igual que ya se hace con MercadoPago
+			// y dLocal Go. Solo esa respuesta decide si se acredita KC.
+			status, refID, err := getPayPalOrder(orderID)
+			if err != nil {
+				slog.Error("PayPal order query failed", "orderID", orderID, "error", err)
+				return
+			}
+			if status != "COMPLETED" {
+				return
 			}
 			if refID == "" {
-				slog.Warn("PayPal webhook missing reference_id")
+				slog.Warn("PayPal order sin reference_id", "orderID", orderID)
 				return
 			}
 
@@ -181,22 +201,38 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 
 func HandlerPayPalCapture(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		paymentID := c.Query("id")
 		paypalToken := c.Query("token") // PayPal order ID
-
-		txID, err := uuid.Parse(paymentID)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id invalido"})
+		if paypalToken == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "token invalido"})
 			return
 		}
 
-		// Capture the PayPal order
-		if paypalToken != "" {
-			if err := capturePayPalOrder(paypalToken); err != nil {
-				slog.Error("PayPal capture on return failed", "error", err)
-				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error capturando pago"})
-				return
-			}
+		if err := capturePayPalOrder(paypalToken); err != nil {
+			slog.Error("PayPal capture on return failed", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error capturando pago"})
+			return
+		}
+
+		// Nunca se confía en el "id" que venga en la URL — cualquiera podría
+		// alterarlo manualmente para acreditar una transacción distinta a la que
+		// realmente pagó. El txID a acreditar siempre sale del reference_id que la
+		// propia orden de PayPal tiene guardado desde que se creó, verificado
+		// directamente contra la API de PayPal.
+		status, refID, err := getPayPalOrder(paypalToken)
+		if err != nil {
+			slog.Error("PayPal order query on return failed", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error verificando pago"})
+			return
+		}
+		if status != "COMPLETED" {
+			c.JSON(http.StatusOK, gin.H{"success": false, "error": "pago aun no completado"})
+			return
+		}
+
+		txID, err := uuid.Parse(refID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "orden sin referencia valida"})
+			return
 		}
 
 		if err := processApprovedPayment(database, txID); err != nil {
@@ -217,25 +253,30 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 		slog.Info("NOWPayments webhook received", "body", string(body))
 
 		var notification struct {
-			PaymentStatus string `json:"payment_status"`
-			OrderID       string `json:"order_id"`
-			PaymentID     int64  `json:"payment_id"`
+			PaymentID int64 `json:"payment_id"`
 		}
-		if err := json.Unmarshal(body, &notification); err != nil {
-			c.JSON(http.StatusOK, gin.H{"received": true})
-			return
-		}
-
-		// Only process confirmed/finished payments
-		if notification.PaymentStatus != "confirmed" && notification.PaymentStatus != "finished" {
+		if err := json.Unmarshal(body, &notification); err != nil || notification.PaymentID == 0 {
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
 
 		go func() {
-			txID, err := uuid.Parse(notification.OrderID)
+			// El IPN no viene firmado — no se le puede creer su "payment_status" ni
+			// su "order_id" a ciegas, cualquiera podría forjar este POST. Se vuelve
+			// a consultar el estado real directamente en la API de NOWPayments con
+			// nuestra propia API key, igual que ya se hace con MercadoPago.
+			status, orderID, err := nowPaymentsStatus(notification.PaymentID)
 			if err != nil {
-				slog.Error("NOWPayments invalid order_id", "id", notification.OrderID)
+				slog.Error("NOWPayments status query failed", "paymentID", notification.PaymentID, "error", err)
+				return
+			}
+			if status != "confirmed" && status != "finished" {
+				return
+			}
+
+			txID, err := uuid.Parse(orderID)
+			if err != nil {
+				slog.Error("NOWPayments invalid order_id", "id", orderID)
 				return
 			}
 

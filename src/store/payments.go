@@ -367,6 +367,52 @@ func createPayPalOrder(tx db.PaymentTransactionInput) (string, string, error) {
 	return approveURL, result.ID, nil
 }
 
+// getPayPalOrder consulta el estado real de una orden directamente en la API
+// de PayPal, usando nuestras propias credenciales. Nunca hay que confiar en el
+// contenido de un webhook o de un parámetro de la URL para decidir si un pago
+// se aprobó — cualquiera podría forjar esa llamada. Esta es la única fuente de
+// verdad: si PayPal dice que la orden está COMPLETED y a qué reference_id
+// (nuestro txID) pertenece, recién ahí se acredita el pago.
+func getPayPalOrder(orderID string) (status, referenceID string, err error) {
+	token, err := getPayPalAccessToken()
+	if err != nil {
+		return "", "", err
+	}
+
+	baseURL := "https://api-m.sandbox.paypal.com"
+	if paymentCfg.PayPalMode == "live" {
+		baseURL = "https://api-m.paypal.com"
+	}
+
+	req, _ := http.NewRequest("GET", baseURL+"/v2/checkout/orders/"+orderID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("PayPal order query failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", "", fmt.Errorf("PayPal order query error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Status        string `json:"status"`
+		PurchaseUnits []struct {
+			ReferenceID string `json:"reference_id"`
+		} `json:"purchase_units"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", "", fmt.Errorf("PayPal: respuesta de orden inesperada: %s", string(respBody))
+	}
+	if len(result.PurchaseUnits) == 0 {
+		return result.Status, "", nil
+	}
+	return result.Status, result.PurchaseUnits[0].ReferenceID, nil
+}
+
 func capturePayPalOrder(orderID string) error {
 	token, err := getPayPalAccessToken()
 	if err != nil {
@@ -393,6 +439,38 @@ func capturePayPalOrder(orderID string) error {
 		return fmt.Errorf("capture failed %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// nowPaymentsStatus consulta el estado real de un pago directamente en la API
+// de NOWPayments, usando nuestra propia API key — el IPN que llega al webhook
+// no viene firmado, así que no se le puede creer a ciegas su contenido.
+func nowPaymentsStatus(paymentID int64) (status string, orderID string, err error) {
+	if paymentCfg.NOWPaymentsAPIKey == "" {
+		return "", "", fmt.Errorf("NOWPayments not configured")
+	}
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("https://api.nowpayments.io/v1/payment/%d", paymentID), nil)
+	req.Header.Set("x-api-key", paymentCfg.NOWPaymentsAPIKey)
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("NOWPayments status request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", "", fmt.Errorf("NOWPayments status error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		PaymentStatus string `json:"payment_status"`
+		OrderID       string `json:"order_id"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", "", fmt.Errorf("NOWPayments: respuesta de estado inesperada: %s", string(respBody))
+	}
+	return result.PaymentStatus, result.OrderID, nil
 }
 
 // ==================== NOWPAYMENTS ====================

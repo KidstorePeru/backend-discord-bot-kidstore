@@ -99,6 +99,11 @@ func CreateTables(db *sql.DB) error {
 			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 		)`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='game_accounts' AND column_name='last_gift_reset_date') THEN
+				ALTER TABLE game_accounts ADD COLUMN last_gift_reset_date DATE NOT NULL DEFAULT CURRENT_DATE;
+			END IF;
+		END $$`,
 		`CREATE TABLE IF NOT EXISTS game_account_secrets (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			account_id UUID NOT NULL REFERENCES game_accounts(id) ON DELETE CASCADE,
@@ -478,6 +483,42 @@ func IsWithinSchedule(db *sql.DB) (bool, string) {
 			s.StartHour, s.EndHour, s.Timezone, hour)
 	}
 	return true, ""
+}
+
+// dailyGiftLimit — cuántos regalos puede enviar cada cuenta bot por día.
+// Debe coincidir con el DEFAULT de remaining_gifts en game_accounts y con el
+// valor que se le asigna a una cuenta recién vinculada (ver fortnite.go).
+const dailyGiftLimit = 5
+
+// ResetDailyGifts repone remaining_gifts=5 en todas las cuentas bot cuyo
+// último reseteo fue en un día anterior al de hoy (según la zona horaria
+// configurada en el horario de bots) — esto es lo que hace real la promesa
+// "los gifts se resetean diariamente" que se muestra en toda la web y en los
+// mensajes de error del worker de pedidos. Antes de este fix, remaining_gifts
+// nunca se reponía: una vez que una cuenta llegaba a 0 se quedaba así para
+// siempre. Es una sola consulta UPDATE, segura de correr con la frecuencia
+// que sea — solo toca las filas cuya fecha ya quedó vieja.
+func ResetDailyGifts(db *sql.DB) (int64, error) {
+	schedule, err := GetBotSchedule(db)
+	timezone := "America/Lima"
+	if err == nil && schedule.Timezone != "" {
+		timezone = schedule.Timezone
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	today := time.Now().In(loc).Format("2006-01-02")
+
+	result, err := db.Exec(`
+		UPDATE game_accounts
+		SET remaining_gifts=$1, last_gift_reset_date=$2, updated_at=NOW()
+		WHERE last_gift_reset_date < $2`,
+		dailyGiftLimit, today)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // ==================== PENDING REGISTRATIONS ====================
@@ -978,8 +1019,8 @@ func RefundOrder(db *sql.DB, orderID uuid.UUID) error {
 		Scan(&customerID, &priceKC, &status)
 	if err != nil { return fmt.Errorf("order not found") }
 	if status == "refunded" || status == "sent" { return fmt.Errorf("order cannot be refunded: status is %s", status) }
-	tx.Exec(`UPDATE customers SET kc_balance=kc_balance+$1, updated_at=NOW() WHERE id=$2`, priceKC, customerID)
-	tx.Exec(`UPDATE orders SET status='refunded', updated_at=NOW() WHERE id=$1`, orderID)
+	if _, err := tx.Exec(`UPDATE customers SET kc_balance=kc_balance+$1, updated_at=NOW() WHERE id=$2`, priceKC, customerID); err != nil { return err }
+	if _, err := tx.Exec(`UPDATE orders SET status='refunded', updated_at=NOW() WHERE id=$1`, orderID); err != nil { return err }
 	return tx.Commit()
 }
 

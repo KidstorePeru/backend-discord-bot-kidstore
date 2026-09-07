@@ -241,6 +241,18 @@ func main() {
 		}
 	}()
 
+	// ── Reset diario de gifts de bots (remaining_gifts vuelve a 5 cada día) ──
+	go func() {
+		for {
+			if n, err := db.ResetDailyGifts(database); err != nil {
+				slog.Error("Error reseteando gifts diarios", "error", err)
+			} else if n > 0 {
+				slog.Info("Gifts diarios reseteados", "cuentas", n)
+			}
+			time.Sleep(10 * time.Minute)
+		}
+	}()
+
 	// ── Workers ──
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	store.StartOrderWorker(workerCtx, database)

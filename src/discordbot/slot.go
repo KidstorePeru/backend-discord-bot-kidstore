@@ -112,7 +112,11 @@ func handleSlotCommand(s *discordgo.Session, i *discordgo.InteractionCreate, dat
 		})
 		return
 	}
-	db.RecordSlotPlay(database, customer.ID, int(amount), won, payout)
+	if err := db.RecordSlotPlay(database, customer.ID, int(amount), won, payout); err != nil {
+		// El balance ya se actualizó correctamente — esto solo afecta las
+		// estadísticas del panel de admin, no debe bloquear la respuesta al jugador.
+		slog.Error("Discord bot: error registrando jugada de /slot para estadísticas", "error", err)
+	}
 
 	reels := fmt.Sprintf("%s ┃ %s ┃ %s", randomSymbol(), randomSymbol(), randomSymbol())
 	title := "🎰 Sin suerte esta vez"

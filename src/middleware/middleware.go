@@ -74,10 +74,16 @@ func ParseCustomerToken(tokenStr string, secretKey string) (*types.CustomerClaim
 		return nil, fmt.Errorf("token no es de cliente")
 	}
 	isAdmin, _ := claims["is_admin"].(bool)
+	customerID, _ := claims["customer_id"].(string)
+	epicUsername, _ := claims["epic_username"].(string)
+	email, _ := claims["email"].(string)
+	if customerID == "" {
+		return nil, fmt.Errorf("token sin customer_id")
+	}
 	return &types.CustomerClaims{
-		CustomerID:   claims["customer_id"].(string),
-		EpicUsername: claims["epic_username"].(string),
-		Email:        claims["email"].(string),
+		CustomerID:   customerID,
+		EpicUsername: epicUsername,
+		Email:        email,
 		IsCustomer:   true,
 		IsAdmin:      isAdmin,
 	}, nil
