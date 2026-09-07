@@ -5,12 +5,23 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	htmlpkg "html"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/smtp"
 	"time"
 )
+
+// esc escapa HTML en cualquier texto que venga de un cliente (nombre de
+// usuario Epic, nombre de producto de una nota de admin, motivo de un
+// pedido fallido, etc.) antes de meterlo en el HTML del correo. Los
+// clientes de correo modernos ya filtran <script> agresivamente, pero no
+// hay que depender de eso — nunca se debe confiar en texto de usuario
+// dentro de HTML sin escapar.
+func esc(s string) string {
+	return htmlpkg.EscapeString(s)
+}
 
 // sendEmail sends an HTML email using Resend API (production) or SMTP (local dev).
 func sendEmail(cfg types.EnvConfig, to, subject, htmlBody string) error {
@@ -224,6 +235,7 @@ func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, 
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	productName = esc(productName)
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
@@ -267,6 +279,7 @@ func SendOrderSentEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, it
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	epicUsername, itemName = esc(epicUsername), esc(itemName)
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
@@ -309,6 +322,7 @@ func SendOrderFailedEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, 
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	epicUsername, itemName, reason = esc(epicUsername), esc(itemName), esc(reason)
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
@@ -356,6 +370,7 @@ func sendVerificationEmailNew(cfg types.EnvConfig, toEmail, username, verifyURL,
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	username = esc(username)
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
@@ -395,6 +410,7 @@ func sendResetEmailNew(cfg types.EnvConfig, toEmail, username, resetURL, lang st
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	username = esc(username)
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
@@ -434,6 +450,7 @@ func sendEmailChangeOTPNew(cfg types.EnvConfig, toEmail, username, code, lang st
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	username = esc(username)
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
@@ -470,6 +487,7 @@ func sendPasswordChangedEmail(cfg types.EnvConfig, toEmail, username, lang strin
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	username = esc(username)
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
@@ -515,6 +533,7 @@ func SendAccountLinkedEmail(cfg types.EnvConfig, toEmail, username, provider, la
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	username = esc(username)
 	es := lang != "en"
 	pl := providerLabel(provider)
 
@@ -554,6 +573,7 @@ func SendAccountUnlinkedEmail(cfg types.EnvConfig, toEmail, username, provider, 
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	username = esc(username)
 	es := lang != "en"
 	pl := providerLabel(provider)
 
@@ -593,6 +613,7 @@ func SendEmailChangedNoticeEmail(cfg types.EnvConfig, oldEmail, username, newEma
 	if !hasEmailProvider(cfg) {
 		return
 	}
+	username, newEmailMasked = esc(username), esc(newEmailMasked)
 	es := lang != "en"
 
 	subject := "KidStorePeru — "

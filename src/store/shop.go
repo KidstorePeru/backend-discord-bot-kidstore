@@ -207,34 +207,70 @@ func HandlerGetShop(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json", body)
 }
 
-// verifyShopPrice confirma que un offerId y su precio en VBucks corresponden
-// realmente a un item de la tienda actual de Fortnite. Nunca hay que confiar
-// en el precio que manda el cliente al crear un pedido — cualquiera podría
-// interceptar la petición y pedir un item carísimo pagando casi nada de KC,
-// mientras el bot igual gasta sus VBucks reales enviándolo. Esta es la única
-// fuente de verdad: los datos reales de fortnite-api.com.
-func verifyShopPrice(ctx context.Context, offerID string, claimedVBucks int) (bool, error) {
+// shopItem — lo que realmente sabemos de un item de la tienda, sacado de la
+// API de Fortnite, no de lo que mande el cliente.
+type shopItem struct {
+	Name        string
+	Image       string
+	FinalPrice  int
+}
+
+// resolveShopItem busca un offerId en la tienda actual y devuelve sus datos
+// REALES (precio, nombre e imagen). Nunca hay que confiar en lo que manda el
+// cliente al crear un pedido — ni el precio, ni el nombre, ni la imagen —
+// cualquiera podría interceptar la petición y, además de intentar pagar de
+// menos, meter texto/HTML arbitrario en item_name que después se muestra tal
+// cual en el correo de confirmación. Esta es la única fuente de verdad.
+func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 	body, err := fetchShopBody(ctx, "es-419")
 	if err != nil {
-		return false, err
+		return shopItem{}, err
 	}
 	var parsed struct {
 		Data struct {
 			Entries []struct {
 				OfferID    string `json:"offerId"`
 				FinalPrice int    `json:"finalPrice"`
+				Bundle     *struct {
+					Name string `json:"name"`
+				} `json:"bundle"`
+				BrItems []struct {
+					Name   string `json:"name"`
+					Images struct {
+						Featured  string `json:"featured"`
+						Icon      string `json:"icon"`
+						SmallIcon string `json:"smallIcon"`
+					} `json:"images"`
+				} `json:"brItems"`
+				Tracks []struct {
+					Title string `json:"title"`
+				} `json:"tracks"`
 			} `json:"entries"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return false, fmt.Errorf("respuesta de tienda inesperada: %w", err)
+		return shopItem{}, fmt.Errorf("respuesta de tienda inesperada: %w", err)
 	}
 	for _, e := range parsed.Data.Entries {
-		if e.OfferID == offerID {
-			return e.FinalPrice == claimedVBucks, nil
+		if e.OfferID != offerID {
+			continue
 		}
+		item := shopItem{FinalPrice: e.FinalPrice}
+		switch {
+		case e.Bundle != nil:
+			item.Name = e.Bundle.Name
+		case len(e.BrItems) > 0:
+			item.Name = e.BrItems[0].Name
+			item.Image = e.BrItems[0].Images.Featured
+			if item.Image == "" { item.Image = e.BrItems[0].Images.Icon }
+			if item.Image == "" { item.Image = e.BrItems[0].Images.SmallIcon }
+		case len(e.Tracks) > 0:
+			item.Name = e.Tracks[0].Title
+		}
+		if item.Name == "" { item.Name = "Item" }
+		return item, nil
 	}
-	return false, fmt.Errorf("item no encontrado en la tienda actual")
+	return shopItem{}, fmt.Errorf("item no encontrado en la tienda actual")
 }
 
 // ==================== CREAR PEDIDO ====================
@@ -260,13 +296,15 @@ func HandlerCreateOrder(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		// ── Verificar precio contra la tienda real ──
-		// El cliente podría manipular price_kc/price_vbucks directamente en la
-		// petición (editando la request desde el navegador) para pedir un item
-		// caro pagando casi nada — el bot igual gastaría sus VBucks reales
-		// enviándolo. Nunca hay que confiar en el precio que manda el cliente:
-		// se verifica contra los datos reales de fortnite-api.com.
-		priceOK, err := verifyShopPrice(c.Request.Context(), req.ItemOfferID, req.PriceVBucks)
+		// ── Verificar el item contra la tienda real ──
+		// El cliente podría manipular price_kc/price_vbucks/item_name/item_image
+		// directamente en la petición (editando la request desde el navegador)
+		// para pedir un item caro pagando casi nada — el bot igual gastaría sus
+		// VBucks reales enviándolo — o para meter texto/HTML arbitrario en
+		// item_name, que después se muestra tal cual en el correo de
+		// confirmación. Nunca hay que confiar en nada de esto: se reemplaza
+		// todo por los datos reales de fortnite-api.com.
+		item, err := resolveShopItem(c.Request.Context(), req.ItemOfferID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no se pudo verificar el item en la tienda actual: " + err.Error()})
 			return
@@ -274,13 +312,18 @@ func HandlerCreateOrder(database *sql.DB) gin.HandlerFunc {
 		// 1 VBuck = 1 KC (igual que vbucksToKC en el frontend) — si esa tasa
 		// cambia algún día, hay que actualizarla también acá.
 		expectedKC := req.PriceVBucks
-		if !priceOK || req.PriceKC != expectedKC {
+		if item.FinalPrice != req.PriceVBucks || req.PriceKC != expectedKC {
 			slog.Warn("Posible manipulación de precio en pedido bloqueada",
 				"customer", customerID, "offerID", req.ItemOfferID,
 				"price_kc_reclamado", req.PriceKC, "price_vbucks_reclamado", req.PriceVBucks, "ip", c.ClientIP())
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "el precio del item no coincide con la tienda actual"})
 			return
 		}
+		// Nunca se usa el item_image que mande el cliente — solo el real del
+		// catálogo, o vacío (las plantillas ya manejan ese caso con un ícono
+		// de reemplazo).
+		req.ItemName = item.Name
+		req.ItemImage = item.Image
 
 		// ── Verificar horario ──
 		inSchedule, scheduleReason := db.IsWithinSchedule(database)
