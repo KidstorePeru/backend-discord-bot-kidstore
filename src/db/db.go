@@ -1284,7 +1284,7 @@ func GetPaymentTransaction(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, 
 	var t types.PaymentTransaction
 	var currencyCode sql.NullString
 	err := db.QueryRow(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions WHERE id=$1`, id).
 		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
 	t.CurrencyCode = currencyCode.String
@@ -1322,7 +1322,7 @@ func GetAllPaymentTransactions(db *sql.DB, page, limit int) ([]types.PaymentTran
 	var total int
 	db.QueryRow(`SELECT COUNT(*) FROM payment_transactions`).Scan(&total)
 	rows, err := db.Query(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
@@ -1339,7 +1339,7 @@ func GetAllPaymentTransactions(db *sql.DB, page, limit int) ([]types.PaymentTran
 
 func GetPaymentsByCustomer(db *sql.DB, customerID uuid.UUID) ([]types.PaymentTransaction, error) {
 	rows, err := db.Query(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions WHERE customer_id=$1 ORDER BY created_at DESC LIMIT 50`, customerID)
 	if err != nil { return nil, err }
 	defer rows.Close()
@@ -1434,7 +1434,7 @@ func DeletePayment(db *sql.DB, id uuid.UUID) error {
 
 func GetPaymentByID(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, error) {
 	var t types.PaymentTransaction
-	err := db.QueryRow(`SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+	err := db.QueryRow(`SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions WHERE id=$1`, id).
 		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
 	return t, err

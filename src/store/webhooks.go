@@ -17,12 +17,20 @@ import (
 
 // ==================== COMMON ====================
 
+// ProcessApprovedPayment es la version exportada de processApprovedPayment —
+// la usa el panel de admin (HandlerUpdatePayment) para que el botón
+// "Aprobar" realmente acredite el KC al cliente (email, notificación de
+// Discord, todo) en vez de solo cambiarle la etiqueta al pago.
+func ProcessApprovedPayment(database *sql.DB, txID uuid.UUID) error {
+	return processApprovedPayment(database, txID)
+}
+
 func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 	tx, err := db.GetPaymentTransaction(database, txID)
 	if err != nil {
 		return fmt.Errorf("transaction not found: %w", err)
 	}
-	if tx.Status == "approved" {
+	if tx.Status == "approved" || tx.Status == "fulfilled" {
 		return nil // already processed (idempotent)
 	}
 

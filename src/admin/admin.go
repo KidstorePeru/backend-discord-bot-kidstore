@@ -3,6 +3,7 @@ package admin
 import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/discordbot"
+	"KidStoreStore/src/store"
 	"KidStoreStore/src/types"
 	"database/sql"
 	"fmt"
@@ -496,9 +497,27 @@ func HandlerUpdatePayment(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		if err := db.AdminUpdatePaymentStatus(database, id, req.Status); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
-			return
+		if req.Status == "approved" || req.Status == "fulfilled" {
+			// "Aprobar" debe acreditar el KC de verdad (mismo camino que un
+			// webhook real: email, notificación de Discord, todo) — antes esto
+			// solo le cambiaba la etiqueta al pago sin darle el KC al cliente,
+			// lo que dejaba pagos marcados "aprobados" que en realidad nunca se
+			// acreditaron.
+			if err := store.ProcessApprovedPayment(database, id); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+				return
+			}
+			if req.Status == "fulfilled" {
+				if err := db.AdminUpdatePaymentStatus(database, id, "fulfilled"); err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+					return
+				}
+			}
+		} else {
+			if err := db.AdminUpdatePaymentStatus(database, id, req.Status); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+				return
+			}
 		}
 
 		db.AddAuditLog(database, nil, "ADMIN_PAYMENT_UPDATED",
