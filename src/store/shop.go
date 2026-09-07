@@ -393,7 +393,11 @@ func StartOrderWorker(ctx context.Context, database *sql.DB) {
 }
 
 func processOrders(database *sql.DB) {
-	orders, err := db.GetPendingOrders(database)
+	// ClaimPendingOrders (no GetPendingOrders) — reclama los pedidos de forma
+	// atómica (FOR UPDATE SKIP LOCKED) para que, si local y producción llegan
+	// a correr al mismo tiempo contra la misma base compartida, nunca puedan
+	// tomar y enviar el mismo pedido dos veces.
+	orders, err := db.ClaimPendingOrders(database)
 	if err != nil || len(orders) == 0 { return }
 
 	accounts, err := db.GetActiveGameAccounts(database, encryptionKey)
@@ -430,7 +434,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		return
 	}
 
-	db.UpdateOrderStatus(database, order.ID, "processing", nil, nil)
+	// (El pedido ya quedó marcado "processing" al reclamarlo en ClaimPendingOrders.)
 
 	// Obtener el Epic account ID del receptor (igual para todos los bots, basta con uno)
 	var receiverAccountID string

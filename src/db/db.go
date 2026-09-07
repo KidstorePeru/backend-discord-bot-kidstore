@@ -1036,6 +1036,39 @@ func GetPendingOrders(db *sql.DB) ([]types.Order, error) {
 	return scanOrders(rows)
 }
 
+// ClaimPendingOrders selecciona los pedidos pendientes Y los marca como
+// "processing" en la MISMA transacción, usando FOR UPDATE SKIP LOCKED. Esto
+// existe porque el entorno local y producción comparten la misma base de
+// datos y cada uno corre su propio worker de pedidos en un ticker
+// independiente — sin esto, dos instancias del backend podrían leer el
+// mismo pedido "pending" al mismo tiempo y AMBAS enviarían el regalo real
+// por Epic Games, duplicando el envío de un pedido pagado una sola vez.
+// FOR UPDATE SKIP LOCKED hace que si una instancia ya está mirando esas
+// filas, la otra simplemente las salte en vez de esperar o repetirlas.
+func ClaimPendingOrders(database *sql.DB) ([]types.Order, error) {
+	tx, err := database.Begin()
+	if err != nil { return nil, err }
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`
+		SELECT id, customer_id, epic_username, item_offer_id, item_name,
+		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, created_at, updated_at
+		FROM orders WHERE status='pending' ORDER BY created_at ASC
+		FOR UPDATE SKIP LOCKED`)
+	if err != nil { return nil, err }
+	orders, scanErr := scanOrders(rows)
+	rows.Close()
+	if scanErr != nil { return nil, scanErr }
+
+	for _, o := range orders {
+		if _, err := tx.Exec(`UPDATE orders SET status='processing', updated_at=NOW() WHERE id=$1`, o.ID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil { return nil, err }
+	return orders, nil
+}
+
 func UpdateOrderStatus(db *sql.DB, orderID uuid.UUID, status string, gameAccountID *uuid.UUID, errMsg *string) error {
 	_, err := db.Exec(`UPDATE orders SET status=$1, game_account_id=$2, error_msg=$3, updated_at=NOW() WHERE id=$4`,
 		status, gameAccountID, errMsg, orderID)
