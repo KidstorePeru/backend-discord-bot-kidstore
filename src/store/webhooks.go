@@ -251,7 +251,8 @@ func HandlerPayPalCapture(database *sql.DB) gin.HandlerFunc {
 
 		if err := processApprovedPayment(database, txID); err != nil {
 			slog.Error("PayPal return processing failed", "txID", txID, "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+			// Ruta publica sin autenticar — no devolver el error crudo.
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error procesando el pago, contacta soporte"})
 			return
 		}
 

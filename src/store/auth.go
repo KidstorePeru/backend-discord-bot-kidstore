@@ -235,6 +235,12 @@ const (
 	accountLockDuration = 15 * time.Minute
 )
 
+// dummyPasswordHash es un hash bcrypt fijo (de una contraseña que no le
+// pertenece a nadie) que se usa solo para "gastar" el mismo tiempo de CPU
+// que gastaría una comparación real, cuando el correo ni siquiera existe —
+// ver el comentario en HandlerLogin.
+const dummyPasswordHash = "$2a$10$VEnXUQTbaN67NtB5RkYs9ekbic9gO9wCPMo2.4ce/u2/wt91MWI0a"
+
 var (
 	loginFailuresMu sync.Mutex
 	loginFailures   = map[uuid.UUID][]time.Time{}
@@ -300,6 +306,13 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 				})
 				return
 			}
+			// Comparación bcrypt "de mentira" contra un hash fijo — sin esto,
+			// un correo inexistente responde casi instantáneo mientras que uno
+			// real (con contraseña incorrecta) tarda lo que tarda bcrypt. Esa
+			// diferencia de tiempo es suficiente para que alguien adivine, uno
+			// por uno, qué correos SÍ están registrados en el sitio, sin
+			// necesitar acertar ninguna contraseña.
+			bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(req.Password))
 			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "credenciales inválidas"})
 			return
 		}
@@ -404,6 +417,31 @@ func HandlerRefreshToken(database *sql.DB, secretKey string) gin.HandlerFunc {
 			"refresh_token": newRefreshPlain,
 			"customer": customer.Public(),
 		})
+	}
+}
+
+// ==================== LOGOUT ====================
+
+// HandlerLogout revoca el refresh token del dispositivo actual — antes
+// "cerrar sesión" solo borraba el token del navegador, pero el refresh
+// token seguía siendo válido en el servidor hasta sus 7 días completos. Si
+// alguien lo hubiera copiado (dispositivo compartido, malware, backup del
+// navegador), "cerrar sesión" no le quitaba el acceso. Ahora sí lo revoca
+// de verdad. No requiere que el refresh token sea de quien llama — poseer
+// el valor exacto (256 bits al azar) ya es la prueba de que es su propia
+// sesión la que se está cerrando.
+func HandlerLogout(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req types.RefreshTokenRequest
+		if err := c.ShouldBindJSON(&req); err != nil || req.RefreshToken == "" {
+			// Sin refresh token no hay nada que revocar del lado del servidor
+			// (p. ej. una sesión que ya expiró) — no es un error real.
+			c.JSON(http.StatusOK, gin.H{"success": true})
+			return
+		}
+		tokenHash := middleware.HashRefreshToken(req.RefreshToken)
+		db.DeleteRefreshToken(database, tokenHash)
+		c.JSON(http.StatusOK, gin.H{"success": true})
 	}
 }
 
@@ -540,13 +578,24 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 		token, _ := middleware.GenerateCustomerToken(updatedCustomer, secretKey)
 		db.AddAuditLog(database, &customerID, "PROFILE_UPDATED", "perfil actualizado", c.ClientIP())
 
-		// Alerta de seguridad: si cambió la contraseña, avisar por correo. Si
-		// no fue el dueño real quien la cambió, esta es la única forma de que
-		// se entere a tiempo.
-		if newHash != "" && updatedCustomer.Email != nil && *updatedCustomer.Email != "" {
-			lang := c.GetHeader("X-Lang")
-			if lang == "" { lang = "es" }
-			go sendPasswordChangedEmail(smtpConfig, *updatedCustomer.Email, updatedCustomer.EpicUsername, lang)
+		if newHash != "" {
+			// Si cambió la contraseña, se revocan TODAS las sesiones activas
+			// (refresh tokens) de la cuenta — si alguien más tenía un token
+			// robado de antes del cambio, no debe poder seguir renovando su
+			// sesión indefinidamente solo porque el dueño cambió la contraseña
+			// desde otro lado. El propio dispositivo actual sigue funcionando
+			// hasta que su token de acceso (1h) expire, y ahí tendrá que
+			// volver a iniciar sesión con la contraseña nueva — como cualquier
+			// otro.
+			db.DeleteAllRefreshTokensForCustomer(database, customerID)
+
+			// Alerta de seguridad: si no fue el dueño real quien la cambió,
+			// esta es la única forma de que se entere a tiempo.
+			if updatedCustomer.Email != nil && *updatedCustomer.Email != "" {
+				lang := c.GetHeader("X-Lang")
+				if lang == "" { lang = "es" }
+				go sendPasswordChangedEmail(smtpConfig, *updatedCustomer.Email, updatedCustomer.EpicUsername, lang)
+			}
 		}
 
 		c.JSON(http.StatusOK, gin.H{
@@ -853,7 +902,9 @@ func HandlerResetPassword(database *sql.DB) gin.HandlerFunc {
 		db.MarkResetTokenUsed(database, req.Token)
 		db.AddAuditLog(database, &resetToken.CustomerID, "PASSWORD_RESET", "contraseña restablecida", c.ClientIP())
 
-		// Alerta de seguridad — mismo motivo que en HandlerUpdateProfile.
+		// Mismo motivo que en HandlerUpdateProfile: revocar todas las
+		// sesiones activas y avisar por correo.
+		db.DeleteAllRefreshTokensForCustomer(database, resetToken.CustomerID)
 		if customer, err := db.GetCustomerByID(database, resetToken.CustomerID); err == nil && customer.Email != nil && *customer.Email != "" {
 			lang := c.GetHeader("X-Lang")
 			if lang == "" { lang = "es" }

@@ -154,6 +154,15 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
+	// Cabeceras de seguridad estándar — barato de agregar, sin downside real.
+	router.Use(func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		c.Next()
+	})
+
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"service": "KidStore Store API", "status": "ok"})
 	})
@@ -171,6 +180,7 @@ func main() {
 		authGroup.POST("/reset-password",      store.HandlerResetPassword(database))
 		authGroup.POST("/resend-verification", store.HandlerResendVerification(database, cfg))
 		authGroup.POST("/refresh-token",      store.HandlerRefreshToken(database, cfg.SecretKey))
+		authGroup.POST("/logout",             store.HandlerLogout(database))
 	}
 
 	// ── OAuth: login/registro con Google y Discord (con rate limit) ──

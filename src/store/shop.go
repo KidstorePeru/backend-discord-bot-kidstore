@@ -201,7 +201,10 @@ func HandlerGetShop(c *gin.Context) {
 
 	body, err := fetchShopBody(c.Request.Context(), lang)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+		// Ruta publica, sin autenticar — nunca devolver el error crudo (podria
+		// traer detalles internos de red/infraestructura), solo loguearlo.
+		slog.Error("HandlerGetShop: error obteniendo tienda", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "no se pudo obtener la tienda, intenta de nuevo"})
 		return
 	}
 	c.Data(http.StatusOK, "application/json", body)

@@ -1449,6 +1449,16 @@ func DeleteRefreshToken(db *sql.DB, tokenHash string) error {
 	return err
 }
 
+// DeleteAllRefreshTokensForCustomer revoca TODAS las sesiones (refresh
+// tokens) de una cuenta — se usa al cambiar la contraseña, para que un
+// atacante que ya tuviera un refresh token robado (de antes del cambio) no
+// pueda seguir renovando su sesión indefinidamente después de que el dueño
+// real haya "cerrado la puerta" cambiando su contraseña.
+func DeleteAllRefreshTokensForCustomer(db *sql.DB, customerID uuid.UUID) error {
+	_, err := db.Exec(`DELETE FROM refresh_tokens WHERE customer_id=$1`, customerID)
+	return err
+}
+
 // ==================== AUDIT LOG ====================
 
 func AddAuditLog(db *sql.DB, customerID *uuid.UUID, action, details, ip string) {
