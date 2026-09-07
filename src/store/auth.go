@@ -10,9 +10,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -221,6 +223,62 @@ func HandlerResendVerification(database *sql.DB, cfg types.EnvConfig) gin.Handle
 }
 
 // ==================== LOGIN ====================
+//
+// El límite de intentos que ya existe (authLimiter, 5/min) es por IP — no
+// alcanza contra alguien con varias IPs (proxies, botnet) probando
+// contraseñas contra UNA sola cuenta puntual. Este segundo control es por
+// CUENTA, sin importar desde cuántas IPs distintas vengan los intentos.
+
+const (
+	maxLoginFailures    = 8
+	loginFailureWindow  = 15 * time.Minute
+	accountLockDuration = 15 * time.Minute
+)
+
+var (
+	loginFailuresMu sync.Mutex
+	loginFailures   = map[uuid.UUID][]time.Time{}
+)
+
+// recordLoginFailure suma un intento fallido para esta cuenta. Devuelve
+// true si con este intento se alcanzó el máximo y la cuenta queda
+// bloqueada temporalmente.
+func recordLoginFailure(customerID uuid.UUID) bool {
+	loginFailuresMu.Lock()
+	defer loginFailuresMu.Unlock()
+	now := time.Now()
+	var recent []time.Time
+	for _, t := range loginFailures[customerID] {
+		if now.Sub(t) < loginFailureWindow {
+			recent = append(recent, t)
+		}
+	}
+	recent = append(recent, now)
+	loginFailures[customerID] = recent
+	return len(recent) >= maxLoginFailures
+}
+
+// accountLockStatus dice si la cuenta está bloqueada ahora mismo y cuánto
+// falta para que se libere.
+func accountLockStatus(customerID uuid.UUID) (locked bool, retryAfter time.Duration) {
+	loginFailuresMu.Lock()
+	defer loginFailuresMu.Unlock()
+	times := loginFailures[customerID]
+	if len(times) < maxLoginFailures {
+		return false, 0
+	}
+	elapsed := time.Since(times[len(times)-1])
+	if elapsed >= accountLockDuration {
+		return false, 0
+	}
+	return true, accountLockDuration - elapsed
+}
+
+func clearLoginFailures(customerID uuid.UUID) {
+	loginFailuresMu.Lock()
+	defer loginFailuresMu.Unlock()
+	delete(loginFailures, customerID)
+}
 
 func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -246,11 +304,25 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 			return
 		}
 
+		if locked, retryAfter := accountLockStatus(customer.ID); locked {
+			db.AddAuditLog(database, &customer.ID, "LOGIN_BLOCKED", "cuenta bloqueada temporalmente por intentos fallidos", c.ClientIP())
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"success": false,
+				"error":   fmt.Sprintf("Demasiados intentos fallidos. Intenta de nuevo en %d minutos.", int(retryAfter.Minutes())+1),
+				"code":    "ACCOUNT_LOCKED",
+			})
+			return
+		}
+
 		if err := bcrypt.CompareHashAndPassword([]byte(customer.PasswordHash), []byte(req.Password)); err != nil {
 			db.AddAuditLog(database, &customer.ID, "LOGIN_FAILED", "intento fallido", c.ClientIP())
+			if recordLoginFailure(customer.ID) {
+				slog.Warn("Cuenta bloqueada temporalmente por demasiados intentos fallidos", "customer", customer.ID, "ip", c.ClientIP())
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "credenciales inválidas"})
 			return
 		}
+		clearLoginFailures(customer.ID)
 
 		if !customer.IsVerified {
 			c.JSON(http.StatusForbidden, gin.H{
@@ -521,6 +593,19 @@ func HandlerUpdateAvatar(database *sql.DB) gin.HandlerFunc {
 		}
 		if len(decoded) > maxAvatarBytes {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"success": false, "error": "la imagen es muy grande (máx. 400KB)"})
+			return
+		}
+		// El "data:image/..." del principio es solo una etiqueta que pone el
+		// propio navegador — no prueba que los bytes decodificados sean
+		// realmente una imagen. Sin este chequeo, alguien podría subir un SVG
+		// (que sí puede llevar <script>) u otro archivo cualquiera disfrazado
+		// de imagen. Se valida el contenido real por sus bytes, aceptando solo
+		// formatos de imagen rasterizada — un SVG nunca pasa este chequeo.
+		switch http.DetectContentType(decoded) {
+		case "image/png", "image/jpeg", "image/gif", "image/webp":
+			// ok
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "el archivo no es una imagen válida (solo PNG, JPEG, GIF o WEBP)"})
 			return
 		}
 
