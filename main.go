@@ -86,7 +86,15 @@ func main() {
 		BackendURL:          backendURL,
 	})
 
-	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+	// sslmode=require — la conexión a Postgres viaja por la red pública de
+	// Railway (el host es un proxy público, caboose.proxy.rlwy.net), no por
+	// una red interna. Con sslmode=disable, cada consulta SQL — contraseñas
+	// hasheadas, correos, tokens, todo — viajaba sin cifrar por esa red
+	// pública. "require" cifra el canal (protege contra cualquiera
+	// escuchando el tráfico) aunque no valide el certificado contra una CA
+	// conocida — Railway no publica uno; validar el certificado exigiría
+	// distribuir su CA propia, que no vale la pena acá.
+	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
 		cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName)
 	database, err := sql.Open("postgres", psqlInfo)
 	if err != nil { log.Fatalf("Error abriendo DB: %v", err) }
