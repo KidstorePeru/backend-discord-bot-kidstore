@@ -461,6 +461,12 @@ func HandlerOrderVoucher(database *sql.DB) gin.HandlerFunc {
 				"price_vbucks":  order.PriceVBucks,
 				"status":        order.Status,
 				"created_at":    order.CreatedAt,
+				// delivery_confirmed: true si Epic Games confirmó el envío con
+				// su propia respuesta (evidencia guardada server-side). No se
+				// expone el JSON crudo al cliente, solo la confirmación —
+				// el detalle técnico queda para uso interno en disputas de pago.
+				"delivery_confirmed": order.DeliveryEvidence != nil,
+				"delivered_at":       order.UpdatedAt,
 			},
 		})
 	}
@@ -612,13 +618,20 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 
 		// Intentar enviar el regalo
 		message := "¡Gracias por tu compra en KidStorePeru! 🎮"
-		err = fortnite.SendGift(database, *bot, receiverAccountID,
+		var evidence string
+		evidence, err = fortnite.SendGift(database, *bot, receiverAccountID,
 			order.ItemOfferID, order.PriceVBucks, order.ItemName, message)
 
 		if err == nil {
 			// ── Éxito ──
 			accountID := bot.ID
-			db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
+			// Guardamos la respuesta cruda de Epic como evidencia de entrega:
+			// si algún día hay una disputa de pago/contracargo, esta es la
+			// prueba de que el ítem sí se entregó a la cuenta correcta.
+			if markErr := db.MarkOrderDelivered(database, order.ID, accountID, evidence); markErr != nil {
+				slog.Warn("Worker: error guardando evidencia de entrega", "orderID", order.ID, "error", markErr)
+				db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
+			}
 			db.UpdateRemainingGifts(database, bot.ID, bot.RemainingGifts-1)
 			bot.RemainingGifts--
 

@@ -586,7 +586,13 @@ func ResolveDisplayNames(database *sql.DB, account types.GameAccount, accountIDs
 
 // ==================== SEND GIFT ====================
 
-func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, offerID string, priceVBucks int, itemName, message string) error {
+// SendGift envía el regalo y devuelve, además del error, la "evidencia de
+// entrega": la respuesta cruda que da el propio Epic Games confirmando que
+// procesó el envío (incluye su hora de servidor y la revisión del perfil
+// actualizado). Esto es justo lo que hace falta ante una disputa de pago —
+// una prueba de un tercero (Epic), no solo nuestro propio registro, de que
+// el item realmente se entregó.
+func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, offerID string, priceVBucks int, itemName, message string) (evidence string, err error) {
 	botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
 	receiverClean := strings.ReplaceAll(receiverAccountID, "-", "")
 
@@ -603,7 +609,7 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("error marshaling gift payload: %w", err)
+		return "", fmt.Errorf("error marshaling gift payload: %w", err)
 	}
 
 	req, _ := http.NewRequest("POST",
@@ -613,7 +619,7 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 
 	resp, updatedAccount, err := executeWithRefresh(database, account, req)
 	if err != nil {
-		return fmt.Errorf("error enviando gift request: %w", err)
+		return "", fmt.Errorf("error enviando gift request: %w", err)
 	}
 	defer resp.Body.Close()
 	_ = updatedAccount
@@ -628,19 +634,30 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 			switch errCode {
 			case "errors.com.epicgames.modules.gamesubcatalog.purchase_not_allowed":
 				db.UpdateRemainingGifts(database, account.ID, 0)
-				return fmt.Errorf("la cuenta bot no tiene slots de regalo disponibles")
+				return "", fmt.Errorf("la cuenta bot no tiene slots de regalo disponibles")
 			case "errors.com.epicgames.friends.friendship_not_found":
-				return fmt.Errorf("el cliente no tiene agregado al bot como amigo")
+				return "", fmt.Errorf("el cliente no tiene agregado al bot como amigo")
 			case "errors.com.epicgames.modules.gamesubcatalog.receiver_will_own_more_than_one":
-				return fmt.Errorf("el cliente ya tiene este item")
+				return "", fmt.Errorf("el cliente ya tiene este item")
 			default:
-				return fmt.Errorf("error de Epic Games: %s", errCode)
+				return "", fmt.Errorf("error de Epic Games: %s", errCode)
 			}
 		}
-		return fmt.Errorf("error enviando gift, status: %d", resp.StatusCode)
+		return "", fmt.Errorf("error enviando gift, status: %d", resp.StatusCode)
 	}
 
-	return nil
+	// Envolver la respuesta cruda de Epic junto con datos que la ubican en el
+	// tiempo y el contexto del pedido — esto es lo que queda guardado como
+	// "evidencia de entrega" del pedido.
+	evidenceObj := map[string]interface{}{
+		"epic_response":       json.RawMessage(respBody),
+		"bot_account_id":      account.ID.String(),
+		"receiver_account_id": receiverAccountID,
+		"offer_id":            offerID,
+		"captured_at":         time.Now().UTC().Format(time.RFC3339),
+	}
+	evidenceBytes, _ := json.Marshal(evidenceObj)
+	return string(evidenceBytes), nil
 }
 
 // ==================== GOROUTINE: Auto-accept friend requests ====================

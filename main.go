@@ -128,6 +128,9 @@ func main() {
 	// esas APIs o sobrecargar el servidor. 40/min es generoso para tráfico
 	// legítimo de pasarelas reales, pero frena un abuso automatizado.
 	webhookLimiter := middleware.NewIPRateLimiter(40, time.Minute)
+	// Libro de Reclamaciones: público (cualquier consumidor, sin cuenta) —
+	// límite generoso para uso legítimo pero que frena un bombardeo automatizado.
+	complaintLimiter := middleware.NewIPRateLimiter(5, time.Hour)
 
 	gin.SetMode(gin.ReleaseMode)
 	// gin.Default() ya trae Logger + Recovery — no hace falta (ni conviene)
@@ -230,6 +233,15 @@ func main() {
 	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
 	router.GET("/store/product-available/:id", admin.HandlerCheckProductAvailable(database))
 
+	// Libro de Reclamaciones Virtual — público, no requiere cuenta (requisito
+	// legal en Perú: cualquier consumidor debe poder presentar un reclamo).
+	complaintGroup := router.Group("/store")
+	complaintGroup.Use(middleware.RateLimitMiddleware(complaintLimiter))
+	{
+		complaintGroup.POST("/complaints",              store.HandlerCreateComplaint(database, cfg))
+		complaintGroup.GET("/complaints/:reference",    store.HandlerGetComplaintStatus(database))
+	}
+
 	// ── Rutas de cliente (JWT requerido) ──
 	customer := router.Group("/store")
 	customer.Use(middleware.CustomerAuthMiddleware(cfg.SecretKey))
@@ -283,6 +295,9 @@ func main() {
 		adminGroup.PUT("/payments/:id",     admin.HandlerUpdatePayment(database))
 		adminGroup.DELETE("/payments/:id",  admin.HandlerDeletePayment(database))
 		adminGroup.GET("/check",            admin.HandlerAdminCheck(database))
+		adminGroup.GET("/complaints",       admin.HandlerGetAllComplaints(database))
+		adminGroup.PUT("/complaints/:id/respond", admin.HandlerRespondComplaint(database, cfg))
+		adminGroup.PUT("/complaints/:id/close",   admin.HandlerCloseComplaint(database))
 	}
 
 	// ── Payment expiration goroutine (expire pending payments after 30 min) ──

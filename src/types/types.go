@@ -182,8 +182,59 @@ type Order struct {
 	Status        string     `json:"status"`
 	GameAccountID *uuid.UUID `json:"game_account_id,omitempty"`
 	ErrorMsg      *string    `json:"error_msg,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	// DeliveryEvidence: respuesta cruda de Epic Games confirmando el envío
+	// del regalo (JSON), guardada como prueba de entrega para disputas de
+	// pago/contracargos. Solo se llena cuando status="sent".
+	DeliveryEvidence *string   `json:"delivery_evidence,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// ==================== LIBRO DE RECLAMACIONES ====================
+
+// ConsumerComplaint: un reclamo o queja presentado a través del Libro de
+// Reclamaciones Virtual (requisito legal en Perú — Ley N° 29571). No está
+// ligado a una cuenta de cliente: cualquier consumidor puede presentar uno.
+type ConsumerComplaint struct {
+	ID                  uuid.UUID  `json:"id"`
+	Reference           string     `json:"reference"`
+	Kind                string     `json:"kind"` // "reclamo" | "queja"
+	FullName            string     `json:"full_name"`
+	DocumentType        string     `json:"document_type"`
+	DocumentNumber      string     `json:"document_number"`
+	Email               string     `json:"email"`
+	Phone               *string    `json:"phone,omitempty"`
+	Address             *string    `json:"address,omitempty"`
+	IsMinor             bool       `json:"is_minor"`
+	GuardianName        *string    `json:"guardian_name,omitempty"`
+	OrderID             *uuid.UUID `json:"order_id,omitempty"`
+	AmountInvolved      *float64   `json:"amount_involved,omitempty"`
+	ProductDescription  string     `json:"product_description"`
+	Detail              string     `json:"detail"`
+	ConsumerRequest     string     `json:"consumer_request"`
+	Status              string     `json:"status"` // "pendiente" | "respondido" | "cerrado"
+	AdminResponse       *string    `json:"admin_response,omitempty"`
+	RespondedAt         *time.Time `json:"responded_at,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+}
+
+// CreateComplaintRequest: cuerpo del formulario público del Libro de
+// Reclamaciones. document_type: "DNI" | "CE" | "Pasaporte". kind: "reclamo" | "queja".
+type CreateComplaintRequest struct {
+	Kind               string   `json:"kind" binding:"required,oneof=reclamo queja"`
+	FullName           string   `json:"full_name" binding:"required,min=3,max=255"`
+	DocumentType       string   `json:"document_type" binding:"required,oneof=DNI CE Pasaporte"`
+	DocumentNumber     string   `json:"document_number" binding:"required,min=6,max=20"`
+	Email              string   `json:"email" binding:"required,email"`
+	Phone              string   `json:"phone" binding:"omitempty,max=30"`
+	Address            string   `json:"address" binding:"omitempty,max=500"`
+	IsMinor            bool     `json:"is_minor"`
+	GuardianName       string   `json:"guardian_name" binding:"omitempty,max=255"`
+	OrderID            string   `json:"order_id" binding:"omitempty,uuid"`
+	AmountInvolved     *float64 `json:"amount_involved" binding:"omitempty,gte=0"`
+	ProductDescription string   `json:"product_description" binding:"required,min=3,max=1000"`
+	Detail             string   `json:"detail" binding:"required,min=10,max=3000"`
+	ConsumerRequest    string   `json:"consumer_request" binding:"required,min=3,max=1000"`
 }
 
 // ==================== PASSWORD RESET ====================

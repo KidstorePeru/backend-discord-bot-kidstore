@@ -573,3 +573,67 @@ func HandlerAdminCheck(database *sql.DB) gin.HandlerFunc {
 		c.JSON(http.StatusOK, gin.H{"success": true, "is_admin": true})
 	}
 }
+
+// ==================== LIBRO DE RECLAMACIONES (ADMIN) ====================
+
+func HandlerGetAllComplaints(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+		complaints, total, err := db.GetAllComplaints(database, page, limit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo reclamos"})
+			return
+		}
+		if complaints == nil { complaints = []types.ConsumerComplaint{} }
+		c.JSON(http.StatusOK, gin.H{"success": true, "complaints": complaints, "total": total, "page": page, "limit": limit})
+	}
+}
+
+// HandlerRespondComplaint registra la respuesta del negocio a un reclamo o
+// queja y avisa al consumidor por correo. Por el reglamento de INDECOPI, el
+// plazo máximo de respuesta es de 30 días calendario desde su presentación.
+func HandlerRespondComplaint(database *sql.DB, cfg types.EnvConfig) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "ID inválido"})
+			return
+		}
+		var req struct {
+			Response string `json:"response" binding:"required,min=3,max=3000"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+		complaint, err := db.GetComplaintByID(database, id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "reclamo no encontrado"})
+			return
+		}
+		if err := db.RespondToComplaint(database, id, req.Response); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error guardando la respuesta"})
+			return
+		}
+		db.AddAuditLog(database, nil, "COMPLAINT_RESPONDED", "reclamo "+complaint.Reference+" respondido", c.ClientIP())
+		go store.SendComplaintRespondedEmail(cfg, complaint.Email, complaint.FullName, complaint.Reference, req.Response, "es")
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "respuesta enviada"})
+	}
+}
+
+func HandlerCloseComplaint(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "ID inválido"})
+			return
+		}
+		if err := db.CloseComplaint(database, id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error cerrando el reclamo"})
+			return
+		}
+		db.AddAuditLog(database, nil, "COMPLAINT_CLOSED", id.String(), c.ClientIP())
+		c.JSON(http.StatusOK, gin.H{"success": true})
+	}
+}

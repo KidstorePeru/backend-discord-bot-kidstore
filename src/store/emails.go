@@ -660,3 +660,78 @@ func SendEmailChangedNoticeEmail(cfg types.EnvConfig, oldEmail, username, newEma
 		slog.Info("Email: email changed notice sent", "to", oldEmail)
 	}
 }
+
+// SendComplaintReceivedEmail confirma al consumidor que su reclamo/queja del
+// Libro de Reclamaciones fue registrado, con una copia de lo que declaró y su
+// código de seguimiento — es práctica estándar (y esperada por INDECOPI) que
+// el consumidor reciba constancia de lo que presentó.
+func SendComplaintReceivedEmail(cfg types.EnvConfig, toEmail, fullName, reference, kind, productDescription, detail, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	fullName, productDescription, detail = esc(fullName), esc(productDescription), esc(detail)
+	es := lang != "en"
+	kindLabel := map[string]string{"reclamo": map[bool]string{true: "Reclamo", false: "Complaint"}[es], "queja": map[bool]string{true: "Queja", false: "Grievance"}[es]}[kind]
+
+	subject := fmt.Sprintf("KidStorePeru — %s #%s %s", kindLabel, reference, map[bool]string{true: "recibido", false: "received"}[es])
+	intro, hero, plazo := "", "", ""
+	if es {
+		intro = fmt.Sprintf("Hola %s, registramos tu %s en nuestro Libro de Reclamaciones Virtual. Guarda tu código de seguimiento.", fullName, strings.ToLower(kindLabel))
+		hero = "Código: " + reference
+		plazo = "Tienes derecho a una respuesta en un plazo máximo de 30 días calendario. Te escribiremos a este correo apenas tengamos una respuesta."
+	} else {
+		intro = fmt.Sprintf("Hi %s, we've registered your %s in our Virtual Complaints Book. Save your tracking code.", fullName, strings.ToLower(kindLabel))
+		hero = "Code: " + reference
+		plazo = "You're entitled to a response within a maximum of 30 calendar days. We'll email you here as soon as we have one."
+	}
+
+	rows := emailRow(map[bool]string{true: "Bien contratado", false: "Product/service"}[es], productDescription) +
+		emailRow(map[bool]string{true: "Detalle", false: "Detail"}[es], detail)
+
+	body := emailEyebrow(map[bool]string{true: "Libro de Reclamaciones Virtual", false: "Virtual Complaints Book"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailRows(rows) +
+		emailNotice(map[bool]string{true: "Plazo de respuesta", false: "Response timeframe"}[es], plazo)
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: complaint received send error", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: complaint received confirmation sent", "to", toEmail, "reference", reference)
+	}
+}
+
+// SendComplaintRespondedEmail notifica al consumidor cuando el negocio
+// responde su reclamo/queja.
+func SendComplaintRespondedEmail(cfg types.EnvConfig, toEmail, fullName, reference, response, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	fullName, response = esc(fullName), esc(response)
+	es := lang != "en"
+
+	subject := fmt.Sprintf("KidStorePeru — %s #%s", map[bool]string{true: "Respuesta a tu reclamo", false: "Response to your complaint"}[es], reference)
+	intro, hero := "", ""
+	if es {
+		intro = fmt.Sprintf("Hola %s, respondimos tu reclamo/queja #%s.", fullName, reference)
+		hero = "Respondimos tu reclamo"
+	} else {
+		intro = fmt.Sprintf("Hi %s, we responded to your complaint #%s.", fullName, reference)
+		hero = "We responded to your complaint"
+	}
+
+	body := emailEyebrow(map[bool]string{true: "Libro de Reclamaciones Virtual", false: "Virtual Complaints Book"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailRows(emailRow(map[bool]string{true: "Respuesta", false: "Response"}[es], response))
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: complaint responded send error", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: complaint responded notification sent", "to", toEmail, "reference", reference)
+	}
+}

@@ -3,8 +3,11 @@ package db
 import (
 	"KidStoreStore/src/crypto"
 	"KidStoreStore/src/types"
+	cryptorand "crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,6 +55,11 @@ func CreateTables(db *sql.DB) error {
 			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 		)`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='delivery_evidence') THEN
+				ALTER TABLE orders ADD COLUMN delivery_evidence TEXT;
+			END IF;
+		END $$`,
 		`CREATE TABLE IF NOT EXISTS audit_logs (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
@@ -297,6 +305,37 @@ func CreateTables(db *sql.DB) error {
 			notified_at TIMESTAMP NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (customer_id, bot_id)
 		)`,
+		// Libro de Reclamaciones Virtual — requisito legal para negocios de
+		// e-commerce en Perú (Código de Protección y Defensa del Consumidor,
+		// Ley N° 29571). No requiere que el cliente esté logueado: cualquier
+		// consumidor debe poder presentar un reclamo o queja.
+		`CREATE TABLE IF NOT EXISTS consumer_complaints (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			reference VARCHAR(20) NOT NULL UNIQUE,
+			kind VARCHAR(20) NOT NULL CHECK (kind IN ('reclamo','queja')),
+			full_name VARCHAR(255) NOT NULL,
+			document_type VARCHAR(20) NOT NULL,
+			document_number VARCHAR(30) NOT NULL,
+			email VARCHAR(255) NOT NULL,
+			phone VARCHAR(30),
+			address TEXT,
+			is_minor BOOLEAN NOT NULL DEFAULT false,
+			guardian_name VARCHAR(255),
+			order_id UUID,
+			amount_involved NUMERIC(10,2),
+			product_description TEXT NOT NULL,
+			detail TEXT NOT NULL,
+			consumer_request TEXT NOT NULL,
+			status VARCHAR(20) NOT NULL DEFAULT 'pendiente'
+				CHECK (status IN ('pendiente','respondido','cerrado')),
+			admin_response TEXT,
+			responded_at TIMESTAMP,
+			ip_address VARCHAR(45),
+			created_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_complaints_reference ON consumer_complaints(reference)`,
+		`CREATE INDEX IF NOT EXISTS idx_complaints_status ON consumer_complaints(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_complaints_email ON consumer_complaints(email)`,
 	}
 
 	for _, q := range queries {
@@ -1033,7 +1072,7 @@ func RefundOrder(db *sql.DB, orderID uuid.UUID) error {
 func GetPendingOrders(db *sql.DB) ([]types.Order, error) {
 	rows, err := db.Query(`
 		SELECT id, customer_id, epic_username, item_offer_id, item_name,
-		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, created_at, updated_at
+		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, delivery_evidence, created_at, updated_at
 		FROM orders WHERE status='pending' ORDER BY created_at ASC`)
 	if err != nil { return nil, err }
 	defer rows.Close()
@@ -1056,7 +1095,7 @@ func ClaimPendingOrders(database *sql.DB) ([]types.Order, error) {
 
 	rows, err := tx.Query(`
 		SELECT id, customer_id, epic_username, item_offer_id, item_name,
-		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, created_at, updated_at
+		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, delivery_evidence, created_at, updated_at
 		FROM orders WHERE status='pending' ORDER BY created_at ASC
 		FOR UPDATE SKIP LOCKED`)
 	if err != nil { return nil, err }
@@ -1076,6 +1115,17 @@ func ClaimPendingOrders(database *sql.DB) ([]types.Order, error) {
 func UpdateOrderStatus(db *sql.DB, orderID uuid.UUID, status string, gameAccountID *uuid.UUID, errMsg *string) error {
 	_, err := db.Exec(`UPDATE orders SET status=$1, game_account_id=$2, error_msg=$3, updated_at=NOW() WHERE id=$4`,
 		status, gameAccountID, errMsg, orderID)
+	return err
+}
+
+// MarkOrderDelivered marca un pedido como enviado Y guarda la evidencia de
+// entrega (la respuesta cruda de Epic Games confirmando el envío) en la
+// misma operación — esta es la prueba que se usa si algún día hay que
+// responder a una disputa de pago (el banco/pasarela pregunta "¿en verdad
+// se entregó lo que se cobró?").
+func MarkOrderDelivered(db *sql.DB, orderID, gameAccountID uuid.UUID, evidence string) error {
+	_, err := db.Exec(`UPDATE orders SET status='sent', game_account_id=$1, error_msg=NULL, delivery_evidence=$2, updated_at=NOW() WHERE id=$3`,
+		gameAccountID, evidence, orderID)
 	return err
 }
 
@@ -1120,10 +1170,10 @@ func GetOrderByID(db *sql.DB, id uuid.UUID) (types.Order, error) {
 	var o types.Order
 	err := db.QueryRow(`
 		SELECT id, customer_id, epic_username, item_offer_id, item_name,
-		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, created_at, updated_at
+		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, delivery_evidence, created_at, updated_at
 		FROM orders WHERE id=$1`, id).
 		Scan(&o.ID, &o.CustomerID, &o.EpicUsername, &o.ItemOfferID, &o.ItemName,
-			&o.ItemImage, &o.PriceKC, &o.PriceVBucks, &o.Status, &o.GameAccountID, &o.ErrorMsg, &o.CreatedAt, &o.UpdatedAt)
+			&o.ItemImage, &o.PriceKC, &o.PriceVBucks, &o.Status, &o.GameAccountID, &o.ErrorMsg, &o.DeliveryEvidence, &o.CreatedAt, &o.UpdatedAt)
 	return o, err
 }
 
@@ -1137,7 +1187,7 @@ func GetAllOrders(db *sql.DB, page, limit int) ([]types.Order, int, error) {
 
 	rows, err := db.Query(`
 		SELECT id, customer_id, epic_username, item_offer_id, item_name,
-		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, created_at, updated_at
+		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, delivery_evidence, created_at, updated_at
 		FROM orders ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
@@ -1151,7 +1201,7 @@ func scanOrders(rows *sql.Rows) ([]types.Order, error) {
 		var o types.Order
 		if err := rows.Scan(&o.ID, &o.CustomerID, &o.EpicUsername, &o.ItemOfferID,
 			&o.ItemName, &o.ItemImage, &o.PriceKC, &o.PriceVBucks, &o.Status,
-			&o.GameAccountID, &o.ErrorMsg, &o.CreatedAt, &o.UpdatedAt); err != nil {
+			&o.GameAccountID, &o.ErrorMsg, &o.DeliveryEvidence, &o.CreatedAt, &o.UpdatedAt); err != nil {
 			return nil, err
 		}
 		orders = append(orders, o)
@@ -1533,5 +1583,115 @@ func GetPaymentByID(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, error) 
 
 func SetCustomerAdmin(db *sql.DB, customerID uuid.UUID, isAdmin bool) error {
 	_, err := db.Exec(`UPDATE customers SET is_admin=$1, updated_at=NOW() WHERE id=$2`, isAdmin, customerID)
+	return err
+}
+
+// ==================== LIBRO DE RECLAMACIONES ====================
+
+// generateComplaintReference crea un código corto y humano-legible para que
+// el consumidor pueda identificar y hacer seguimiento a su reclamo (ej:
+// "KS-260908-A1B2C3"). No es secreto — solo un identificador de seguimiento.
+func generateComplaintReference() (string, error) {
+	b := make([]byte, 3)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("KS-%s-%s", time.Now().Format("060102"), strings.ToUpper(hex.EncodeToString(b))), nil
+}
+
+// CreateComplaint inserta un nuevo reclamo/queja del Libro de Reclamaciones
+// Virtual y le asigna un código de seguimiento único.
+func CreateComplaint(db *sql.DB, c types.ConsumerComplaint, ip string) (types.ConsumerComplaint, error) {
+	for attempt := 0; attempt < 5; attempt++ {
+		ref, err := generateComplaintReference()
+		if err != nil {
+			return types.ConsumerComplaint{}, err
+		}
+		id := uuid.New()
+		var createdAt time.Time
+		err = db.QueryRow(`
+			INSERT INTO consumer_complaints
+				(id, reference, kind, full_name, document_type, document_number, email, phone, address,
+				 is_minor, guardian_name, order_id, amount_involved, product_description, detail, consumer_request,
+				 status, ip_address, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pendiente',$17,NOW())
+			RETURNING created_at`,
+			id, ref, c.Kind, c.FullName, c.DocumentType, c.DocumentNumber, c.Email, c.Phone, c.Address,
+			c.IsMinor, c.GuardianName, c.OrderID, c.AmountInvolved, c.ProductDescription, c.Detail, c.ConsumerRequest,
+			ip).Scan(&createdAt)
+		if err != nil {
+			// Colisión de código único (extremadamente improbable) → reintentar con uno nuevo
+			if strings.Contains(err.Error(), "consumer_complaints_reference_key") {
+				continue
+			}
+			return types.ConsumerComplaint{}, err
+		}
+		c.ID = id
+		c.Reference = ref
+		c.Status = "pendiente"
+		c.CreatedAt = createdAt
+		return c, nil
+	}
+	return types.ConsumerComplaint{}, fmt.Errorf("no se pudo generar un código de reclamo único")
+}
+
+func scanComplaint(row interface{ Scan(dest ...interface{}) error }) (types.ConsumerComplaint, error) {
+	var c types.ConsumerComplaint
+	err := row.Scan(&c.ID, &c.Reference, &c.Kind, &c.FullName, &c.DocumentType, &c.DocumentNumber,
+		&c.Email, &c.Phone, &c.Address, &c.IsMinor, &c.GuardianName, &c.OrderID, &c.AmountInvolved,
+		&c.ProductDescription, &c.Detail, &c.ConsumerRequest, &c.Status, &c.AdminResponse, &c.RespondedAt, &c.CreatedAt)
+	return c, err
+}
+
+const complaintSelectCols = `id, reference, kind, full_name, document_type, document_number,
+	email, phone, address, is_minor, guardian_name, order_id, amount_involved,
+	product_description, detail, consumer_request, status, admin_response, responded_at, created_at`
+
+// GetComplaintByReference permite a un consumidor consultar el estado de su
+// reclamo con el código que se le entregó al presentarlo — no requiere cuenta.
+func GetComplaintByReference(db *sql.DB, reference string) (types.ConsumerComplaint, error) {
+	row := db.QueryRow(`SELECT `+complaintSelectCols+` FROM consumer_complaints WHERE reference=$1`, reference)
+	return scanComplaint(row)
+}
+
+func GetComplaintByID(db *sql.DB, id uuid.UUID) (types.ConsumerComplaint, error) {
+	row := db.QueryRow(`SELECT `+complaintSelectCols+` FROM consumer_complaints WHERE id=$1`, id)
+	return scanComplaint(row)
+}
+
+// GetAllComplaints — listado paginado para el panel admin.
+func GetAllComplaints(db *sql.DB, page, limit int) ([]types.ConsumerComplaint, int, error) {
+	if page < 1 { page = 1 }
+	if limit < 1 || limit > 200 { limit = 50 }
+	offset := (page - 1) * limit
+
+	var total int
+	db.QueryRow(`SELECT COUNT(*) FROM consumer_complaints`).Scan(&total)
+
+	rows, err := db.Query(`SELECT `+complaintSelectCols+`
+		FROM consumer_complaints ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
+	if err != nil { return nil, 0, err }
+	defer rows.Close()
+
+	var complaints []types.ConsumerComplaint
+	for rows.Next() {
+		c, err := scanComplaint(rows)
+		if err != nil { return nil, 0, err }
+		complaints = append(complaints, c)
+	}
+	return complaints, total, nil
+}
+
+// RespondToComplaint registra la respuesta del negocio a un reclamo/queja.
+// Por norma de INDECOPI, el plazo máximo de respuesta es de 30 días
+// calendario desde la presentación del reclamo.
+func RespondToComplaint(db *sql.DB, id uuid.UUID, response string) error {
+	_, err := db.Exec(`UPDATE consumer_complaints SET status='respondido', admin_response=$1, responded_at=NOW() WHERE id=$2`,
+		response, id)
+	return err
+}
+
+func CloseComplaint(db *sql.DB, id uuid.UUID) error {
+	_, err := db.Exec(`UPDATE consumer_complaints SET status='cerrado' WHERE id=$1`, id)
 	return err
 }
