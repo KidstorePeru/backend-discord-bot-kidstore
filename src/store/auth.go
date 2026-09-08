@@ -189,26 +189,27 @@ func HandlerResendVerification(database *sql.DB, cfg types.EnvConfig) gin.Handle
 		body.Email = strings.ToLower(strings.TrimSpace(body.Email))
 		if body.Lang == "" { body.Lang = "es" }
 
+		// Mismo mensaje de respuesta sin importar el caso — si no, alguien
+		// podía usar este endpoint para saber si un correo no existe, ya está
+		// verificado, o tiene un registro pendiente sin verificar, solo
+		// mirando qué mensaje le devuelve.
+		const genericMsg = "Si el correo existe y no está verificado, recibirás un nuevo enlace."
+
 		// Buscar registro pendiente primero
-		pending, err := db.GetPendingRegistrationByEmail(database, body.Email)
-		if err == nil {
+		if pending, err := db.GetPendingRegistrationByEmail(database, body.Email); err == nil {
 			tokenBytes := make([]byte, 32)
 			rand.Read(tokenBytes)
 			newToken := hex.EncodeToString(tokenBytes)
 			db.UpdatePendingRegistrationToken(database, body.Email, newToken)
 			go sendVerificationEmail(cfg, body.Email, newToken, pending.EpicUsername, body.Lang)
-			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Se envió un nuevo enlace de verificación."})
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": genericMsg})
 			return
 		}
 
 		// Buscar cuenta ya existente no verificada
 		customer, err := db.GetCustomerByEmail(database, body.Email)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Si el correo existe, recibirás un nuevo enlace."})
-			return
-		}
-		if customer.IsVerified {
-			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Este correo ya está verificado. Puedes iniciar sesión."})
+		if err != nil || customer.IsVerified {
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": genericMsg})
 			return
 		}
 
@@ -218,7 +219,7 @@ func HandlerResendVerification(database *sql.DB, cfg types.EnvConfig) gin.Handle
 		db.CreateEmailVerificationToken(database, customer.ID, verificationToken)
 		go sendVerificationEmail(cfg, body.Email, verificationToken, customer.EpicUsername, body.Lang)
 
-		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Se envió un nuevo enlace de verificación."})
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": genericMsg})
 	}
 }
 
