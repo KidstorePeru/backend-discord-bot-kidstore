@@ -1,10 +1,12 @@
 package middleware
 
 import (
+	"KidStoreStore/src/db"
 	"KidStoreStore/src/safe"
 	"KidStoreStore/src/types"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 // ==================== JWT ====================
@@ -193,7 +196,17 @@ func CustomerAuthMiddleware(secretKey string) gin.HandlerFunc {
 
 // AdminAuthMiddleware validates admin access via API Key (X-Admin-Key header)
 // OR via JWT with is_admin=true claim. Either method grants full admin access.
-func AdminAuthMiddleware(adminAPIKey, secretKey string) gin.HandlerFunc {
+//
+// El claim is_admin del JWT (Método 2) se graba al momento de emitir el
+// token y no cambia hasta que el token expire (hasta 1h) — antes, si un
+// admin era destituido (db.SetCustomerAdmin(..., false)) o su cuenta se
+// desactivaba, su JWT ya emitido seguía funcionando con acceso total de
+// admin hasta que expirara solo, sin importar el cambio hecho en la base
+// de datos. Ahora se vuelve a consultar el estado ACTUAL del cliente en
+// cada request — un costo aceptable (una consulta más) para que revocar
+// el rol de admin surta efecto de inmediato, no recién cuando el token
+// expire solo.
+func AdminAuthMiddleware(database *sql.DB, adminAPIKey, secretKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Method 1: API Key header (legacy, still works)
 		apiKey := c.GetHeader("X-Admin-Key")
@@ -202,16 +215,23 @@ func AdminAuthMiddleware(adminAPIKey, secretKey string) gin.HandlerFunc {
 			return
 		}
 
-		// Method 2: JWT with is_admin=true
+		// Method 2: JWT with is_admin=true — pero se verifica contra el
+		// estado actual en la base de datos, no solo el claim del token.
 		authHeader := c.GetHeader("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 			claims, err := ParseCustomerToken(tokenStr, secretKey)
 			if err == nil && claims.IsAdmin {
-				c.Set("customer_id", claims.CustomerID)
-				c.Set("is_admin", true)
-				c.Next()
-				return
+				customerID, err := uuid.Parse(claims.CustomerID)
+				if err == nil {
+					current, err := db.GetCustomerByID(database, customerID)
+					if err == nil && current.IsAdmin && current.IsActive {
+						c.Set("customer_id", claims.CustomerID)
+						c.Set("is_admin", true)
+						c.Next()
+						return
+					}
+				}
 			}
 		}
 

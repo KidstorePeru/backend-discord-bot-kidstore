@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const linkTokenPurpose = "oauth_link"
@@ -58,7 +59,17 @@ func parseLinkToken(cfg Config, tokenStr, expectedProvider string) (string, erro
 
 // HandlerStartLink genera el token de vinculación para el cliente autenticado.
 // POST /store/link/:provider/start
-func HandlerStartLink(cfg Config) gin.HandlerFunc {
+//
+// Vincular un proveedor OAuth agrega un método de acceso PERMANENTE a la
+// cuenta — alguien con solo el JWT robado (sin la contraseña) podía antes
+// vincular su propia cuenta de Google/Discord a la víctima y quedarse con
+// una puerta de entrada que sobrevive incluso a un cambio de contraseña
+// posterior. Si la cuenta tiene contraseña, ahora se exige confirmarla acá
+// (autenticación reciente), igual que ya se hace para 2FA y para eliminar
+// la cuenta. Las cuentas sin contraseña (creadas por OAuth) no tienen nada
+// extra que confirmar — la sesión ya es la única prueba de identidad que
+// existe para ellas.
+func HandlerStartLink(database *sql.DB, cfg Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		provider := c.Param("provider")
 		if provider != "google" && provider != "discord" {
@@ -73,6 +84,29 @@ func HandlerStartLink(cfg Config) gin.HandlerFunc {
 		if !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
 			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		customer, err := db.GetCustomerByID(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado"})
+			return
+		}
+		if customer.HasPassword {
+			var req struct {
+				Password string `json:"password" binding:"required"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "se requiere tu contraseña actual para vincular una cuenta nueva"})
+				return
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(customer.PasswordHash), []byte(req.Password)); err != nil {
+				c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "contraseña incorrecta"})
+				return
+			}
 		}
 		linkToken, err := generateLinkToken(cfg, customerIDStr, provider)
 		if err != nil {

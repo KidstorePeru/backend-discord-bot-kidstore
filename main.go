@@ -265,7 +265,7 @@ func main() {
 		customer.PUT("/avatar",            store.HandlerUpdateAvatar(database))
 		customer.POST("/email/request-change", middleware.RateLimitMiddleware(authLimiter), store.HandlerRequestEmailChange(database, cfg))
 		customer.POST("/email/confirm-change", middleware.RateLimitMiddleware(authLimiter), store.HandlerConfirmEmailChange(database, cfg.SecretKey))
-		customer.POST("/link/:provider/start", oauth.HandlerStartLink(oauthCfg))
+		customer.POST("/link/:provider/start", oauth.HandlerStartLink(database, oauthCfg))
 		customer.DELETE("/link/:provider",     oauth.HandlerUnlinkProvider(database))
 		customer.POST("/2fa/setup",         middleware.RateLimitMiddleware(authLimiter), store.HandlerSetup2FA(database))
 		customer.POST("/2fa/confirm",       middleware.RateLimitMiddleware(authLimiter), store.HandlerConfirm2FA(database))
@@ -281,7 +281,7 @@ func main() {
 	// ── Admin (API Key + rate limit) ──
 	adminGroup := router.Group("/admin")
 	adminGroup.Use(middleware.RateLimitMiddleware(adminLimiter))
-	adminGroup.Use(middleware.AdminAuthMiddleware(cfg.AdminAPIKey, cfg.SecretKey))
+	adminGroup.Use(middleware.AdminAuthMiddleware(database, cfg.AdminAPIKey, cfg.SecretKey))
 	{
 		adminGroup.GET("/customers",        admin.HandlerGetAllCustomers(database))
 		adminGroup.GET("/customers/:id",    admin.HandlerGetCustomer(database))
