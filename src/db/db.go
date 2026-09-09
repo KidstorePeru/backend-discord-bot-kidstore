@@ -387,6 +387,22 @@ func CreateTables(db *sql.DB) error {
 			END IF;
 		END $$`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_kc_recharges_payment_tx_unique ON kc_recharges(payment_transaction_id) WHERE payment_transaction_id IS NOT NULL`,
+		// Registro duradero de cada webhook de pago recibido — antes solo
+		// quedaba en el log del proceso (slog), que se pierde en cada
+		// reinicio/deploy. Con esto, si algo se pierde en el camino
+		// (proceso caído a mitad de camino, notificación duplicada, etc.)
+		// queda un rastro consultable de qué llegó, cuándo, y en qué
+		// terminó — independiente de si el pago se llegó a acreditar o no
+		// (eso lo decide ReconcilePendingPayments/CreditPaymentOnce).
+		`CREATE TABLE IF NOT EXISTS webhook_events (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			gateway VARCHAR(50) NOT NULL,
+			raw_body TEXT,
+			outcome TEXT,
+			received_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			processed_at TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_webhook_events_gateway ON webhook_events(gateway, received_at DESC)`,
 	}
 
 	for _, q := range queries {
@@ -1591,6 +1607,56 @@ func CreditPaymentOnce(db *sql.DB, id uuid.UUID) (credited bool, ptx types.Payme
 		return false, ptx, err
 	}
 	return true, ptx, nil
+}
+
+// GetStalePendingPayments lista pagos que llevan un rato en 'pending' y ya
+// tienen un external_id (la pasarela sí llegó a crear la sesión de pago) —
+// candidatos para que ReconcilePendingPayments vuelva a preguntarle a la
+// pasarela directamente, por si el webhook correspondiente nunca llegó o se
+// perdió (el proceso se cayó antes de terminar de procesarlo, por ejemplo).
+// El margen de 2 minutos evita reconciliar pagos que un cliente todavía
+// está completando en la pasarela.
+// LogWebhookEvent guarda de forma duradera cada webhook de pago recibido,
+// ANTES de intentar procesarlo — así, si el proceso se cae a mitad de
+// camino, queda registro de que la notificación llegó (útil para
+// diagnosticar: "¿nunca llegó el webhook, o llegó y algo falló después?").
+// No devuelve error al llamador si falla — nunca debe impedir que el
+// webhook responda 200 a la pasarela.
+func LogWebhookEvent(db *sql.DB, gateway, rawBody string) uuid.UUID {
+	id := uuid.New()
+	if _, err := db.Exec(`INSERT INTO webhook_events (id, gateway, raw_body, received_at) VALUES ($1,$2,$3,NOW())`,
+		id, gateway, rawBody); err != nil {
+		slog.Error("no se pudo registrar webhook_event", "gateway", gateway, "error", err)
+	}
+	return id
+}
+
+// MarkWebhookEventProcessed anota cómo terminó de procesarse un webhook ya
+// registrado con LogWebhookEvent — outcome es un texto corto y legible
+// ("credited", "ignored: not approved", "error: ...", etc.), no un código.
+func MarkWebhookEventProcessed(db *sql.DB, id uuid.UUID, outcome string) {
+	if _, err := db.Exec(`UPDATE webhook_events SET outcome=$1, processed_at=NOW() WHERE id=$2`, outcome, id); err != nil {
+		slog.Error("no se pudo actualizar webhook_event", "id", id, "error", err)
+	}
+}
+
+func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
+	rows, err := db.Query(`
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		FROM payment_transactions
+		WHERE status='pending' AND COALESCE(external_id,'') != '' AND created_at < NOW() - INTERVAL '2 minutes'
+		ORDER BY created_at ASC LIMIT 100`)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var txs []types.PaymentTransaction
+	for rows.Next() {
+		var t types.PaymentTransaction
+		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		txs = append(txs, t)
+	}
+	return txs, nil
 }
 
 func GetAllPaymentTransactions(db *sql.DB, page, limit int) ([]types.PaymentTransaction, int, error) {

@@ -321,6 +321,17 @@ func main() {
 		}
 	}()
 
+	// ── Conciliación de pagos pendientes con las pasarelas (red de seguridad
+	// para cuando un webhook nunca llega o se pierde en el camino) ──
+	go func() {
+		for {
+			time.Sleep(2 * time.Minute)
+			safe.Run("ReconcilePendingPayments", func() {
+				store.ReconcilePendingPayments(database)
+			})
+		}
+	}()
+
 	// ── Reset diario de gifts de bots (remaining_gifts vuelve a 5 cada día) ──
 	go func() {
 		for {

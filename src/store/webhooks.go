@@ -4,6 +4,7 @@ import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/safe"
+	"KidStoreStore/src/types"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -58,12 +59,97 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 	return nil
 }
 
+// ReconcilePendingPayments es la red de seguridad para cuando un webhook
+// nunca llega o se pierde en el camino — todos los webhooks de esta misma
+// familia responden "received: true" de inmediato y procesan en una
+// goroutine aparte (necesario para no bloquear la respuesta HTTP a la
+// pasarela), así que si el proceso se cae, o simplemente la notificación
+// nunca llega (problema de red del lado de la pasarela, por ejemplo), el
+// pago queda "pending" sin que nada vuelva a intentarlo — antes de esto,
+// solo MercadoPago tenía un mecanismo de repesca (el poll de
+// HandlerPaymentStatus), y solo mientras el cliente seguía mirando la
+// página. Se llama periódicamente desde main.go.
+func ReconcilePendingPayments(database *sql.DB) {
+	stale, err := db.GetStalePendingPayments(database)
+	if err != nil {
+		slog.Error("reconciliación de pagos: error listando pendientes", "error", err)
+		return
+	}
+	for _, p := range stale {
+		p := p
+		safe.Run("ReconcilePendingPayments."+p.Gateway, func() { reconcileOnePayment(database, p) })
+	}
+}
+
+func reconcileOnePayment(database *sql.DB, p types.PaymentTransaction) {
+	switch p.Gateway {
+	case "mercadopago":
+		approved, err := mercadoPagoStatusByReference(p.ID.String())
+		if err != nil {
+			slog.Warn("reconciliación MercadoPago falló", "txID", p.ID, "error", err)
+			return
+		}
+		if !approved {
+			return
+		}
+	case "paypal":
+		status, _, err := getPayPalOrder(p.ExternalID)
+		if err != nil {
+			slog.Warn("reconciliación PayPal falló", "txID", p.ID, "error", err)
+			return
+		}
+		if status == "APPROVED" {
+			// El cliente ya aprobó la orden en PayPal pero el webhook que
+			// dispara la captura nunca llegó — capturarla acá es lo mismo
+			// que hace HandlerPayPalWebhook al recibir CHECKOUT.ORDER.APPROVED.
+			if err := capturePayPalOrder(p.ExternalID); err != nil {
+				slog.Warn("reconciliación PayPal: captura falló", "txID", p.ID, "error", err)
+				return
+			}
+			status, _, err = getPayPalOrder(p.ExternalID)
+			if err != nil {
+				slog.Warn("reconciliación PayPal: re-consulta tras capturar falló", "txID", p.ID, "error", err)
+				return
+			}
+		}
+		if status != "COMPLETED" {
+			return
+		}
+	case "dlocalgo":
+		status, _, err := dlocalGoPaymentStatus(p.ExternalID)
+		if err != nil {
+			slog.Warn("reconciliación dLocal Go falló", "txID", p.ID, "error", err)
+			return
+		}
+		if status != "PAID" {
+			return
+		}
+	default:
+		// nowpayments: el external_id que guardamos es el ID de la FACTURA
+		// (invoice), no el del pago — la API de NOWPayments identifica los
+		// pagos por su propio ID, distinto y solo conocido cuando llega el
+		// IPN. Sin un ID de pago que consultar, no hay forma de reconciliar
+		// acá; ese gateway sigue dependiendo únicamente del webhook. Queda
+		// documentado como limitación conocida, no resuelto en silencio.
+		return
+	}
+	if err := processApprovedPayment(database, p.ID); err != nil {
+		slog.Error("reconciliación: error acreditando pago", "txID", p.ID, "gateway", p.Gateway, "error", err)
+	} else {
+		slog.Info("reconciliación: pago acreditado sin depender del webhook", "txID", p.ID, "gateway", p.Gateway)
+	}
+}
+
 // ==================== MERCADOPAGO WEBHOOK ====================
 
 func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, _ := io.ReadAll(c.Request.Body)
 		slog.Info("MercadoPago webhook received", "body", string(body))
+		// Registro duradero ANTES de intentar procesar nada — si el proceso
+		// se cae a mitad de camino, queda constancia de que la notificación
+		// sí llegó (ver ReconcilePendingPayments para la recuperación real).
+		eventID := db.LogWebhookEvent(database, "mercadopago", string(body))
 
 		var notification struct {
 			Type string `json:"type"`
@@ -72,12 +158,14 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(body, &notification); err != nil {
+			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON")
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
 
 		// Only process payment notifications
 		if notification.Type != "payment" {
+			db.MarkWebhookEventProcessed(database, eventID, "ignored: type="+notification.Type)
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
@@ -85,6 +173,9 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 		// Query MercadoPago API for payment details
 		paymentID := notification.Data.ID
 		go safe.Run("HandlerMercadoPagoWebhook", func() {
+			outcome := "ignored: not approved"
+			defer func() { db.MarkWebhookEventProcessed(database, eventID, outcome) }()
+
 			// paymentID viene tal cual de un webhook público sin firmar —
 			// cualquiera puede mandar este POST con lo que quiera en "data.id".
 			// Si se interpolara crudo en la URL, un valor con caracteres raros
@@ -96,6 +187,7 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 				"https://api.mercadopago.com/v1/payments/"+url.PathEscape(paymentID), nil)
 			if err != nil {
 				slog.Error("MP webhook: paymentID inválido, ignorando", "paymentID", paymentID, "error", err)
+				outcome = "error: invalid paymentID"
 				return
 			}
 			req.Header.Set("Authorization", "Bearer "+paymentCfg.MercadoPagoToken)
@@ -103,6 +195,7 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 			resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 			if err != nil {
 				slog.Error("MP payment query failed", "error", err)
+				outcome = "error: MP query failed"
 				return
 			}
 			defer resp.Body.Close()
@@ -120,11 +213,15 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 			txID, err := uuid.Parse(payment.ExternalReference)
 			if err != nil {
 				slog.Error("MP invalid external_reference", "ref", payment.ExternalReference)
+				outcome = "error: invalid external_reference"
 				return
 			}
 
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("MP payment processing failed", "txID", txID, "error", err)
+				outcome = "error: " + err.Error()
+			} else {
+				outcome = "processed"
 			}
 		})
 
@@ -138,6 +235,7 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, _ := io.ReadAll(c.Request.Body)
 		slog.Info("PayPal webhook received", "body", string(body))
+		eventID := db.LogWebhookEvent(database, "paypal", string(body))
 
 		var event struct {
 			EventType string `json:"event_type"`
@@ -151,22 +249,28 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 			} `json:"resource"`
 		}
 		if err := json.Unmarshal(body, &event); err != nil {
+			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON")
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
 
 		if event.EventType != "CHECKOUT.ORDER.APPROVED" && event.EventType != "PAYMENT.CAPTURE.COMPLETED" {
+			db.MarkWebhookEventProcessed(database, eventID, "ignored: event_type="+event.EventType)
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
 
 		go safe.Run("HandlerPayPalWebhook", func() {
+			outcome := "ignored: not completed"
+			defer func() { db.MarkWebhookEventProcessed(database, eventID, outcome) }()
+
 			orderID := event.Resource.ID
 			if event.EventType == "CHECKOUT.ORDER.APPROVED" {
 				// Capturar el pago — esto ya de por sí solo funciona si la orden
 				// es real y aprobada, PayPal la rechaza si no.
 				if err := capturePayPalOrder(orderID); err != nil {
 					slog.Error("PayPal capture failed", "orderID", orderID, "error", err)
+					outcome = "error: capture failed"
 					return
 				}
 			} else {
@@ -176,6 +280,7 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 			}
 			if orderID == "" {
 				slog.Warn("PayPal webhook sin order_id resoluble")
+				outcome = "error: no order_id"
 				return
 			}
 
@@ -187,6 +292,7 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 			status, refID, err := getPayPalOrder(orderID)
 			if err != nil {
 				slog.Error("PayPal order query failed", "orderID", orderID, "error", err)
+				outcome = "error: order query failed"
 				return
 			}
 			if status != "COMPLETED" {
@@ -194,17 +300,22 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 			}
 			if refID == "" {
 				slog.Warn("PayPal order sin reference_id", "orderID", orderID)
+				outcome = "error: no reference_id"
 				return
 			}
 
 			txID, err := uuid.Parse(refID)
 			if err != nil {
 				slog.Error("PayPal invalid reference_id", "ref", refID)
+				outcome = "error: invalid reference_id"
 				return
 			}
 
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("PayPal payment processing failed", "txID", txID, "error", err)
+				outcome = "error: " + err.Error()
+			} else {
+				outcome = "processed"
 			}
 		})
 
@@ -267,16 +378,21 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, _ := io.ReadAll(c.Request.Body)
 		slog.Info("NOWPayments webhook received", "body", string(body))
+		eventID := db.LogWebhookEvent(database, "nowpayments", string(body))
 
 		var notification struct {
 			PaymentID int64 `json:"payment_id"`
 		}
 		if err := json.Unmarshal(body, &notification); err != nil || notification.PaymentID == 0 {
+			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON or no payment_id")
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
 
 		go safe.Run("HandlerNOWPaymentsWebhook", func() {
+			outcome := "ignored: not confirmed"
+			defer func() { db.MarkWebhookEventProcessed(database, eventID, outcome) }()
+
 			// El IPN no viene firmado — no se le puede creer su "payment_status" ni
 			// su "order_id" a ciegas, cualquiera podría forjar este POST. Se vuelve
 			// a consultar el estado real directamente en la API de NOWPayments con
@@ -284,6 +400,7 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 			status, orderID, err := nowPaymentsStatus(notification.PaymentID)
 			if err != nil {
 				slog.Error("NOWPayments status query failed", "paymentID", notification.PaymentID, "error", err)
+				outcome = "error: status query failed"
 				return
 			}
 			if status != "confirmed" && status != "finished" {
@@ -293,11 +410,15 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 			txID, err := uuid.Parse(orderID)
 			if err != nil {
 				slog.Error("NOWPayments invalid order_id", "id", orderID)
+				outcome = "error: invalid order_id"
 				return
 			}
 
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("NOWPayments processing failed", "txID", txID, "error", err)
+				outcome = "error: " + err.Error()
+			} else {
+				outcome = "processed"
 			}
 		})
 
@@ -314,22 +435,29 @@ func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
 
 		if !verifyDLocalGoSignature(body, c.GetHeader("Authorization")) {
 			slog.Warn("dLocal Go webhook: firma inválida, ignorando")
+			db.LogWebhookEvent(database, "dlocalgo", string(body)) // queda constancia igual, aunque se ignore
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
+		eventID := db.LogWebhookEvent(database, "dlocalgo", string(body))
 
 		var notification struct {
 			PaymentID string `json:"payment_id"`
 		}
 		if err := json.Unmarshal(body, &notification); err != nil || notification.PaymentID == "" {
+			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON or no payment_id")
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
 
 		go safe.Run("HandlerDLocalGoWebhook", func() {
+			outcome := "ignored: not paid"
+			defer func() { db.MarkWebhookEventProcessed(database, eventID, outcome) }()
+
 			status, orderID, err := dlocalGoPaymentStatus(notification.PaymentID)
 			if err != nil {
 				slog.Error("dLocal Go status query failed", "paymentID", notification.PaymentID, "error", err)
+				outcome = "error: status query failed"
 				return
 			}
 			if status != "PAID" {
@@ -339,10 +467,14 @@ func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
 			txID, err := uuid.Parse(orderID)
 			if err != nil {
 				slog.Error("dLocal Go invalid order_id", "id", orderID)
+				outcome = "error: invalid order_id"
 				return
 			}
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("dLocal Go processing failed", "txID", txID, "error", err)
+				outcome = "error: " + err.Error()
+			} else {
+				outcome = "processed"
 			}
 		})
 

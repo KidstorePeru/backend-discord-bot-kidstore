@@ -234,25 +234,12 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 		if tx.Status == "pending" && tx.Gateway == "mercadopago" && tx.ExternalID != "" && paymentCfg.MercadoPagoToken != "" {
 			txID := tx.ID
 			go safe.Run("HandlerPaymentStatus.mercadopago-poll", func() {
-				// Check payments by external_reference
-				reqPay, err := http.NewRequest("GET",
-					"https://api.mercadopago.com/v1/payments/search?external_reference="+url.QueryEscape(txID.String()), nil)
+				approved, err := mercadoPagoStatusByReference(txID.String())
 				if err != nil {
-					slog.Error("MP status poll: error construyendo request", "error", err)
+					slog.Warn("MP status poll falló", "txID", txID, "error", err)
 					return
 				}
-				reqPay.Header.Set("Authorization", "Bearer "+paymentCfg.MercadoPagoToken)
-				client := &http.Client{Timeout: 10 * time.Second}
-				resp, err := client.Do(reqPay)
-				if err != nil { return }
-				defer resp.Body.Close()
-				var result struct {
-					Results []struct {
-						Status string `json:"status"`
-					} `json:"results"`
-				}
-				json.NewDecoder(resp.Body).Decode(&result)
-				if len(result.Results) > 0 && result.Results[0].Status == "approved" {
+				if approved {
 					processApprovedPayment(database, txID)
 				}
 			})
@@ -453,6 +440,46 @@ func createMercadoPagoPreference(tx db.PaymentTransactionInput) (string, string,
 	}
 	json.Unmarshal(respBody, &result)
 	return result.InitPoint, result.ID, nil
+}
+
+// mercadoPagoStatusByReference busca si existe un pago APROBADO en
+// MercadoPago para nuestro external_reference (nuestro propio UUID de
+// pago). Es la única forma confiable de reconciliar MercadoPago sin
+// esperar al webhook: el external_id que guardamos al crear el pago es el
+// ID de la PREFERENCIA (la sesión de checkout), no el del pago real —
+// ese solo existe y se conoce después de que el cliente paga. La búsqueda
+// por external_reference es lo que ya usaba el poll de HandlerPaymentStatus;
+// se extrajo acá para que ReconcilePendingPayments (webhooks.go) también
+// pueda reusarla.
+func mercadoPagoStatusByReference(txID string) (approved bool, err error) {
+	if paymentCfg.MercadoPagoToken == "" {
+		return false, fmt.Errorf("MercadoPago not configured")
+	}
+	req, err := http.NewRequest("GET",
+		"https://api.mercadopago.com/v1/payments/search?external_reference="+url.QueryEscape(txID), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+paymentCfg.MercadoPagoToken)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Results []struct {
+			Status string `json:"status"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+	for _, r := range result.Results {
+		if r.Status == "approved" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ==================== PAYPAL ====================
