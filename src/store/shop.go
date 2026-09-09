@@ -5,6 +5,7 @@ import (
 	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/fortnite"
 	"KidStoreStore/src/middleware"
+	"KidStoreStore/src/safe"
 	"KidStoreStore/src/types"
 	"context"
 	"database/sql"
@@ -493,7 +494,7 @@ func StartOrderWorker(ctx context.Context, database *sql.DB) {
 			case <-ticker.C:
 				inSchedule, reason := db.IsWithinSchedule(database)
 				if !inSchedule { slog.Info("Worker: pausado", "reason", reason); continue }
-				processOrders(database)
+				safe.Run("StartOrderWorker.processOrders", func() { processOrders(database) })
 			}
 		}
 	}()
@@ -523,7 +524,10 @@ func processOrders(database *sql.DB) {
 	}
 
 	for _, order := range orders {
-		processOrder(database, order, accounts)
+		o := order
+		// Un panic al procesar UN pedido (ej. datos raros del cliente) no
+		// debe frenar el resto del lote de este mismo ciclo.
+		safe.Run("processOrders.processOrder", func() { processOrder(database, o, accounts) })
 	}
 }
 

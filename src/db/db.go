@@ -2,6 +2,7 @@ package db
 
 import (
 	"KidStoreStore/src/crypto"
+	"KidStoreStore/src/safe"
 	"KidStoreStore/src/types"
 	cryptorand "crypto/rand"
 	"database/sql"
@@ -619,9 +620,22 @@ func GetPendingRegistrationByEmail(db *sql.DB, email string) (PendingRegistratio
 	return p, err
 }
 
-func UpdatePendingRegistrationToken(db *sql.DB, email, newToken string) {
-	db.Exec(`UPDATE pending_registrations SET verification_token=$1, expires_at=NOW() + INTERVAL '24 hours' WHERE email=$2`,
-		newToken, email)
+// UpdatePendingRegistrationToken reemplaza TODO el registro pendiente de un
+// email — no solo el token. Si alguien ya había dejado un registro
+// pendiente sin verificar para este correo (a propósito, con datos
+// ajenos — un usuario Epic o contraseña que no son los tuyos — o
+// simplemente porque lo abandonó a medias), y el dueño real del correo
+// intenta registrarse de nuevo, el intento MÁS RECIENTE debe ganar por
+// completo: usuario Epic, contraseña e idioma nuevos, no solo un token
+// nuevo sobre datos viejos. Sin esto, el correo de verificación le llega al
+// dueño real del correo, pero la cuenta que activa terminaría teniendo el
+// usuario/contraseña que haya elegido quien se registró primero — nunca
+// hay que asumir que el primer intento es el legítimo.
+func UpdatePendingRegistrationToken(db *sql.DB, epicUsername, email, passwordHash, newToken, lang string) {
+	db.Exec(`UPDATE pending_registrations
+		SET epic_username=$1, password_hash=$2, verification_token=$3, lang=$4, expires_at=NOW() + INTERVAL '24 hours'
+		WHERE email=$5`,
+		epicUsername, passwordHash, newToken, lang, email)
 }
 
 func DeletePendingRegistration(db *sql.DB, token string) {
@@ -1530,6 +1544,7 @@ func DeleteAllRefreshTokensForCustomer(db *sql.DB, customerID uuid.UUID) error {
 
 func AddAuditLog(db *sql.DB, customerID *uuid.UUID, action, details, ip string) {
 	go func() {
+		defer safe.Recover("AddAuditLog")
 		db.Exec(`INSERT INTO audit_logs (id, customer_id, action, details, ip_address, created_at) VALUES ($1,$2,$3,$4,$5,NOW())`,
 			uuid.New(), customerID, action, details, ip)
 	}()

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"KidStoreStore/src/safe"
 	"KidStoreStore/src/types"
 	"crypto/rand"
 	"crypto/sha256"
@@ -238,25 +239,32 @@ func NewIPRateLimiter(limit int, window time.Duration) *IPRateLimiter {
 	// Limpiar entradas viejas cada minuto
 	go func() {
 		for range time.Tick(time.Minute) {
-			now := time.Now()
-			r.mu.Lock()
-			for ip, times := range r.attempts {
-				var valid []time.Time
-				for _, t := range times {
-					if now.Sub(t) < r.window {
-						valid = append(valid, t)
-					}
-				}
-				if len(valid) == 0 {
-					delete(r.attempts, ip)
-				} else {
-					r.attempts[ip] = valid
-				}
-			}
-			r.mu.Unlock()
+			func() {
+				defer safe.Recover("IPRateLimiter.cleanup")
+				cleanupRateLimiter(r)
+			}()
 		}
 	}()
 	return r
+}
+
+func cleanupRateLimiter(r *IPRateLimiter) {
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for ip, times := range r.attempts {
+		var valid []time.Time
+		for _, t := range times {
+			if now.Sub(t) < r.window {
+				valid = append(valid, t)
+			}
+		}
+		if len(valid) == 0 {
+			delete(r.attempts, ip)
+		} else {
+			r.attempts[ip] = valid
+		}
+	}
 }
 
 func (r *IPRateLimiter) Allow(ip string) bool {

@@ -7,6 +7,7 @@ import (
 	"KidStoreStore/src/fortnite"
 	"KidStoreStore/src/middleware"
 	"KidStoreStore/src/oauth"
+	"KidStoreStore/src/safe"
 	"KidStoreStore/src/store"
 	"KidStoreStore/src/types"
 	"context"
@@ -310,23 +311,27 @@ func main() {
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
-			if n, err := db.ExpirePendingPayments(database); err != nil {
-				slog.Error("Error expirando pagos", "error", err)
-			} else if n > 0 {
-				slog.Info("Pagos pendientes expirados", "count", n)
-			}
+			safe.Run("ExpirePendingPayments", func() {
+				if n, err := db.ExpirePendingPayments(database); err != nil {
+					slog.Error("Error expirando pagos", "error", err)
+				} else if n > 0 {
+					slog.Info("Pagos pendientes expirados", "count", n)
+				}
+			})
 		}
 	}()
 
 	// ── Reset diario de gifts de bots (remaining_gifts vuelve a 5 cada día) ──
 	go func() {
 		for {
-			if n, err := db.ResetDailyGifts(database); err != nil {
-				slog.Error("Error reseteando gifts diarios", "error", err)
-			} else if n > 0 {
-				slog.Info("Gifts diarios reseteados", "cuentas", n)
-				discordbot.ClearAllNoGiftSlotsAlerts()
-			}
+			safe.Run("ResetDailyGifts", func() {
+				if n, err := db.ResetDailyGifts(database); err != nil {
+					slog.Error("Error reseteando gifts diarios", "error", err)
+				} else if n > 0 {
+					slog.Info("Gifts diarios reseteados", "cuentas", n)
+					discordbot.ClearAllNoGiftSlotsAlerts()
+				}
+			})
 			time.Sleep(10 * time.Minute)
 		}
 	}()

@@ -3,6 +3,7 @@ package store
 import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/middleware"
+	"KidStoreStore/src/safe"
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -230,10 +232,15 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 
 		// If payment is pending, check with MercadoPago directly (for localhost without webhooks)
 		if tx.Status == "pending" && tx.Gateway == "mercadopago" && tx.ExternalID != "" && paymentCfg.MercadoPagoToken != "" {
-			go func() {
+			txID := tx.ID
+			go safe.Run("HandlerPaymentStatus.mercadopago-poll", func() {
 				// Check payments by external_reference
-				reqPay, _ := http.NewRequest("GET",
-					"https://api.mercadopago.com/v1/payments/search?external_reference="+tx.ID.String(), nil)
+				reqPay, err := http.NewRequest("GET",
+					"https://api.mercadopago.com/v1/payments/search?external_reference="+url.QueryEscape(txID.String()), nil)
+				if err != nil {
+					slog.Error("MP status poll: error construyendo request", "error", err)
+					return
+				}
 				reqPay.Header.Set("Authorization", "Bearer "+paymentCfg.MercadoPagoToken)
 				client := &http.Client{Timeout: 10 * time.Second}
 				resp, err := client.Do(reqPay)
@@ -246,9 +253,9 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 				}
 				json.NewDecoder(resp.Body).Decode(&result)
 				if len(result.Results) > 0 && result.Results[0].Status == "approved" {
-					processApprovedPayment(database, tx.ID)
+					processApprovedPayment(database, txID)
 				}
-			}()
+			})
 		}
 
 		c.JSON(http.StatusOK, gin.H{"success": true, "transaction": tx})
@@ -559,7 +566,13 @@ func getPayPalOrder(orderID string) (status, referenceID string, err error) {
 		baseURL = "https://api-m.paypal.com"
 	}
 
-	req, _ := http.NewRequest("GET", baseURL+"/v2/checkout/orders/"+orderID, nil)
+	// orderID puede venir de un webhook público sin firmar, o del query
+	// param ?token= en /store/paypal-capture (nadie lo autentica antes de
+	// esta función) — nunca se interpola crudo en la URL.
+	req, err := http.NewRequest("GET", baseURL+"/v2/checkout/orders/"+url.PathEscape(orderID), nil)
+	if err != nil {
+		return "", "", fmt.Errorf("PayPal: orderID inválido: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
@@ -599,7 +612,10 @@ func capturePayPalOrder(orderID string) error {
 		baseURL = "https://api-m.paypal.com"
 	}
 
-	req, _ := http.NewRequest("POST", baseURL+"/v2/checkout/orders/"+orderID+"/capture", nil)
+	req, err := http.NewRequest("POST", baseURL+"/v2/checkout/orders/"+url.PathEscape(orderID)+"/capture", nil)
+	if err != nil {
+		return fmt.Errorf("PayPal: orderID inválido: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
@@ -624,7 +640,10 @@ func nowPaymentsStatus(paymentID int64) (status string, orderID string, err erro
 		return "", "", fmt.Errorf("NOWPayments not configured")
 	}
 
-	req, _ := http.NewRequest("GET", fmt.Sprintf("https://api.nowpayments.io/v1/payment/%d", paymentID), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://api.nowpayments.io/v1/payment/%d", paymentID), nil)
+	if err != nil {
+		return "", "", fmt.Errorf("NOWPayments: error construyendo request: %w", err)
+	}
 	req.Header.Set("x-api-key", paymentCfg.NOWPaymentsAPIKey)
 
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
@@ -777,7 +796,10 @@ func createDLocalGoPayment(tx db.PaymentTransactionInput) (string, string, error
 // ubicar la transacción interna sin necesitar una tabla de mapeo aparte —
 // igual que hace MercadoPago con su external_reference.
 func dlocalGoPaymentStatus(paymentID string) (status string, orderID string, err error) {
-	req, _ := http.NewRequest("GET", dlocalGoBaseURL()+"/v1/payments/"+paymentID, nil)
+	req, err := http.NewRequest("GET", dlocalGoBaseURL()+"/v1/payments/"+url.PathEscape(paymentID), nil)
+	if err != nil {
+		return "", "", fmt.Errorf("dLocal Go: paymentID inválido: %w", err)
+	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s:%s", paymentCfg.DLocalGoAPIKey, paymentCfg.DLocalGoSecretKey))
 
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)

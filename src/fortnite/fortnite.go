@@ -3,6 +3,7 @@ package fortnite
 import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/discordbot"
+	"KidStoreStore/src/safe"
 	"KidStoreStore/src/types"
 	"bytes"
 	"database/sql"
@@ -472,9 +473,17 @@ func executeWithRefresh(database *sql.DB, account types.GameAccount, req *http.R
 // Busca el accountId de un usuario Epic por su displayName y verifica amistad
 
 func GetReceiverAccountID(database *sql.DB, account types.GameAccount, displayName string) (string, error) {
-	req, _ := http.NewRequest("GET",
-		fmt.Sprintf("https://account-public-service-prod.ol.epicgames.com/account/api/public/account/displayName/%s", displayName),
+	// displayName lo escribe el cliente (usuario Epic de su cuenta, elegido
+	// al registrarse) — nunca se interpola crudo en una URL. url.PathEscape
+	// evita tanto que un caracter raro rompa el parseo de la URL (lo que
+	// dejaría req en nil y tumbaría el proceso más abajo) como que termine
+	// apuntando a otra ruta de la API de Epic por accidente.
+	req, err := http.NewRequest("GET",
+		"https://account-public-service-prod.ol.epicgames.com/account/api/public/account/displayName/"+url.PathEscape(displayName),
 		nil)
+	if err != nil {
+		return "", fmt.Errorf("usuario Epic inválido: %w", err)
+	}
 
 	resp, _, err := executeWithRefresh(database, account, req)
 	if err != nil {
@@ -497,10 +506,13 @@ func GetReceiverAccountID(database *sql.DB, account types.GameAccount, displayNa
 // CheckFriendship verifica si la cuenta bot ya es amiga del cliente y hace cuánto
 func CheckFriendship(database *sql.DB, account types.GameAccount, receiverAccountID string) (bool, time.Time, error) {
 	botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
-	req, _ := http.NewRequest("GET",
+	req, err := http.NewRequest("GET",
 		fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/friends/%s",
-			botIDClean, strings.ReplaceAll(receiverAccountID, "-", "")),
+			botIDClean, url.PathEscape(strings.ReplaceAll(receiverAccountID, "-", ""))),
 		nil)
+	if err != nil {
+		return false, time.Time{}, fmt.Errorf("error construyendo request de amistad: %w", err)
+	}
 
 	resp, _, err := executeWithRefresh(database, account, req)
 	if err != nil {
@@ -728,7 +740,7 @@ func StartFriendRequestAcceptor(database *sql.DB, intervalSeconds int) {
 		ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			acceptPendingFriendRequests(database)
+			safe.Run("StartFriendRequestAcceptor", func() { acceptPendingFriendRequests(database) })
 		}
 	}()
 	slog.Info("Bots: auto-aceptar solicitudes de amistad", "intervalSeconds", intervalSeconds)
@@ -740,32 +752,49 @@ func acceptPendingFriendRequests(database *sql.DB) {
 		return
 	}
 
-	for _, account := range accounts {
-		botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
-		req, _ := http.NewRequest("GET",
-			fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/incoming", botIDClean),
-			nil)
+	for _, acc := range accounts {
+		account := acc
+		func() {
+			defer safe.Recover("acceptPendingFriendRequests." + account.DisplayName)
 
-		resp, _, err := executeWithRefresh(database, account, req)
-		if err != nil {
-			continue
-		}
-
-		var incoming []types.EpicFriendEntry
-		json.NewDecoder(resp.Body).Decode(&incoming)
-		resp.Body.Close()
-
-		for _, friend := range incoming {
-			acceptReq, _ := http.NewRequest("POST",
-				fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/friends/%s",
-					botIDClean, friend.AccountId),
+			botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
+			req, err := http.NewRequest("GET",
+				fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/incoming", botIDClean),
 				nil)
-			acceptResp, _, err := executeWithRefresh(database, account, acceptReq)
-			if err == nil {
-				acceptResp.Body.Close()
-				slog.Info("Bots: solicitud aceptada", "friendAccountId", friend.AccountId, "bot", account.DisplayName)
+			if err != nil {
+				slog.Error("Bots: error construyendo request de solicitudes", "bot", account.DisplayName, "error", err)
+				return
 			}
-		}
+
+			resp, _, err := executeWithRefresh(database, account, req)
+			if err != nil {
+				return
+			}
+
+			var incoming []types.EpicFriendEntry
+			json.NewDecoder(resp.Body).Decode(&incoming)
+			resp.Body.Close()
+
+			for _, friend := range incoming {
+				// friend.AccountId viene de la propia API de Epic (no es
+				// input externo directo), pero igual se valida el error de
+				// NewRequest por las dudas — nunca hay que asumir que
+				// construir una URL no puede fallar.
+				acceptReq, err := http.NewRequest("POST",
+					fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/friends/%s",
+						botIDClean, url.PathEscape(friend.AccountId)),
+					nil)
+				if err != nil {
+					slog.Error("Bots: error construyendo request de aceptar amistad", "bot", account.DisplayName, "error", err)
+					continue
+				}
+				acceptResp, _, err := executeWithRefresh(database, account, acceptReq)
+				if err == nil {
+					acceptResp.Body.Close()
+					slog.Info("Bots: solicitud aceptada", "friendAccountId", friend.AccountId, "bot", account.DisplayName)
+				}
+			}
+		}()
 	}
 }
 
@@ -776,7 +805,7 @@ func StartFriendship48hChecker(database *sql.DB, intervalSeconds int) {
 		ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			checkFriendship48h(database)
+			safe.Run("StartFriendship48hChecker", func() { checkFriendship48h(database) })
 		}
 	}()
 	slog.Info("Bots: verificación de 48h de amistad", "intervalSeconds", intervalSeconds)

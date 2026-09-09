@@ -63,8 +63,14 @@ func HandlerRegister(database *sql.DB, secretKey string, cfg types.EnvConfig) gi
 		if lang == "" { lang = "es" }
 		if err := db.CreatePendingRegistration(database, req.EpicUsername, req.Email, string(hash), verificationToken, lang); err != nil {
 			if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
-				// Ya hay un registro pendiente — reenviar el email
-				db.UpdatePendingRegistrationToken(database, req.Email, verificationToken)
+				// Ya había un registro pendiente sin verificar para este correo
+				// (de este mismo intento anterior, o de alguien más que lo dejó a
+				// medias con otros datos) — el intento actual reemplaza TODO el
+				// registro pendiente (usuario, contraseña, idioma, token), no
+				// solo el token. Así, quien complete la verificación en su bandeja
+				// de entrada real siempre activa la cuenta con los datos que
+				// ACABA de elegir, nunca con los de un intento anterior ajeno.
+				db.UpdatePendingRegistrationToken(database, req.EpicUsername, req.Email, string(hash), verificationToken, lang)
 			} else {
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error al iniciar registro"})
 				return
@@ -200,7 +206,10 @@ func HandlerResendVerification(database *sql.DB, cfg types.EnvConfig) gin.Handle
 			tokenBytes := make([]byte, 32)
 			rand.Read(tokenBytes)
 			newToken := hex.EncodeToString(tokenBytes)
-			db.UpdatePendingRegistrationToken(database, body.Email, newToken)
+			// Reenvío del mismo registro pendiente sin cambios — se pasan de
+			// vuelta su propio usuario/contraseña/idioma ya guardados, solo se
+			// renueva el token y la expiración.
+			db.UpdatePendingRegistrationToken(database, pending.EpicUsername, body.Email, pending.PasswordHash, newToken, body.Lang)
 			go sendVerificationEmail(cfg, body.Email, newToken, pending.EpicUsername, body.Lang)
 			c.JSON(http.StatusOK, gin.H{"success": true, "message": genericMsg})
 			return

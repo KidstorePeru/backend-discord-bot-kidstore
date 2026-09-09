@@ -3,12 +3,14 @@ package store
 import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/discordbot"
+	"KidStoreStore/src/safe"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -93,10 +95,21 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 		}
 
 		// Query MercadoPago API for payment details
-		go func() {
-			paymentID := notification.Data.ID
-			req, _ := http.NewRequest("GET",
-				fmt.Sprintf("https://api.mercadopago.com/v1/payments/%s", paymentID), nil)
+		paymentID := notification.Data.ID
+		go safe.Run("HandlerMercadoPagoWebhook", func() {
+			// paymentID viene tal cual de un webhook público sin firmar —
+			// cualquiera puede mandar este POST con lo que quiera en "data.id".
+			// Si se interpolara crudo en la URL, un valor con caracteres raros
+			// podría hacer que http.NewRequest fallara y dejara req en nil —
+			// eso, sin chequear el error, tumbaba el proceso entero (sin
+			// necesitar ninguna autenticación). url.PathEscape más el chequeo
+			// de error cierran las dos puntas del problema.
+			req, err := http.NewRequest("GET",
+				"https://api.mercadopago.com/v1/payments/"+url.PathEscape(paymentID), nil)
+			if err != nil {
+				slog.Error("MP webhook: paymentID inválido, ignorando", "paymentID", paymentID, "error", err)
+				return
+			}
 			req.Header.Set("Authorization", "Bearer "+paymentCfg.MercadoPagoToken)
 
 			resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
@@ -125,7 +138,7 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("MP payment processing failed", "txID", txID, "error", err)
 			}
-		}()
+		})
 
 		c.JSON(http.StatusOK, gin.H{"received": true})
 	}
@@ -159,7 +172,7 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		go func() {
+		go safe.Run("HandlerPayPalWebhook", func() {
 			orderID := event.Resource.ID
 			if event.EventType == "CHECKOUT.ORDER.APPROVED" {
 				// Capturar el pago — esto ya de por sí solo funciona si la orden
@@ -205,7 +218,7 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("PayPal payment processing failed", "txID", txID, "error", err)
 			}
-		}()
+		})
 
 		c.JSON(http.StatusOK, gin.H{"received": true})
 	}
@@ -275,7 +288,7 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		go func() {
+		go safe.Run("HandlerNOWPaymentsWebhook", func() {
 			// El IPN no viene firmado — no se le puede creer su "payment_status" ni
 			// su "order_id" a ciegas, cualquiera podría forjar este POST. Se vuelve
 			// a consultar el estado real directamente en la API de NOWPayments con
@@ -298,7 +311,7 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("NOWPayments processing failed", "txID", txID, "error", err)
 			}
-		}()
+		})
 
 		c.JSON(http.StatusOK, gin.H{"received": true})
 	}
@@ -325,7 +338,7 @@ func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		go func() {
+		go safe.Run("HandlerDLocalGoWebhook", func() {
 			status, orderID, err := dlocalGoPaymentStatus(notification.PaymentID)
 			if err != nil {
 				slog.Error("dLocal Go status query failed", "paymentID", notification.PaymentID, "error", err)
@@ -343,7 +356,7 @@ func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
 			if err := processApprovedPayment(database, txID); err != nil {
 				slog.Error("dLocal Go processing failed", "txID", txID, "error", err)
 			}
-		}()
+		})
 
 		c.JSON(http.StatusOK, gin.H{"received": true})
 	}
