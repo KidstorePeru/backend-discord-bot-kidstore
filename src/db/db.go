@@ -336,6 +336,23 @@ func CreateTables(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_complaints_reference ON consumer_complaints(reference)`,
 		`CREATE INDEX IF NOT EXISTS idx_complaints_status ON consumer_complaints(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_complaints_email ON consumer_complaints(email)`,
+		// 2FA (TOTP) para cuentas admin — el secreto se guarda cifrado (igual
+		// que los tokens de las cuentas bot) y totp_enabled solo pasa a true
+		// tras confirmar un código real durante la activación.
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='customers' AND column_name='totp_secret_enc') THEN
+				ALTER TABLE customers ADD COLUMN totp_secret_enc TEXT;
+				ALTER TABLE customers ADD COLUMN totp_enabled BOOLEAN NOT NULL DEFAULT false;
+			END IF;
+		END $$`,
+		`CREATE TABLE IF NOT EXISTS admin_backup_codes (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+			code_hash VARCHAR(255) NOT NULL,
+			used_at TIMESTAMP,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_backup_codes_customer ON admin_backup_codes(customer_id)`,
 	}
 
 	for _, q := range queries {
@@ -637,11 +654,11 @@ func GetCustomerByEpicUsername(db *sql.DB, epicUsername string) (types.Customer,
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
 		FROM customers WHERE LOWER(epic_username) = LOWER($1) AND is_active = true`, epicUsername).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -673,11 +690,11 @@ func GetCustomerByEmail(db *sql.DB, email string) (types.Customer, error) {
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
 		FROM customers WHERE email = $1 AND is_active = true`, email).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -686,11 +703,11 @@ func GetCustomerByID(db *sql.DB, id uuid.UUID) (types.Customer, error) {
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
 		FROM customers WHERE id = $1 AND is_active = true`, id).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -699,11 +716,11 @@ func GetCustomerByGoogleID(db *sql.DB, googleID string) (types.Customer, error) 
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
 		FROM customers WHERE google_id = $1 AND is_active = true`, googleID).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -712,11 +729,11 @@ func GetCustomerByDiscordID(db *sql.DB, discordID string) (types.Customer, error
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
 		FROM customers WHERE discord_id = $1 AND is_active = true`, discordID).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -761,7 +778,7 @@ func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error)
 		var c types.Customer
 		if err := rows.Scan(&c.ID, &c.EpicUsername, &c.Email, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		customers = append(customers, c)
@@ -1584,6 +1601,110 @@ func GetPaymentByID(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, error) 
 func SetCustomerAdmin(db *sql.DB, customerID uuid.UUID, isAdmin bool) error {
 	_, err := db.Exec(`UPDATE customers SET is_admin=$1, updated_at=NOW() WHERE id=$2`, isAdmin, customerID)
 	return err
+}
+
+// ==================== 2FA (TOTP) ====================
+
+// SetPendingTOTPSecret guarda un secreto TOTP recién generado, todavía sin
+// confirmar (totp_enabled sigue en false hasta que HandlerConfirm2FA valide
+// un código real generado con ese secreto).
+func SetPendingTOTPSecret(db *sql.DB, customerID uuid.UUID, encSecret string) error {
+	_, err := db.Exec(`UPDATE customers SET totp_secret_enc=$1, totp_enabled=false, updated_at=NOW() WHERE id=$2`, encSecret, customerID)
+	return err
+}
+
+func EnableTOTP(db *sql.DB, customerID uuid.UUID) error {
+	_, err := db.Exec(`UPDATE customers SET totp_enabled=true, updated_at=NOW() WHERE id=$1`, customerID)
+	return err
+}
+
+// DisableTOTP apaga el 2FA y borra tanto el secreto como los códigos de
+// respaldo — si se vuelve a activar más adelante, empieza de cero.
+func DisableTOTP(db *sql.DB, customerID uuid.UUID) error {
+	tx, err := db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE customers SET totp_enabled=false, totp_secret_enc=NULL, updated_at=NOW() WHERE id=$1`, customerID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM admin_backup_codes WHERE customer_id=$1`, customerID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CreateBackupCodes reemplaza los códigos de respaldo existentes (si los
+// había) por un lote nuevo — se llama una sola vez, justo al confirmar la
+// activación del 2FA.
+func CreateBackupCodes(db *sql.DB, customerID uuid.UUID, hashes []string) error {
+	tx, err := db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM admin_backup_codes WHERE customer_id=$1`, customerID); err != nil {
+		return err
+	}
+	for _, h := range hashes {
+		if _, err := tx.Exec(`INSERT INTO admin_backup_codes (id, customer_id, code_hash, created_at) VALUES ($1,$2,$3,NOW())`,
+			uuid.New(), customerID, h); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ConsumeBackupCode marca un código de respaldo como usado, atómicamente —
+// solo funciona una vez por código. Devuelve false si el código no existe,
+// no le pertenece a este cliente, o ya se usó antes.
+func ConsumeBackupCode(db *sql.DB, customerID uuid.UUID, codeHash string) (bool, error) {
+	result, err := db.Exec(`
+		UPDATE admin_backup_codes SET used_at=NOW()
+		WHERE customer_id=$1 AND code_hash=$2 AND used_at IS NULL`, customerID, codeHash)
+	if err != nil { return false, err }
+	n, err := result.RowsAffected()
+	return n > 0, err
+}
+
+func CountUnusedBackupCodes(db *sql.DB, customerID uuid.UUID) (int, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM admin_backup_codes WHERE customer_id=$1 AND used_at IS NULL`, customerID).Scan(&count)
+	return count, err
+}
+
+// ==================== ELIMINAR CUENTA PROPIA ====================
+
+// DeleteOwnAccount "elimina" la cuenta de un cliente a petición propia. No
+// hace un DELETE físico de la fila: la tabla orders referencia customers
+// SIN cascada (a propósito — son el registro de compras reales ya
+// entregadas), así que un DELETE directo fallaría por la restricción de
+// llave foránea en cuanto el cliente tuviera algún pedido. En cambio, se
+// anonimiza: se borran todos los datos personales identificables (email,
+// usuario Epic, vínculos de OAuth, teléfono, avatar, contraseña, 2FA) y se
+// desactiva la cuenta, dejando intacto el historial de pedidos/pagos para
+// fines contables, pero ya sin poder asociarlo a una persona identificable
+// ni volver a iniciar sesión con esos datos.
+func DeleteOwnAccount(db *sql.DB, customerID uuid.UUID) error {
+	suffix := customerID.String()[:8]
+	anonEmail := fmt.Sprintf("eliminado-%s@kidstoreperu.invalid", suffix)
+	anonUsername := "usuario_eliminado_" + suffix
+
+	tx, err := db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		UPDATE customers SET
+			email=$1, epic_username=$2, password_hash='', has_password=false,
+			google_id=NULL, discord_id=NULL, discord_username=NULL,
+			avatar_url=NULL, phone=NULL, totp_secret_enc=NULL, totp_enabled=false,
+			is_active=false, updated_at=NOW()
+		WHERE id=$3`,
+		anonEmail, anonUsername, customerID)
+	if err != nil { return err }
+
+	if _, err := tx.Exec(`DELETE FROM refresh_tokens WHERE customer_id=$1`, customerID); err != nil { return err }
+	if _, err := tx.Exec(`DELETE FROM admin_backup_codes WHERE customer_id=$1`, customerID); err != nil { return err }
+
+	return tx.Commit()
 }
 
 // ==================== LIBRO DE RECLAMACIONES ====================

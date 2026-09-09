@@ -93,8 +93,14 @@ type Customer struct {
 	IsActive        bool       `json:"is_active"`
 	IsVerified      bool       `json:"is_verified"`
 	IsAdmin         bool       `json:"is_admin"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	// TOTPSecretEnc: secreto TOTP cifrado (igual que los tokens de las
+	// cuentas bot, con crypto.Encrypt) — nunca se serializa a JSON.
+	// TOTPEnabled: solo pasa a true después de confirmar el código una vez
+	// durante la activación (mientras tanto el secreto queda "pendiente").
+	TOTPSecretEnc *string   `json:"-"`
+	TOTPEnabled   bool      `json:"-"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // EmailChangeCooldown es el tiempo minimo que debe pasar entre dos cambios de email.
@@ -127,7 +133,7 @@ func (c Customer) Public() CustomerPublic {
 		AvatarURL: c.AvatarURL, Phone: c.Phone, HasPassword: c.HasPassword,
 		GoogleLinked: c.GoogleID != nil, DiscordLinked: c.DiscordID != nil, DiscordUsername: c.DiscordUsername,
 		NextEmailChangeAt: c.NextEmailChangeAt(),
-		IsVerified:        c.IsVerified, IsAdmin: c.IsAdmin, CreatedAt: c.CreatedAt,
+		IsVerified:        c.IsVerified, IsAdmin: c.IsAdmin, TOTPEnabled: c.TOTPEnabled, CreatedAt: c.CreatedAt,
 	}
 }
 
@@ -416,6 +422,7 @@ type CustomerPublic struct {
 	NextEmailChangeAt *time.Time `json:"next_email_change_at,omitempty"`
 	IsVerified        bool       `json:"is_verified"`
 	IsAdmin           bool       `json:"is_admin"`
+	TOTPEnabled       bool       `json:"totp_enabled"`
 	CreatedAt         time.Time  `json:"created_at"`
 }
 

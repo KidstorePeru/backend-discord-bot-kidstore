@@ -119,6 +119,24 @@ func redirectLinkError(c *gin.Context, frontendURL, provider, reason string) {
 }
 
 func issueLoginRedirect(c *gin.Context, database *sql.DB, cfg Config, customer types.Customer) {
+	// Cuenta admin con 2FA activado → el login por OAuth NO puede saltarse
+	// el segundo factor (si pudiera, el 2FA de la contraseña sería
+	// decorativo). Se redirige con un token temporal en vez del real, y el
+	// frontend pide el código antes de completar la sesión — mismo
+	// mecanismo que el login por contraseña en HandlerLogin.
+	if customer.IsAdmin && customer.TOTPEnabled {
+		tempToken, err := middleware.Generate2FAPendingToken(customer.ID.String(), cfg.SecretKey)
+		if err != nil {
+			redirectError(c, cfg.FrontendURL, "token_error")
+			return
+		}
+		db.AddAuditLog(database, &customer.ID, "LOGIN_2FA_PENDING", "OAuth correcto, esperando código 2FA", c.ClientIP())
+		redirectURL := fmt.Sprintf("%s/auth/callback?requires_2fa=true&temp_token=%s",
+			cfg.FrontendURL, url.QueryEscape(tempToken))
+		c.Redirect(http.StatusFound, redirectURL)
+		return
+	}
+
 	token, err := middleware.GenerateCustomerToken(customer, cfg.SecretKey)
 	if err != nil {
 		redirectError(c, cfg.FrontendURL, "token_error")

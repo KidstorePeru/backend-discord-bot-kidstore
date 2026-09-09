@@ -348,6 +348,20 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 			return
 		}
 
+		// Cuenta admin con 2FA activado → todavía no se entrega el token
+		// real. Solo un token temporal (5 min) que sirve únicamente para
+		// completar la verificación en /store/login/2fa.
+		if customer.IsAdmin && customer.TOTPEnabled {
+			tempToken, err := middleware.Generate2FAPendingToken(customer.ID.String(), secretKey)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error interno"})
+				return
+			}
+			db.AddAuditLog(database, &customer.ID, "LOGIN_2FA_PENDING", "contraseña correcta, esperando código 2FA", c.ClientIP())
+			c.JSON(http.StatusOK, gin.H{"success": true, "requires_2fa": true, "temp_token": tempToken})
+			return
+		}
+
 		token, err := middleware.GenerateCustomerToken(customer, secretKey)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error generando token"})
@@ -605,6 +619,64 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 			"token":    token,
 			"customer": updatedCustomer.Public(),
 		})
+	}
+}
+
+// ==================== ELIMINAR CUENTA PROPIA ====================
+
+// HandlerDeleteOwnAccount permite a un cliente eliminar su propia cuenta.
+// Exige la contraseña actual (mismo motivo que HandlerDisable2FA: un JWT
+// robado por sí solo no debe poder borrar la cuenta). Cuentas creadas solo
+// por OAuth (sin contraseña) confirman con el código que ya reciben para
+// cambios sensibles — por ahora, mientras no tengan contraseña, deben
+// contactar a soporte para eliminar su cuenta.
+func HandlerDeleteOwnAccount(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		var req struct {
+			Password string `json:"password" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		customer, err := db.GetCustomerByID(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado"})
+			return
+		}
+		if !customer.HasPassword {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "tu cuenta no tiene contraseña (creada por Google/Discord) — contáctanos por soporte para eliminarla"})
+			return
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(customer.PasswordHash), []byte(req.Password)); err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "contraseña incorrecta"})
+			return
+		}
+		if customer.IsAdmin {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "las cuentas admin no pueden autoeliminarse — contáctanos por soporte"})
+			return
+		}
+
+		if err := db.DeleteOwnAccount(database, customerID); err != nil {
+			slog.Error("Error eliminando cuenta propia", "customer", customerID, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error eliminando la cuenta, contáctanos por soporte"})
+			return
+		}
+		db.AddAuditLog(database, nil, "ACCOUNT_SELF_DELETED",
+			fmt.Sprintf("cuenta %s eliminada por su propio dueño", customer.EpicUsername), c.ClientIP())
+
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "tu cuenta fue eliminada"})
 	}
 }
 

@@ -33,6 +33,50 @@ func GenerateCustomerToken(customer types.Customer, secretKey string) (string, e
 	return token.SignedString([]byte(secretKey))
 }
 
+// Generate2FAPendingToken se emite tras validar email+contraseña de una
+// cuenta admin con 2FA activado, ANTES de dar acceso real — solo prueba
+// "ya pasé el primer factor", nada más. Deliberadamente NO lleva
+// is_customer:true ni is_admin, así que ParseCustomerToken y todo el resto
+// de middlewares de auth lo rechazan; solo Parse2FAPendingToken lo entiende.
+// Vive apenas 5 minutos.
+func Generate2FAPendingToken(customerID string, secretKey string) (string, error) {
+	claims := jwt.MapClaims{
+		"customer_id": customerID,
+		"purpose":     "2fa_pending",
+		"exp":         time.Now().Add(5 * time.Minute).Unix(),
+		"iat":         time.Now().Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(secretKey))
+}
+
+// Parse2FAPendingToken valida y extrae el customer_id de un token generado
+// por Generate2FAPendingToken. Exige el mismo método de firma HMAC explícito
+// que ParseCustomerToken, por la misma razón (nunca confiar en "alg" del token).
+func Parse2FAPendingToken(tokenStr, secretKey string) (string, error) {
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("método de firma inválido")
+		}
+		return []byte(secretKey), nil
+	})
+	if err != nil || !token.Valid {
+		return "", fmt.Errorf("token inválido o expirado")
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", fmt.Errorf("claims inválidos")
+	}
+	if purpose, _ := claims["purpose"].(string); purpose != "2fa_pending" {
+		return "", fmt.Errorf("token no es de verificación 2FA")
+	}
+	customerID, _ := claims["customer_id"].(string)
+	if customerID == "" {
+		return "", fmt.Errorf("token sin customer_id")
+	}
+	return customerID, nil
+}
+
 // GenerateRefreshToken generates a random refresh token.
 // Returns the plaintext token (to send to client) and its SHA-256 hash (to store in DB).
 func GenerateRefreshToken() (plaintext string, hash string, err error) {

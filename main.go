@@ -192,6 +192,7 @@ func main() {
 		authGroup.POST("/resend-verification", store.HandlerResendVerification(database, cfg))
 		authGroup.POST("/refresh-token",      store.HandlerRefreshToken(database, cfg.SecretKey))
 		authGroup.POST("/logout",             store.HandlerLogout(database))
+		authGroup.POST("/login/2fa",          store.HandlerLoginVerify2FA(database, cfg.SecretKey))
 	}
 
 	// ── OAuth: login/registro con Google y Discord (con rate limit) ──
@@ -262,6 +263,11 @@ func main() {
 		customer.POST("/email/confirm-change", middleware.RateLimitMiddleware(authLimiter), store.HandlerConfirmEmailChange(database, cfg.SecretKey))
 		customer.POST("/link/:provider/start", oauth.HandlerStartLink(oauthCfg))
 		customer.DELETE("/link/:provider",     oauth.HandlerUnlinkProvider(database))
+		customer.POST("/2fa/setup",         store.HandlerSetup2FA(database))
+		customer.POST("/2fa/confirm",       store.HandlerConfirm2FA(database))
+		customer.POST("/2fa/disable",       store.HandlerDisable2FA(database))
+		customer.GET("/2fa/status",         store.HandlerGet2FAStatus(database))
+		customer.DELETE("/account",         middleware.RateLimitMiddleware(authLimiter), store.HandlerDeleteOwnAccount(database))
 		customer.POST("/order",
 			middleware.RateLimitMiddleware(orderLimiter),
 			store.HandlerCreateOrder(database),
