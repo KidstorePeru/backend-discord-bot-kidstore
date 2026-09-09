@@ -263,9 +263,9 @@ func main() {
 		customer.POST("/email/confirm-change", middleware.RateLimitMiddleware(authLimiter), store.HandlerConfirmEmailChange(database, cfg.SecretKey))
 		customer.POST("/link/:provider/start", oauth.HandlerStartLink(oauthCfg))
 		customer.DELETE("/link/:provider",     oauth.HandlerUnlinkProvider(database))
-		customer.POST("/2fa/setup",         store.HandlerSetup2FA(database))
-		customer.POST("/2fa/confirm",       store.HandlerConfirm2FA(database))
-		customer.POST("/2fa/disable",       store.HandlerDisable2FA(database))
+		customer.POST("/2fa/setup",         middleware.RateLimitMiddleware(authLimiter), store.HandlerSetup2FA(database))
+		customer.POST("/2fa/confirm",       middleware.RateLimitMiddleware(authLimiter), store.HandlerConfirm2FA(database))
+		customer.POST("/2fa/disable",       middleware.RateLimitMiddleware(authLimiter), store.HandlerDisable2FA(database))
 		customer.GET("/2fa/status",         store.HandlerGet2FAStatus(database))
 		customer.DELETE("/account",         middleware.RateLimitMiddleware(authLimiter), store.HandlerDeleteOwnAccount(database))
 		customer.POST("/order",

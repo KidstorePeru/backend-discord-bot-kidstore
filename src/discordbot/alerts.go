@@ -108,7 +108,7 @@ func CheckVBucksAlert(botID uuid.UUID, displayName string, vbucks int) {
 		if shouldAlert(zeroKey) {
 			sendAdminAlert(
 				"🔴 Bot sin V-Bucks: "+displayName,
-				fmt.Sprintf("**%s** se quedó en **0 V-Bucks**. No puede enviar ningún regalo pagado hasta que le cargues más.\n\nLos pedidos que le toquen fallarán automáticamente (el cliente recibe su KC de vuelta), pero mejor evitarlo cargándole pavos ahora.", displayName),
+				fmt.Sprintf("**%s** se quedó en **0 V-Bucks**. No puede enviar ningún regalo pagado hasta que le cargues más.\n\nLos pedidos que le toquen automáticamente pasan a probar otro bot con fondos — no se cancelan por esto solo. Si **ningún** bot tiene fondos suficientes para un pedido, recién ahí te avisamos aparte y el pedido queda pendiente (nunca se cancela, se reintenta solo apenas recargues a alguno). De todos modos, mejor evitarlo cargándole pavos ahora.", displayName),
 				colorAlert,
 			)
 			slog.Info("Discord alert: bot sin V-Bucks", "bot", displayName)

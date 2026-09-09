@@ -594,6 +594,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 	activeBots := 0
 	notFriendBots := 0
 	anyGiftLimit := false
+	insufficientFundsBots := 0
 
 	// ── Loop interno: probar cada bot en orden ──
 	for i := range accounts {
@@ -607,6 +608,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		if bot.VBucks < order.PriceVBucks {
 			slog.Info("Worker: bot sin V-Bucks suficientes, probando siguiente",
 				"bot", bot.DisplayName, "tiene", bot.VBucks, "necesita", order.PriceVBucks)
+			insufficientFundsBots++
 			continue
 		}
 		activeBots++
@@ -651,6 +653,13 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 				if deductErr := db.DeductBotVbucks(database, bot.ID, order.PriceVBucks); deductErr != nil {
 					slog.Warn("Worker: error descontando pavos del bot", "bot", bot.DisplayName, "error", deductErr)
 				} else {
+					// Reflejar el descuento también en memoria (igual que ya se
+					// hace con RemainingGifts) — accounts se reutiliza para el
+					// resto de pedidos de este mismo ciclo de processOrders, así
+					// que si no se actualiza acá, un segundo pedido caro de este
+					// mismo ciclo podría creer que el bot todavía tiene fondos
+					// que en la base de datos ya se gastaron.
+					bot.VBucks -= order.PriceVBucks
 					slog.Info("Worker: pavos descontados", "vbucks", order.PriceVBucks, "bot", bot.DisplayName)
 				}
 			}
@@ -752,6 +761,16 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
 			fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, errMsg), "worker")
 		notifyOrderFailed(database, order, "Tu cuenta de Epic Games no es amiga de ninguno de nuestros bots todavía. Agrega alguno desde la página de Bots y vuelve a intentar tu compra.")
+	} else if activeBots == 0 && insufficientFundsBots > 0 {
+		// Ningún bot con slots tenía V-Bucks suficientes para este pedido en
+		// particular — no es que no haya bots, es que ninguno tiene fondos
+		// para ESTE monto. Se avisa (con el mismo cooldown que "sin bots
+		// disponibles", para no saturar si hay varios pedidos caros en cola)
+		// y se mantiene "pending" para reintentar en cuanto se recarguen.
+		noFundsMsg := "Ningún bot tiene V-Bucks suficientes para este pedido en este momento."
+		slog.Warn("Worker: ningún bot con fondos suficientes", "orderID", order.ID, "necesita", order.PriceVBucks)
+		discordbot.AlertNoActiveBots(1)
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noFundsMsg)
 	} else {
 		// Otro motivo (ej: amistad reciente en todos los bots) → mantener pending
 		slog.Warn("Worker: ningún bot pudo enviar el regalo en este ciclo, reintentando", "orderID", order.ID)

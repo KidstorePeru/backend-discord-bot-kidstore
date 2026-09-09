@@ -6,17 +6,18 @@ import (
 	"KidStoreStore/src/middleware"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -165,7 +166,7 @@ func HandlerConfirm2FA(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error leyendo secreto"})
 			return
 		}
-		if !validateTOTPCode(strings.TrimSpace(req.Code), secret) {
+		if !validateTOTPCode(customerID, strings.TrimSpace(req.Code), secret) {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "código incorrecto, verifica la hora de tu teléfono e intenta de nuevo"})
 			return
 		}
@@ -185,6 +186,11 @@ func HandlerConfirm2FA(database *sql.DB) gin.HandlerFunc {
 		}
 
 		db.AddAuditLog(database, &customerID, "2FA_ENABLED", "activó verificación en dos pasos", c.ClientIP())
+		if customer.Email != nil && *customer.Email != "" {
+			lang := c.GetHeader("X-Lang")
+			if lang == "" { lang = "es" }
+			go sendTwoFactorEnabledEmail(smtpConfig, *customer.Email, customer.EpicUsername, lang)
+		}
 
 		c.JSON(http.StatusOK, gin.H{
 			"success":      true,
@@ -230,6 +236,11 @@ func HandlerDisable2FA(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 		db.AddAuditLog(database, &customerID, "2FA_DISABLED", "desactivó verificación en dos pasos", c.ClientIP())
+		if customer.Email != nil && *customer.Email != "" {
+			lang := c.GetHeader("X-Lang")
+			if lang == "" { lang = "es" }
+			go sendTwoFactorDisabledEmail(smtpConfig, *customer.Email, customer.EpicUsername, lang)
+		}
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "2FA desactivado"})
 	}
 }
@@ -307,7 +318,7 @@ func HandlerLoginVerify2FA(database *sql.DB, secretKey string) gin.HandlerFunc {
 		valid := false
 
 		if secret, err := crypto.Decrypt(*customer.TOTPSecretEnc, encryptionKey); err == nil {
-			valid = validateTOTPCode(code, secret)
+			valid = validateTOTPCode(customerID, code, secret)
 		}
 		if !valid {
 			// No era un código TOTP válido — probar como código de respaldo.
@@ -349,15 +360,49 @@ func HandlerLoginVerify2FA(database *sql.DB, secretKey string) gin.HandlerFunc {
 	}
 }
 
+// totpLastStep guarda, por cuenta, el último período TOTP (bloque de 30s)
+// que se aceptó — así un código NUNCA se puede reutilizar dentro de su
+// propia ventana de validez, aunque matemáticamente siga siendo "correcto".
+// Sin esto, alguien que interceptara un código válido (red, malware, mirada
+// indiscreta) podría reusarlo mientras siga vigente. Vive en memoria — un
+// reinicio del servidor lo resetea, lo cual es aceptable: la ventana real
+// de un código dura segundos, no algo que sobreviva a un redeploy de todos
+// modos.
+var (
+	totpLastStep   = map[uuid.UUID]int64{}
+	totpLastStepMu sync.Mutex
+)
+
+const totpPeriod = int64(30)
+
 // validateTOTPCode acepta el código del período actual y un margen de ±30s
-// (un período antes o después) — sin esto, un teléfono con la hora unos
-// segundos desincronizada rechazaría códigos que en realidad son correctos.
-func validateTOTPCode(code, secret string) bool {
-	valid, _ := totp.ValidateCustom(code, secret, time.Now(), totp.ValidateOpts{
-		Period:    30,
-		Skew:      1,
-		Digits:    otp.DigitsSix,
-		Algorithm: otp.AlgorithmSHA1,
-	})
-	return valid
+// (un período antes o después, para tolerar un teléfono con la hora
+// levemente desincronizada), pero rechaza cualquier código de un período ya
+// usado antes por esta misma cuenta.
+func validateTOTPCode(customerID uuid.UUID, code, secret string) bool {
+	now := time.Now().Unix()
+	currentStep := now / totpPeriod
+
+	totpLastStepMu.Lock()
+	lastStep := totpLastStep[customerID]
+	totpLastStepMu.Unlock()
+
+	for _, step := range []int64{currentStep - 1, currentStep, currentStep + 1} {
+		if step <= lastStep {
+			continue // ya se usó este período (o uno más nuevo) antes — no se acepta de nuevo
+		}
+		expected, err := totp.GenerateCode(secret, time.Unix(step*totpPeriod, 0))
+		if err != nil {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(expected), []byte(code)) == 1 {
+			totpLastStepMu.Lock()
+			if step > totpLastStep[customerID] {
+				totpLastStep[customerID] = step
+			}
+			totpLastStepMu.Unlock()
+			return true
+		}
+	}
+	return false
 }

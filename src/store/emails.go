@@ -735,3 +735,78 @@ func SendComplaintRespondedEmail(cfg types.EnvConfig, toEmail, fullName, referen
 		slog.Info("Email: complaint responded notification sent", "to", toEmail, "reference", reference)
 	}
 }
+
+// sendTwoFactorDisabledEmail avisa cuando se desactiva el 2FA de una cuenta
+// admin — es un cambio que baja la seguridad de la cuenta, así que el dueño
+// real debe enterarse de inmediato si no fue él quien lo hizo (mismo motivo
+// que sendPasswordChangedEmail).
+func sendTwoFactorDisabledEmail(cfg types.EnvConfig, toEmail, username, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	username = esc(username)
+	es := lang != "en"
+
+	subject := "KidStorePeru — "
+	intro, hero, warn := "", "", ""
+	if es {
+		subject += "Se desactivó la verificación en dos pasos"
+		intro = fmt.Sprintf("Hola %s, la verificación en dos pasos de tu cuenta se desactivó.", username)
+		hero = "2FA desactivado"
+		warn = fmt.Sprintf("Contáctanos de inmediato a %s — tu cuenta podría estar comprometida.", SupportEmail)
+	} else {
+		subject += "Two-factor verification was disabled"
+		intro = fmt.Sprintf("Hi %s, two-factor verification on your account was turned off.", username)
+		hero = "2FA disabled"
+		warn = fmt.Sprintf("Contact us immediately at %s — your account may be compromised.", SupportEmail)
+	}
+
+	body := emailEyebrow(map[bool]string{true: "Seguridad de la cuenta", false: "Account security"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro) +
+		emailNotice(map[bool]string{true: "Si no fuiste tú", false: "If this wasn't you"}[es], warn)
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: 2FA disabled send error", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: 2FA disabled notification sent", "to", toEmail)
+	}
+}
+
+// sendTwoFactorEnabledEmail confirma que el 2FA se activó correctamente —
+// no es una alerta de seguridad como la de arriba, solo una confirmación
+// de que el cambio se aplicó (si alguien más lo activó sin permiso, esto
+// también sirve para que el dueño real lo note).
+func sendTwoFactorEnabledEmail(cfg types.EnvConfig, toEmail, username, lang string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	username = esc(username)
+	es := lang != "en"
+
+	subject := "KidStorePeru — "
+	intro, hero := "", ""
+	if es {
+		subject += "Verificación en dos pasos activada"
+		intro = fmt.Sprintf("Hola %s, la verificación en dos pasos de tu cuenta se activó correctamente.", username)
+		hero = "2FA activado"
+	} else {
+		subject += "Two-factor verification enabled"
+		intro = fmt.Sprintf("Hi %s, two-factor verification was successfully enabled on your account.", username)
+		hero = "2FA enabled"
+	}
+
+	body := emailEyebrow(map[bool]string{true: "Seguridad de la cuenta", false: "Account security"}[es]) +
+		emailHero("", hero, true) +
+		emailCopy(intro)
+
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: 2FA enabled send error", "to", toEmail, "error", err)
+	} else {
+		slog.Info("Email: 2FA enabled notification sent", "to", toEmail)
+	}
+}
