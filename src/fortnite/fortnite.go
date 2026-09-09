@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,16 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// ErrAlreadyOwned — Epic devuelve este error cuando el receptor YA tiene el
+// ítem (no se puede regalar dos veces un cosmético que ya es dueño). Es una
+// señal natural de idempotencia: si se reintenta un pedido que en realidad
+// ya se había entregado antes de que algo interrumpiera el proceso (una
+// caída del backend justo después del envío exitoso, por ejemplo), Epic
+// mismo rechaza el reintento en vez de duplicar el regalo. processOrder usa
+// esto para recuperar pedidos atascados en 'processing' sin arriesgarse a
+// enviar el mismo ítem dos veces — ver ClaimPendingOrders.
+var ErrAlreadyOwned = errors.New("el cliente ya tiene este item")
 
 // ==================== CONSTANTS ====================
 
@@ -654,7 +665,7 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 			case "errors.com.epicgames.friends.friendship_not_found":
 				return "", fmt.Errorf("el cliente no tiene agregado al bot como amigo")
 			case "errors.com.epicgames.modules.gamesubcatalog.receiver_will_own_more_than_one":
-				return "", fmt.Errorf("el cliente ya tiene este item")
+				return "", ErrAlreadyOwned
 			default:
 				return "", fmt.Errorf("error de Epic Games: %s", errCode)
 			}

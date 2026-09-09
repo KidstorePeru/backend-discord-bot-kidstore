@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -1151,6 +1152,22 @@ func GetPendingOrders(db *sql.DB) ([]types.Order, error) {
 // por Epic Games, duplicando el envío de un pedido pagado una sola vez.
 // FOR UPDATE SKIP LOCKED hace que si una instancia ya está mirando esas
 // filas, la otra simplemente las salte en vez de esperar o repetirlas.
+// ClaimPendingOrders reclama, de forma atómica, tanto los pedidos nuevos
+// ('pending') como los que quedaron ATASCADOS en 'processing' — un pedido se
+// marca 'processing' al reclamarlo y solo sale de ese estado cuando
+// processOrder termina (sent/failed/pending); si el proceso se cae a mitad
+// de camino (reinicio, deploy, crash), el pedido se queda en 'processing'
+// PARA SIEMPRE si nada vuelve a mirarlo — antes no había ninguna
+// recuperación para ese caso. El margen de 15 minutos es deliberadamente
+// generoso: un pedido real, en el peor caso con varios bots timeouteando en
+// cadena, tarda como mucho un par de minutos; 15 minutos sin ningún avance
+// (updated_at sin tocar) es una señal confiable de que el proceso que lo
+// tenía murió, no de que simplemente está tardando. Reutiliza el mismo
+// FOR UPDATE SKIP LOCKED que ya protegía contra procesar el mismo pedido
+// dos veces en paralelo (local + producción contra la misma base
+// compartida), y la recuperación en sí evita duplicar el envío real
+// comprobando con Epic antes de reintentar (ver fortnite.ErrAlreadyOwned en
+// processOrder).
 func ClaimPendingOrders(database *sql.DB) ([]types.Order, error) {
 	tx, err := database.Begin()
 	if err != nil { return nil, err }
@@ -1159,7 +1176,9 @@ func ClaimPendingOrders(database *sql.DB) ([]types.Order, error) {
 	rows, err := tx.Query(`
 		SELECT id, customer_id, epic_username, item_offer_id, item_name,
 		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, delivery_evidence, created_at, updated_at
-		FROM orders WHERE status='pending' ORDER BY created_at ASC
+		FROM orders
+		WHERE status='pending' OR (status='processing' AND updated_at < NOW() - INTERVAL '15 minutes')
+		ORDER BY created_at ASC
 		FOR UPDATE SKIP LOCKED`)
 	if err != nil { return nil, err }
 	orders, scanErr := scanOrders(rows)
@@ -1167,6 +1186,9 @@ func ClaimPendingOrders(database *sql.DB) ([]types.Order, error) {
 	if scanErr != nil { return nil, scanErr }
 
 	for _, o := range orders {
+		if o.Status == "processing" {
+			slog.Warn("recuperando pedido atascado en 'processing'", "orderID", o.ID, "updated_at", o.UpdatedAt)
+		}
 		if _, err := tx.Exec(`UPDATE orders SET status='processing', updated_at=NOW() WHERE id=$1`, o.ID); err != nil {
 			return nil, err
 		}

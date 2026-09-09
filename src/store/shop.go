@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -639,6 +640,31 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		var evidence string
 		evidence, err = fortnite.SendGift(database, *bot, receiverAccountID,
 			order.ItemOfferID, order.PriceVBucks, order.ItemName, message)
+
+		if errors.Is(err, fortnite.ErrAlreadyOwned) {
+			// Recuperación de un pedido atascado en 'processing' (ver
+			// ClaimPendingOrders) — Epic confirma que el cliente YA tiene
+			// este ítem, es decir, un intento anterior (probablemente
+			// interrumpido por una caída del proceso justo después de
+			// enviarlo) sí llegó a completarse en Epic aunque acá nunca se
+			// haya registrado. NO se reintenta el envío (evitaría
+			// duplicarlo) — se marca como entregado directamente. No se
+			// vuelve a descontar V-Bucks/slot del bot en esta recuperación:
+			// si el intento original alcanzó a descontarlos, hacerlo de
+			// nuevo los dejaría mal contados; si no alcanzó, es un margen de
+			// error muchísimo más barato que enviar el ítem dos veces.
+			recoveryNote := fmt.Sprintf(`{"recovered":true,"note":"Epic confirmó que el ítem ya estaba entregado al recuperar un pedido atascado","bot_account_id":"%s","receiver_account_id":"%s"}`,
+				bot.ID.String(), receiverAccountID)
+			accountID := bot.ID
+			if markErr := db.MarkOrderDelivered(database, order.ID, accountID, recoveryNote); markErr != nil {
+				slog.Warn("Worker: error guardando evidencia de recuperación", "orderID", order.ID, "error", markErr)
+				db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
+			}
+			db.AddAuditLog(database, &order.CustomerID, "ORDER_RECOVERED",
+				fmt.Sprintf("pedido %s recuperado tras atasco en 'processing' — Epic confirmó entrega previa", order.ID), "worker")
+			slog.Info("Worker: pedido recuperado (ya estaba entregado)", "orderID", order.ID, "bot", bot.DisplayName)
+			return
+		}
 
 		if err == nil {
 			// ── Éxito ──
