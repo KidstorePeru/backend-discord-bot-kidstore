@@ -259,6 +259,7 @@ func main() {
 		customer.GET("/orders",            store.HandlerGetMyOrders(database))
 		customer.GET("/orders/stats",      store.HandlerGetMyOrderStats(database))
 		customer.GET("/recharges",         store.HandlerGetMyRecharges(database))
+		customer.GET("/recharges/stats",   store.HandlerGetMyRechargeStats(database))
 		customer.PUT("/profile",           store.HandlerUpdateProfile(database, cfg.SecretKey))
 		customer.PUT("/avatar",            store.HandlerUpdateAvatar(database))
 		customer.POST("/email/request-change", middleware.RateLimitMiddleware(authLimiter), store.HandlerRequestEmailChange(database, cfg))

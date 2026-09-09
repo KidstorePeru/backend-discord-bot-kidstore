@@ -431,12 +431,39 @@ func HandlerGetMyOrderStats(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
 			return
 		}
-		total, sent, spentKC, err := db.GetCustomerOrderStats(database, customerID)
+		total, sent, pending, spentKC, err := db.GetCustomerOrderStats(database, customerID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo estadísticas"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"success": true, "total_orders": total, "sent_orders": sent, "total_spent_kc": spentKC})
+		c.JSON(http.StatusOK, gin.H{"success": true, "total_orders": total, "sent_orders": sent, "pending_orders": pending, "total_spent_kc": spentKC})
+	}
+}
+
+// HandlerGetMyRechargeStats — mismo problema, mismo remedio que
+// HandlerGetMyOrderStats pero para recargas: el dashboard sumaba amount_pen
+// de TODOS los pagos por pasarela sin filtrar por estado (incluía
+// pendientes y fallidos como si fueran plata realmente cobrada) y además
+// solo sobre los últimos 50 pagos cargados. GetCustomerRechargeStats
+// calcula ambos números correctamente sobre todo el historial.
+func HandlerGetMyRechargeStats(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		totalKC, totalPEN, pendingPayments, err := db.GetCustomerRechargeStats(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo estadísticas"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "total_kc_recharged": totalKC, "total_pen_recharged": totalPEN, "pending_payments": pendingPayments})
 	}
 }
 

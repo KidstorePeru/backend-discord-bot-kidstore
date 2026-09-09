@@ -1277,14 +1277,37 @@ func CountActiveCustomers(db *sql.DB) (int, error) {
 	return count, err
 }
 
-// GetCustomerOrderStats resume pedidos totales, entregados y KC gastado en
-// entregados — para mostrar el nivel/progreso del cliente en /perfil.
-func GetCustomerOrderStats(db *sql.DB, customerID uuid.UUID) (totalOrders, sentOrders, totalSpentKC int, err error) {
+// GetCustomerOrderStats resume pedidos totales, entregados, pendientes y KC
+// gastado en entregados — calculado siempre sobre TODO el historial del
+// cliente (no sobre una página ya cargada). La usa /perfil y /dashboard en
+// el sitio web, y el bot de Discord.
+func GetCustomerOrderStats(db *sql.DB, customerID uuid.UUID) (totalOrders, sentOrders, pendingOrders, totalSpentKC int, err error) {
 	err = db.QueryRow(`
 		SELECT COUNT(*),
 		       COUNT(*) FILTER (WHERE status = 'sent'),
+		       COUNT(*) FILTER (WHERE status IN ('pending','processing')),
 		       COALESCE(SUM(price_kc) FILTER (WHERE status = 'sent'), 0)
-		FROM orders WHERE customer_id=$1`, customerID).Scan(&totalOrders, &sentOrders, &totalSpentKC)
+		FROM orders WHERE customer_id=$1`, customerID).Scan(&totalOrders, &sentOrders, &pendingOrders, &totalSpentKC)
+	return
+}
+
+// GetCustomerRechargeStats resume el KC recargado y lo realmente pagado por
+// pasarela — SOLO cuenta pagos con status 'approved'/'fulfilled' para el
+// monto en soles, nunca 'pending'/'failed'/'expired': antes, el dashboard
+// sumaba amount_pen de TODOS los intentos de pago sin filtrar por estado,
+// inflando el total mostrado con pagos que nunca llegaron a acreditar nada.
+func GetCustomerRechargeStats(db *sql.DB, customerID uuid.UUID) (totalKC int, totalPENGateway float64, pendingPayments int, err error) {
+	var totalPENNull sql.NullFloat64
+	err = db.QueryRow(`SELECT COALESCE(SUM(amount_kc),0) FROM kc_recharges WHERE customer_id=$1`, customerID).Scan(&totalKC)
+	if err != nil { return }
+	err = db.QueryRow(`
+		SELECT COALESCE(SUM(amount_pen),0) FROM payment_transactions
+		WHERE customer_id=$1 AND payment_type='kc_recharge' AND status IN ('approved','fulfilled')`, customerID).Scan(&totalPENNull)
+	totalPENGateway = totalPENNull.Float64
+	if err != nil { return }
+	err = db.QueryRow(`
+		SELECT COUNT(*) FROM payment_transactions
+		WHERE customer_id=$1 AND payment_type='kc_recharge' AND status='pending'`, customerID).Scan(&pendingPayments)
 	return
 }
 

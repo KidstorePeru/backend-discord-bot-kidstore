@@ -90,7 +90,7 @@ func handlePerfilCommand(s *discordgo.Session, i *discordgo.InteractionCreate, d
 		return
 	}
 
-	_, _, totalSpentKC, _ := db.GetCustomerOrderStats(database, target.ID)
+	_, _, _, totalSpentKC, _ := db.GetCustomerOrderStats(database, target.ID)
 	levelName, levelEmoji := levelFor(totalSpentKC)
 
 	embed := &discordgo.MessageEmbed{
@@ -131,7 +131,7 @@ func handleOwnProfile(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		linkedStr = joinComma(linked)
 	}
 
-	totalOrders, sentOrders, totalSpentKC, _ := db.GetCustomerOrderStats(database, customer.ID)
+	totalOrders, sentOrders, _, totalSpentKC, _ := db.GetCustomerOrderStats(database, customer.ID)
 	levelName, levelEmoji := levelFor(totalSpentKC)
 
 	embed := &discordgo.MessageEmbed{
