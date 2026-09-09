@@ -599,6 +599,16 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 	for i := range accounts {
 		bot := &accounts[i]
 		if bot.RemainingGifts <= 0 { continue }
+		// No intentar con un bot que no tiene suficientes V-Bucks reales para
+		// pagar este item — sin esto, Epic rechazaría la compra y el pedido
+		// se marcaría como fallido de inmediato en vez de probar el siguiente
+		// bot que sí podría tener fondos. bot.VBucks viene del sync automático
+		// contra la API real de Epic (ver healthcheck.go), así que es confiable.
+		if bot.VBucks < order.PriceVBucks {
+			slog.Info("Worker: bot sin V-Bucks suficientes, probando siguiente",
+				"bot", bot.DisplayName, "tiene", bot.VBucks, "necesita", order.PriceVBucks)
+			continue
+		}
 		activeBots++
 
 		// Verificar amistad con este bot
@@ -675,6 +685,19 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			db.DeactivateGameAccount(database, bot.ID)
 			discordbot.AlertBotDeactivated(bot.ID, bot.DisplayName, "error de autenticación al intentar enviar un regalo: "+errMsg)
 			bot.RemainingGifts = 0
+			continue // probar siguiente bot
+		}
+
+		// Fondos insuficientes en Epic (aunque nuestro contador decía que sí
+		// alcanzaba — ej. otro pedido gastó el saldo justo antes) → tratar
+		// igual que "sin V-Bucks": no reintentar este bot, probar el
+		// siguiente, y avisar para que se recargue pronto.
+		if strings.Contains(errLower, "insufficient") || strings.Contains(errLower, "currency") {
+			slog.Warn("Worker: fondos insuficientes en Epic pese al chequeo previo, probando siguiente bot",
+				"bot", bot.DisplayName, "orderID", order.ID, "msg", errMsg)
+			db.UpdateBotVbucks(database, bot.ID, 0)
+			discordbot.CheckVBucksAlert(bot.ID, bot.DisplayName, 0)
+			bot.VBucks = 0
 			continue // probar siguiente bot
 		}
 
