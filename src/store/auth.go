@@ -599,7 +599,24 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 		}
 
 		updatedCustomer, _ := db.GetCustomerByID(database, customerID)
-		token, _ := middleware.GenerateCustomerToken(updatedCustomer, secretKey)
+
+		// Solo se emite un token NUEVO (con expiración fresca de 1h) si el
+		// usuario Epic realmente cambió — es el único dato de este endpoint
+		// que va dentro de los claims del JWT. Cualquier otra actualización
+		// (teléfono, o incluso un PUT completamente vacío) devuelve el MISMO
+		// token que ya traía la request, con su expiración original intacta.
+		// Sin esto, alguien con un access token robado (aunque no tuviera la
+		// contraseña ni el refresh token) podía llamar a este endpoint una y
+		// otra vez, cada 55 minutos, para renovar indefinidamente su sesión —
+		// justo el límite de 1h que el access token corto está pensado para
+		// imponer.
+		token := middleware.CurrentAccessToken(c)
+		usernameChanged := newEpic != "" && newEpic != customer.EpicUsername
+		if usernameChanged {
+			if fresh, err := middleware.GenerateCustomerToken(updatedCustomer, secretKey); err == nil {
+				token = fresh
+			}
+		}
 		db.AddAuditLog(database, &customerID, "PROFILE_UPDATED", "perfil actualizado", c.ClientIP())
 
 		if newHash != "" {

@@ -310,3 +310,11 @@ func GetCustomerID(c *gin.Context) (string, bool) {
 	idStr, ok := id.(string)
 	return idStr, ok
 }
+
+// CurrentAccessToken devuelve el JWT crudo que trae la request actual (del
+// header Authorization) — sirve para "devolver el mismo token" en vez de
+// emitir uno nuevo cuando un endpoint no necesita extender la sesión.
+func CurrentAccessToken(c *gin.Context) string {
+	auth := c.GetHeader("Authorization")
+	return strings.TrimPrefix(auth, "Bearer ")
+}

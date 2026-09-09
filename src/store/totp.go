@@ -91,6 +91,27 @@ func HandlerSetup2FA(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
+		// Si la cuenta YA tiene 2FA activado, generar un secreto nuevo es una
+		// SUSTITUCIÓN — exige confirmar la contraseña actual primero. Sin
+		// esto, alguien con solo un JWT robado (sin la contraseña) podía
+		// arrancar una sustitución de 2FA a voluntad; aunque el secreto
+		// activo no se toca hasta confirmar (ver PromotePendingTOTPSecret),
+		// mejor cortar el intento acá mismo si no puede probar que es el
+		// dueño real de la cuenta.
+		if customer.TOTPEnabled {
+			var req struct {
+				Password string `json:"password" binding:"required"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "ya tienes 2FA activado — se requiere tu contraseña actual para reemplazarlo"})
+				return
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(customer.PasswordHash), []byte(req.Password)); err != nil {
+				c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "contraseña incorrecta"})
+				return
+			}
+		}
+
 		accountName := customer.EpicUsername
 		if customer.Email != nil && *customer.Email != "" {
 			accountName = *customer.Email
@@ -156,12 +177,14 @@ func HandlerConfirm2FA(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusForbidden, gin.H{"success": false, "error": "el 2FA solo está disponible para cuentas admin"})
 			return
 		}
-		if customer.TOTPSecretEnc == nil {
+		if customer.TOTPPendingSecretEnc == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "primero genera un secreto con /2fa/setup"})
 			return
 		}
 
-		secret, err := crypto.Decrypt(*customer.TOTPSecretEnc, encryptionKey)
+		// Se valida contra el secreto PENDIENTE, no el activo — el activo
+		// (si había uno) sigue protegiendo la cuenta hasta este momento.
+		secret, err := crypto.Decrypt(*customer.TOTPPendingSecretEnc, encryptionKey)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error leyendo secreto"})
 			return
@@ -171,7 +194,9 @@ func HandlerConfirm2FA(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		if err := db.EnableTOTP(database, customerID); err != nil {
+		// Recién acá se confirma la sustitución: el secreto pendiente pasa a
+		// ser el activo (ver PromotePendingTOTPSecret).
+		if err := db.PromotePendingTOTPSecret(database, customerID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error activando 2FA"})
 			return
 		}
@@ -360,31 +385,45 @@ func HandlerLoginVerify2FA(database *sql.DB, secretKey string) gin.HandlerFunc {
 	}
 }
 
-// totpLastStep guarda, por cuenta, el último período TOTP (bloque de 30s)
-// que se aceptó — así un código NUNCA se puede reutilizar dentro de su
-// propia ventana de validez, aunque matemáticamente siga siendo "correcto".
-// Sin esto, alguien que interceptara un código válido (red, malware, mirada
-// indiscreta) podría reusarlo mientras siga vigente. Vive en memoria — un
-// reinicio del servidor lo resetea, lo cual es aceptable: la ventana real
-// de un código dura segundos, no algo que sobreviva a un redeploy de todos
-// modos.
+// totpLastStep guarda, por cuenta + secreto, el último período TOTP (bloque
+// de 30s) que se aceptó — así un código NUNCA se puede reutilizar dentro de
+// su propia ventana de validez, aunque matemáticamente siga siendo
+// "correcto". Sin esto, alguien que interceptara un código válido (red,
+// malware, mirada indiscreta) podría reusarlo mientras siga vigente. Vive en
+// memoria — un reinicio del servidor lo resetea, lo cual es aceptable: la
+// ventana real de un código dura segundos, no algo que sobreviva a un
+// redeploy de todos modos.
+//
+// La clave incluye el secreto (con huella SHA-256, no el secreto en claro)
+// y no solo el customerID: al reemplazar el 2FA (ver PromotePendingTOTPSecret),
+// el secreto pendiente es distinto del activo — sin este detalle, confirmar
+// el reemplazo justo después de haber confirmado la activación original
+// dentro de la misma ventana de 30s se rechazaría por error (el "último
+// período usado" del secreto viejo bloquearía un código legítimo de un
+// secreto completamente distinto que nadie usó todavía).
 var (
-	totpLastStep   = map[uuid.UUID]int64{}
+	totpLastStep   = map[string]int64{}
 	totpLastStepMu sync.Mutex
 )
 
 const totpPeriod = int64(30)
 
+func totpStepKey(customerID uuid.UUID, secret string) string {
+	h := sha256.Sum256([]byte(secret))
+	return customerID.String() + ":" + hex.EncodeToString(h[:8])
+}
+
 // validateTOTPCode acepta el código del período actual y un margen de ±30s
 // (un período antes o después, para tolerar un teléfono con la hora
 // levemente desincronizada), pero rechaza cualquier código de un período ya
-// usado antes por esta misma cuenta.
+// usado antes con ESTE MISMO secreto.
 func validateTOTPCode(customerID uuid.UUID, code, secret string) bool {
+	key := totpStepKey(customerID, secret)
 	now := time.Now().Unix()
 	currentStep := now / totpPeriod
 
 	totpLastStepMu.Lock()
-	lastStep := totpLastStep[customerID]
+	lastStep := totpLastStep[key]
 	totpLastStepMu.Unlock()
 
 	for _, step := range []int64{currentStep - 1, currentStep, currentStep + 1} {
@@ -397,8 +436,8 @@ func validateTOTPCode(customerID uuid.UUID, code, secret string) bool {
 		}
 		if subtle.ConstantTimeCompare([]byte(expected), []byte(code)) == 1 {
 			totpLastStepMu.Lock()
-			if step > totpLastStep[customerID] {
-				totpLastStep[customerID] = step
+			if step > totpLastStep[key] {
+				totpLastStep[key] = step
 			}
 			totpLastStepMu.Unlock()
 			return true

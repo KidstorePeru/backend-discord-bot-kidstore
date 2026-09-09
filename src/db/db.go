@@ -346,6 +346,17 @@ func CreateTables(db *sql.DB) error {
 				ALTER TABLE customers ADD COLUMN totp_enabled BOOLEAN NOT NULL DEFAULT false;
 			END IF;
 		END $$`,
+		// totp_pending_secret_enc: secreto de un intento de activación/
+		// sustitución de 2FA todavía SIN confirmar — separado a propósito de
+		// totp_secret_enc (el que de verdad protege el login). Mientras no se
+		// confirme con un código real, el secreto ACTIVO no se toca — así,
+		// alguien con solo un JWT robado (sin la contraseña) no puede
+		// desactivar el 2FA de una cuenta llamando a /2fa/setup.
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='customers' AND column_name='totp_pending_secret_enc') THEN
+				ALTER TABLE customers ADD COLUMN totp_pending_secret_enc TEXT;
+			END IF;
+		END $$`,
 		`CREATE TABLE IF NOT EXISTS admin_backup_codes (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
@@ -668,11 +679,11 @@ func GetCustomerByEpicUsername(db *sql.DB, epicUsername string) (types.Customer,
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, totp_pending_secret_enc, created_at, updated_at
 		FROM customers WHERE LOWER(epic_username) = LOWER($1) AND is_active = true`, epicUsername).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.TOTPPendingSecretEnc, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -704,11 +715,11 @@ func GetCustomerByEmail(db *sql.DB, email string) (types.Customer, error) {
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, totp_pending_secret_enc, created_at, updated_at
 		FROM customers WHERE email = $1 AND is_active = true`, email).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.TOTPPendingSecretEnc, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -717,11 +728,11 @@ func GetCustomerByID(db *sql.DB, id uuid.UUID) (types.Customer, error) {
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, totp_pending_secret_enc, created_at, updated_at
 		FROM customers WHERE id = $1 AND is_active = true`, id).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.TOTPPendingSecretEnc, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -730,11 +741,11 @@ func GetCustomerByGoogleID(db *sql.DB, googleID string) (types.Customer, error) 
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, totp_pending_secret_enc, created_at, updated_at
 		FROM customers WHERE google_id = $1 AND is_active = true`, googleID).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.TOTPPendingSecretEnc, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -743,11 +754,11 @@ func GetCustomerByDiscordID(db *sql.DB, discordID string) (types.Customer, error
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
 		       google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, created_at, updated_at
+		       is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, totp_pending_secret_enc, created_at, updated_at
 		FROM customers WHERE discord_id = $1 AND is_active = true`, discordID).
 		Scan(&c.ID, &c.EpicUsername, &c.Email, &c.PasswordHash, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt)
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.TOTPPendingSecretEnc, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -783,7 +794,7 @@ func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error)
 	rows, err := db.Query(`
     SELECT id, epic_username, email, kc_balance,
            google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
-           is_active, is_verified, COALESCE(is_admin,false), created_at, updated_at
+           is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, totp_pending_secret_enc, created_at, updated_at
     FROM customers WHERE is_active=true ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
@@ -792,7 +803,7 @@ func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error)
 		var c types.Customer
 		if err := rows.Scan(&c.ID, &c.EpicUsername, &c.Email, &c.KCBalance,
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
-			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.TOTPPendingSecretEnc, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		customers = append(customers, c)
@@ -1623,13 +1634,35 @@ func SetCustomerAdmin(db *sql.DB, customerID uuid.UUID, isAdmin bool) error {
 // SetPendingTOTPSecret guarda un secreto TOTP recién generado, todavía sin
 // confirmar (totp_enabled sigue en false hasta que HandlerConfirm2FA valide
 // un código real generado con ese secreto).
+// SetPendingTOTPSecret guarda un secreto candidato SIN tocar el secreto
+// activo ni totp_enabled — si la cuenta ya tenía 2FA activado, sigue
+// protegida con su factor anterior hasta que se confirme la sustitución
+// (ver PromotePendingTOTPSecret). Así, generar un secreto nuevo por sí
+// solo (ej. con un JWT robado pero sin la contraseña) nunca desactiva el
+// 2FA existente.
 func SetPendingTOTPSecret(db *sql.DB, customerID uuid.UUID, encSecret string) error {
-	_, err := db.Exec(`UPDATE customers SET totp_secret_enc=$1, totp_enabled=false, updated_at=NOW() WHERE id=$2`, encSecret, customerID)
+	_, err := db.Exec(`UPDATE customers SET totp_pending_secret_enc=$1, updated_at=NOW() WHERE id=$2`, encSecret, customerID)
 	return err
 }
 
-func EnableTOTP(db *sql.DB, customerID uuid.UUID) error {
-	_, err := db.Exec(`UPDATE customers SET totp_enabled=true, updated_at=NOW() WHERE id=$1`, customerID)
+// PromotePendingTOTPSecret confirma una activación o sustitución de 2FA:
+// el secreto pendiente pasa a ser el activo, se activa (o se mantiene
+// activado) el 2FA, y se limpia la columna pendiente. Es el ÚNICO lugar
+// donde el secreto activo cambia — y solo se llama tras validar un código
+// real generado con el secreto pendiente (ver HandlerConfirm2FA).
+func PromotePendingTOTPSecret(db *sql.DB, customerID uuid.UUID) error {
+	_, err := db.Exec(`
+		UPDATE customers
+		SET totp_secret_enc=totp_pending_secret_enc, totp_pending_secret_enc=NULL, totp_enabled=true, updated_at=NOW()
+		WHERE id=$1`, customerID)
+	return err
+}
+
+// ClearPendingTOTPSecret descarta un intento de activación/sustitución sin
+// confirmar (ej. si el usuario cancela, o la sesión expira) — el secreto
+// activo (si había uno) sigue intacto.
+func ClearPendingTOTPSecret(db *sql.DB, customerID uuid.UUID) error {
+	_, err := db.Exec(`UPDATE customers SET totp_pending_secret_enc=NULL, updated_at=NOW() WHERE id=$1`, customerID)
 	return err
 }
 
@@ -1639,7 +1672,7 @@ func DisableTOTP(db *sql.DB, customerID uuid.UUID) error {
 	tx, err := db.Begin()
 	if err != nil { return err }
 	defer tx.Rollback()
-	if _, err := tx.Exec(`UPDATE customers SET totp_enabled=false, totp_secret_enc=NULL, updated_at=NOW() WHERE id=$1`, customerID); err != nil {
+	if _, err := tx.Exec(`UPDATE customers SET totp_enabled=false, totp_secret_enc=NULL, totp_pending_secret_enc=NULL, updated_at=NOW() WHERE id=$1`, customerID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM admin_backup_codes WHERE customer_id=$1`, customerID); err != nil {

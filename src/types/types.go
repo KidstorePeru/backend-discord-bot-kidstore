@@ -97,8 +97,9 @@ type Customer struct {
 	// cuentas bot, con crypto.Encrypt) — nunca se serializa a JSON.
 	// TOTPEnabled: solo pasa a true después de confirmar el código una vez
 	// durante la activación (mientras tanto el secreto queda "pendiente").
-	TOTPSecretEnc *string   `json:"-"`
-	TOTPEnabled   bool      `json:"-"`
+	TOTPSecretEnc        *string `json:"-"`
+	TOTPEnabled          bool    `json:"-"`
+	TOTPPendingSecretEnc *string `json:"-"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
