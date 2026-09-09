@@ -28,33 +28,21 @@ func ProcessApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 }
 
 func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
-	tx, err := db.GetPaymentTransaction(database, txID)
+	// Acreditación atómica: marcar el pago como aprobado, sumar el KC e
+	// insertar el movimiento pasan los tres juntos en una sola transacción
+	// (ver CreditPaymentOnce) — una caída a mitad de camino no puede dejar
+	// un pago "aprobado" sin su KC acreditado, y la unicidad no depende del
+	// status visible del pago (que un admin puede cambiar de ida y vuelta),
+	// así que reintentos, webhooks duplicados o un pago reabierto y vuelto
+	// a aprobar nunca acreditan el mismo KC dos veces.
+	credited, tx, err := db.CreditPaymentOnce(database, txID)
 	if err != nil {
-		return fmt.Errorf("transaction not found: %w", err)
+		return fmt.Errorf("crediting payment: %w", err)
 	}
-
-	// Reclamo atómico: si dos llamadas concurrentes llegan acá para el mismo
-	// pago (dos webhooks duplicados, alguien reenviando la misma notificación
-	// muchas veces en paralelo), solo UNA de ellas puede ganar esta carrera —
-	// la base de datos lo garantiza, no el orden en que corra este código Go.
-	claimed, err := db.ClaimPaymentForApproval(database, txID, tx.ExternalID)
-	if err != nil {
-		return fmt.Errorf("updating status: %w", err)
+	if !credited {
+		return nil // ya se había acreditado antes (o alguien más lo está procesando ahora) — idempotente
 	}
-	if !claimed {
-		return nil // ya estaba aprobado (o alguien más lo está procesando ahora) — idempotente
-	}
-
-	// If KC recharge, credit KC
-	if tx.PaymentType == "kc_recharge" && tx.KCAmount > 0 {
-		soles := tx.AmountPEN
-		note := fmt.Sprintf("Pago automatico via %s (ID: %s)", tx.Gateway, tx.ExternalID)
-		if _, err := db.RechargeKC(database, tx.CustomerID, tx.KCAmount, &soles, &note, tx.Gateway, tx.Gateway); err != nil {
-			slog.Error("KC recharge failed after payment", "txID", txID, "error", err)
-			return fmt.Errorf("recharge failed: %w", err)
-		}
-		slog.Info("KC credited via payment", "customer", tx.CustomerID, "kc", tx.KCAmount, "gateway", tx.Gateway)
-	}
+	slog.Info("KC credited via payment", "customer", tx.CustomerID, "kc", tx.KCAmount, "gateway", tx.Gateway)
 
 	// Send payment approved email notification
 	if customer, err := db.GetCustomerByID(database, tx.CustomerID); err == nil {

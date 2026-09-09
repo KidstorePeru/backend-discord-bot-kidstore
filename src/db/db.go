@@ -365,6 +365,27 @@ func CreateTables(db *sql.DB) error {
 			created_at TIMESTAMP NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_backup_codes_customer ON admin_backup_codes(customer_id)`,
+		// kc_credited_at: marca PERMANENTE de "este pago ya acreditó KC" —
+		// separada a propósito de "status" (que es mutable: un admin puede
+		// cambiar approved→failed→approved otra vez desde el panel). La
+		// unicidad de la acreditación depende de esta columna, nunca del
+		// status visible, así que cambiar el status de ida y vuelta no puede
+		// volver a sumar el mismo KC dos veces. Ver CreditPaymentOnce.
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payment_transactions' AND column_name='kc_credited_at') THEN
+				ALTER TABLE payment_transactions ADD COLUMN kc_credited_at TIMESTAMP;
+			END IF;
+		END $$`,
+		// Enlaza cada recarga automática con el pago que la originó — permite
+		// auditar y, con el índice único parcial de abajo, la base de datos
+		// misma rechaza una segunda fila de kc_recharges para el mismo pago
+		// aunque algún camino de código futuro se saltara CreditPaymentOnce.
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kc_recharges' AND column_name='payment_transaction_id') THEN
+				ALTER TABLE kc_recharges ADD COLUMN payment_transaction_id UUID REFERENCES payment_transactions(id);
+			END IF;
+		END $$`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_kc_recharges_payment_tx_unique ON kc_recharges(payment_transaction_id) WHERE payment_transaction_id IS NOT NULL`,
 	}
 
 	for _, q := range queries {
@@ -1455,26 +1476,99 @@ func UpdatePaymentStatus(db *sql.DB, id uuid.UUID, status string, externalID str
 	return err
 }
 
-// ClaimPaymentForApproval marca atómicamente un pago como "approved" SOLO si
-// todavía no estaba aprobado/cumplido, en una única sentencia UPDATE (Postgres
-// garantiza que es atómica incluso con muchas conexiones concurrentes). Esto
-// existe para cerrar una condición de carrera real: los webhooks de pago son
-// rutas públicas sin autenticación (los llaman las pasarelas), así que
-// cualquiera puede mandar la misma notificación muchas veces en paralelo. Sin
-// esto, un "leer estado → decidir en Go → escribir estado" no atómico permite
-// que varias llamadas concurrentes, para el mismo pago real y ya aprobado por
-// la pasarela, pasen todas el chequeo de "todavía no procesado" antes de que
-// la primera termine de escribir — acreditando el mismo pago varias veces.
-// Devuelve true solo para la llamada que efectivamente lo reclamó.
-func ClaimPaymentForApproval(db *sql.DB, id uuid.UUID, externalID string) (bool, error) {
-	result, err := db.Exec(`
-		UPDATE payment_transactions SET status='approved', external_id=$2, updated_at=NOW()
-		WHERE id=$1 AND status NOT IN ('approved','fulfilled')`, id, externalID)
+// CreditPaymentOnce hace, en UNA sola transacción con row lock, las tres
+// cosas que antes pasaban por separado (marcar el pago aprobado, sumar el
+// saldo, insertar el movimiento en kc_recharges) — así una caída del
+// proceso a mitad de camino no puede dejar un pago "aprobado" sin que su
+// KC se haya acreditado nunca (y sin ningún reintento posible, porque el
+// siguiente intento vería el status ya en 'approved' y no haría nada).
+//
+// La unicidad de la acreditación depende de kc_credited_at, NUNCA del
+// status visible del pago: a diferencia del status (que un admin puede
+// cambiar libremente, incluso de vuelta a 'failed' o 'expired' y otra vez
+// a 'approved' desde el panel), kc_credited_at solo se pone una vez y
+// nunca se vuelve a limpiar. Sin esto, aprobar → marcar como fallido →
+// aprobar de nuevo el mismo pago acreditaría el mismo KC dos veces. El
+// índice único parcial en kc_recharges(payment_transaction_id) es una
+// segunda barrera a nivel de base de datos por si algún camino futuro
+// llamara a esto dos veces en paralelo saltándose el lock (FOR UPDATE ya
+// lo evita, pero más vale que la propia base de datos lo garantice
+// también).
+//
+// Devuelve credited=true solo la primera vez que efectivamente suma KC;
+// llamadas posteriores para el mismo pago devuelven credited=false sin
+// tocar el saldo — es seguro reintentar tantas veces como haga falta
+// (webhooks duplicados, reintentos de conciliación, un admin reprocesando
+// a mano) porque no hay ningún estado a medio camino que se pueda quedar
+// atascado.
+func CreditPaymentOnce(db *sql.DB, id uuid.UUID) (credited bool, ptx types.PaymentTransaction, err error) {
+	sqlTx, err := db.Begin()
 	if err != nil {
-		return false, err
+		return false, ptx, err
 	}
-	n, err := result.RowsAffected()
-	return n > 0, err
+	defer sqlTx.Rollback()
+
+	var currencyCode sql.NullString
+	var kcCreditedAt sql.NullTime
+	err = sqlTx.QueryRow(`
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd,
+		       COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, COALESCE(external_id,''),
+		       status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at, kc_credited_at
+		FROM payment_transactions WHERE id=$1 FOR UPDATE`, id).
+		Scan(&ptx.ID, &ptx.CustomerID, &ptx.Gateway, &ptx.PaymentType, &ptx.ProductID, &ptx.ProductName,
+			&ptx.AmountPEN, &ptx.AmountUSD, &currencyCode, &ptx.AmountLocal, &ptx.KCAmount, &ptx.ExternalID,
+			&ptx.Status, &ptx.ActivationCode, &ptx.AutobuyerTaskID, &ptx.CreatedAt, &ptx.UpdatedAt, &kcCreditedAt)
+	if err != nil {
+		return false, ptx, fmt.Errorf("transacción no encontrada: %w", err)
+	}
+	ptx.CurrencyCode = currencyCode.String
+
+	if kcCreditedAt.Valid {
+		// Ya se acreditó antes (esta misma llamada reintentada, un webhook
+		// duplicado, o un admin re-aprobando un pago que ya había pasado por
+		// acá) — no se vuelve a tocar el saldo. Se empareja el status visible
+		// con "approved" si por algún motivo quedó en otra cosa, pero eso es
+		// puramente cosmético.
+		if ptx.Status != "approved" && ptx.Status != "fulfilled" {
+			if _, uerr := sqlTx.Exec(`UPDATE payment_transactions SET status='approved', updated_at=NOW() WHERE id=$1`, id); uerr != nil {
+				return false, ptx, uerr
+			}
+			ptx.Status = "approved"
+		}
+		if cerr := sqlTx.Commit(); cerr != nil {
+			return false, ptx, cerr
+		}
+		return false, ptx, nil
+	}
+
+	if _, err = sqlTx.Exec(`
+		UPDATE payment_transactions SET status='approved', kc_credited_at=NOW(), updated_at=NOW()
+		WHERE id=$1`, id); err != nil {
+		return false, ptx, err
+	}
+	ptx.Status = "approved"
+
+	if ptx.PaymentType == "kc_recharge" && ptx.KCAmount > 0 {
+		result, uerr := sqlTx.Exec(`UPDATE customers SET kc_balance=kc_balance+$1, updated_at=NOW() WHERE id=$2 AND is_active=true`, ptx.KCAmount, ptx.CustomerID)
+		if uerr != nil {
+			return false, ptx, uerr
+		}
+		if rows, _ := result.RowsAffected(); rows == 0 {
+			return false, ptx, fmt.Errorf("cliente no encontrado o inactivo, no se pudo acreditar KC")
+		}
+		note := fmt.Sprintf("Pago automatico via %s (ID: %s)", ptx.Gateway, ptx.ExternalID)
+		if _, uerr = sqlTx.Exec(`
+			INSERT INTO kc_recharges (id, customer_id, amount_kc, amount_soles, method, note, approved_by, payment_transaction_id, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())`,
+			uuid.New(), ptx.CustomerID, ptx.KCAmount, ptx.AmountPEN, ptx.Gateway, note, ptx.Gateway, id); uerr != nil {
+			return false, ptx, uerr
+		}
+	}
+
+	if err = sqlTx.Commit(); err != nil {
+		return false, ptx, err
+	}
+	return true, ptx, nil
 }
 
 func GetAllPaymentTransactions(db *sql.DB, page, limit int) ([]types.PaymentTransaction, int, error) {
