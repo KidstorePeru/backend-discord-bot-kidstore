@@ -2150,8 +2150,10 @@ func GetAllComplaints(db *sql.DB, page, limit int) ([]types.ConsumerComplaint, i
 }
 
 // RespondToComplaint registra la respuesta del negocio a un reclamo/queja.
-// Por norma de INDECOPI, el plazo máximo de respuesta es de 30 días
-// calendario desde la presentación del reclamo.
+// Por Ley N° 29571 (modificada por la Ley N° 31435, vigente desde el
+// 21/05/2022), el plazo máximo de respuesta es de 15 días hábiles
+// improrrogables desde la presentación del reclamo — antes eran 30 días
+// calendario, cifra ya desactualizada.
 func RespondToComplaint(db *sql.DB, id uuid.UUID, response string) error {
 	_, err := db.Exec(`UPDATE consumer_complaints SET status='respondido', admin_response=$1, responded_at=NOW() WHERE id=$2`,
 		response, id)

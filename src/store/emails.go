@@ -697,11 +697,11 @@ func SendComplaintReceivedEmail(cfg types.EnvConfig, toEmail, fullName, referenc
 	if es {
 		intro = fmt.Sprintf("Hola %s, registramos tu %s en nuestro Libro de Reclamaciones Virtual. Guarda tu código de seguimiento.", fullName, strings.ToLower(kindLabel))
 		hero = "Código: " + reference
-		plazo = "Tienes derecho a una respuesta en un plazo máximo de 30 días calendario. Te escribiremos a este correo apenas tengamos una respuesta."
+		plazo = "Tienes derecho a una respuesta en un plazo máximo de 15 días hábiles improrrogables. Te escribiremos a este correo apenas tengamos una respuesta."
 	} else {
 		intro = fmt.Sprintf("Hi %s, we've registered your %s in our Virtual Complaints Book. Save your tracking code.", fullName, strings.ToLower(kindLabel))
 		hero = "Code: " + reference
-		plazo = "You're entitled to a response within a maximum of 30 calendar days. We'll email you here as soon as we have one."
+		plazo = "You're entitled to a response within a maximum of 15 business days, which cannot be extended. We'll email you here as soon as we have one."
 	}
 
 	rows := emailRow(map[bool]string{true: "Bien contratado", false: "Product/service"}[es], productDescription) +

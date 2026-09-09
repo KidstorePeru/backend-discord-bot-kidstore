@@ -595,8 +595,9 @@ func HandlerGetAllComplaints(database *sql.DB) gin.HandlerFunc {
 }
 
 // HandlerRespondComplaint registra la respuesta del negocio a un reclamo o
-// queja y avisa al consumidor por correo. Por el reglamento de INDECOPI, el
-// plazo máximo de respuesta es de 30 días calendario desde su presentación.
+// queja y avisa al consumidor por correo. Por Ley N° 29571 (modificada por
+// la Ley N° 31435, vigente desde el 21/05/2022), el plazo máximo de
+// respuesta es de 15 días hábiles improrrogables desde su presentación.
 func HandlerRespondComplaint(database *sql.DB, cfg types.EnvConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, err := uuid.Parse(c.Param("id"))
