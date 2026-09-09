@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -118,6 +119,12 @@ func redirectLinkError(c *gin.Context, frontendURL, provider, reason string) {
 	c.Redirect(http.StatusFound, frontendURL+"/account/security?link_error="+url.QueryEscape(reason)+"&provider="+url.QueryEscape(provider))
 }
 
+// oauthCodeTTL — el código de un solo uso solo necesita sobrevivir el
+// rebote navegador→/auth/callback→POST /auth/exchange, que pasa en
+// segundos; 2 minutos da margen sin dejarlo utilizable por mucho tiempo si
+// alguien llegara a verlo.
+const oauthCodeTTL = 2 * time.Minute
+
 func issueLoginRedirect(c *gin.Context, database *sql.DB, cfg Config, customer types.Customer) {
 	// Cuenta admin con 2FA activado → el login por OAuth NO puede saltarse
 	// el segundo factor (si pudiera, el 2FA de la contraseña sería
@@ -131,9 +138,13 @@ func issueLoginRedirect(c *gin.Context, database *sql.DB, cfg Config, customer t
 			return
 		}
 		db.AddAuditLog(database, &customer.ID, "LOGIN_2FA_PENDING", "OAuth correcto, esperando código 2FA", c.ClientIP())
-		redirectURL := fmt.Sprintf("%s/auth/callback?requires_2fa=true&temp_token=%s",
-			cfg.FrontendURL, url.QueryEscape(tempToken))
-		c.Redirect(http.StatusFound, redirectURL)
+		payload, _ := json.Marshal(map[string]interface{}{"requires_2fa": true, "temp_token": tempToken})
+		code, err := db.CreateOAuthLoginCode(database, string(payload), oauthCodeTTL)
+		if err != nil {
+			redirectError(c, cfg.FrontendURL, "token_error")
+			return
+		}
+		c.Redirect(http.StatusFound, fmt.Sprintf("%s/auth/callback?code=%s", cfg.FrontendURL, url.QueryEscape(code)))
 		return
 	}
 
@@ -150,7 +161,47 @@ func issueLoginRedirect(c *gin.Context, database *sql.DB, cfg Config, customer t
 	db.CreateRefreshToken(database, customer.ID, refreshHash, time.Now().Add(7*24*time.Hour))
 	db.AddAuditLog(database, &customer.ID, "LOGIN_OAUTH", "login via OAuth", c.ClientIP())
 
-	redirectURL := fmt.Sprintf("%s/auth/callback?token=%s&refresh_token=%s",
-		cfg.FrontendURL, url.QueryEscape(token), url.QueryEscape(refreshPlain))
-	c.Redirect(http.StatusFound, redirectURL)
+	// El token de acceso y sobre todo el refresh token (válido 7 días) ya
+	// NO viajan en la URL de redirect — antes quedaban expuestos en
+	// cualquier cosa que registrara la URL completa (logs del hosting/proxy,
+	// historial del navegador, Referer de recursos externos). Ahora el
+	// redirect solo lleva un código de un solo uso; el frontend lo canjea
+	// por los tokens reales vía POST /auth/exchange (cuerpo, no URL).
+	payload, _ := json.Marshal(map[string]interface{}{"token": token, "refresh_token": refreshPlain})
+	code, err := db.CreateOAuthLoginCode(database, string(payload), oauthCodeTTL)
+	if err != nil {
+		redirectError(c, cfg.FrontendURL, "token_error")
+		return
+	}
+	c.Redirect(http.StatusFound, fmt.Sprintf("%s/auth/callback?code=%s", cfg.FrontendURL, url.QueryEscape(code)))
+}
+
+// HandlerExchangeOAuthCode — POST /auth/exchange. Canjea el código de un
+// solo uso que /auth/callback recibió por query por los datos reales del
+// login (token+refresh_token, o requires_2fa+temp_token) — siempre en el
+// cuerpo de la petición y de la respuesta, nunca en una URL. El código se
+// borra al leerlo (ConsumeOAuthLoginCode), así que un mismo código nunca
+// sirve dos veces, y expira solo en 2 minutos si nadie lo usa.
+func HandlerExchangeOAuthCode(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Code string `json:"code" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "código requerido"})
+			return
+		}
+		payload, ok := db.ConsumeOAuthLoginCode(database, req.Code)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "código inválido o expirado"})
+			return
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(payload), &data); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error interno"})
+			return
+		}
+		data["success"] = true
+		c.JSON(http.StatusOK, data)
+	}
 }

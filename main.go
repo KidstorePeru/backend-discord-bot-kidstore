@@ -213,6 +213,7 @@ func main() {
 		authRateLimited.GET("/google",                oauth.HandlerGoogleAuth(oauthCfg))
 		authRateLimited.GET("/discord",                oauth.HandlerDiscordAuth(oauthCfg))
 		authRateLimited.POST("/complete-registration", oauth.HandlerCompleteRegistration(database, oauthCfg))
+		authRateLimited.POST("/exchange",              oauth.HandlerExchangeOAuthCode(database))
 	}
 	// Los callbacks los invoca el navegador redirigido por Google/Discord — sin rate limit por IP del cliente
 	router.GET("/auth/google/callback", oauth.HandlerGoogleCallback(database, oauthCfg))

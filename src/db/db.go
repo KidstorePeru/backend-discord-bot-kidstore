@@ -403,6 +403,24 @@ func CreateTables(db *sql.DB) error {
 			processed_at TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_webhook_events_gateway ON webhook_events(gateway, received_at DESC)`,
+		// Código efímero de un solo uso para el intercambio final del login
+		// OAuth (Google/Discord) — antes, HandlerGoogleCallback/HandlerDiscordCallback
+		// redirigían al frontend con el token de acceso Y el refresh token de
+		// 7 días directamente en el query string (?token=...&refresh_token=...).
+		// Cualquier cosa que registre la URL completa (logs de acceso del
+		// hosting/proxy, historial del navegador, el header Referer si la
+		// página de destino carga algún recurso externo antes de limpiar la
+		// URL) terminaba con esos secretos en texto plano. Ahora el redirect
+		// solo lleva un código de un solo uso de corta duración; el
+		// intercambio por los tokens reales pasa por POST /auth/exchange, con
+		// el código y los tokens viajando en el cuerpo, nunca en la URL.
+		`CREATE TABLE IF NOT EXISTS oauth_login_codes (
+			code VARCHAR(64) PRIMARY KEY,
+			payload TEXT NOT NULL,
+			expires_at TIMESTAMP NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
+		`DELETE FROM oauth_login_codes WHERE expires_at < NOW()`,
 	}
 
 	for _, q := range queries {
@@ -1737,6 +1755,43 @@ func MarkWebhookEventProcessed(db *sql.DB, id uuid.UUID, outcome string) {
 	if _, err := db.Exec(`UPDATE webhook_events SET outcome=$1, processed_at=NOW() WHERE id=$2`, outcome, id); err != nil {
 		slog.Error("no se pudo actualizar webhook_event", "id", id, "error", err)
 	}
+}
+
+// CreateOAuthLoginCode genera un código de un solo uso (32 bytes al azar,
+// 256 bits de entropía — imposible de adivinar) que representa, por un
+// tiempo muy corto, el resultado de un login OAuth exitoso. payload es el
+// JSON que se le va a devolver al frontend cuando lo canjee (los tokens
+// reales, o el temp_token de 2FA pendiente) — nunca viaja por la URL.
+func CreateOAuthLoginCode(db *sql.DB, payload string, ttl time.Duration) (string, error) {
+	b := make([]byte, 32)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", err
+	}
+	code := hex.EncodeToString(b)
+	// El vencimiento se calcula con el NOW() de PostgreSQL, no con
+	// time.Now() de Go — mismo motivo que CreatePendingRegistration: evita
+	// un desfase de reloj/zona horaria entre donde corre el proceso Go y la
+	// base de datos. Se confirmó en pruebas locales: con time.Now().Add(ttl)
+	// pasado como parámetro, un dev machine en una zona horaria distinta a
+	// la de la base de datos genera un expires_at que ConsumeOAuthLoginCode
+	// ve como "ya vencido" desde el instante en que se crea.
+	_, err := db.Exec(`INSERT INTO oauth_login_codes (code, payload, expires_at) VALUES ($1,$2,NOW() + $3 * INTERVAL '1 second')`,
+		code, payload, int(ttl.Seconds()))
+	if err != nil {
+		return "", err
+	}
+	return code, nil
+}
+
+// ConsumeOAuthLoginCode canjea el código UNA SOLA VEZ — el DELETE...RETURNING
+// es atómico, así que si dos peticiones llegaran a la vez con el mismo
+// código (alguien reenviando la petición, una pestaña duplicada), solo una
+// puede ganar la carrera y quedarse con el payload; la otra ve que ya no
+// existe. Un código vencido tampoco se devuelve, aunque siga en la tabla
+// hasta el próximo barrido.
+func ConsumeOAuthLoginCode(db *sql.DB, code string) (payload string, ok bool) {
+	err := db.QueryRow(`DELETE FROM oauth_login_codes WHERE code=$1 AND expires_at > NOW() RETURNING payload`, code).Scan(&payload)
+	return payload, err == nil
 }
 
 func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
