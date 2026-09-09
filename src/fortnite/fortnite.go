@@ -660,6 +660,63 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 	return string(evidenceBytes), nil
 }
 
+// ==================== VBUCKS BALANCE ====================
+
+// GetRealVBucksBalance consulta directamente el perfil "common_core" de Epic
+// (el mismo endpoint MCP que usa el juego) y devuelve el balance real de
+// V-Bucks de la cuenta — así no hace falta mantenerlo a mano en el panel
+// admin, ni confiar en que quede sincronizado tras cargas manuales.
+func GetRealVBucksBalance(database *sql.DB, account types.GameAccount) (int, error) {
+	botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
+
+	req, err := http.NewRequest("POST",
+		fmt.Sprintf("https://fngw-mcp-gc-livefn.ol.epicgames.com/fortnite/api/game/v2/profile/%s/client/QueryProfile?profileId=common_core", botIDClean),
+		bytes.NewBufferString("{}"))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, _, err := executeWithRefresh(database, account, req)
+	if err != nil {
+		return 0, fmt.Errorf("error consultando perfil: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode > 204 {
+		return 0, fmt.Errorf("QueryProfile status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var parsed struct {
+		ProfileChanges []struct {
+			Profile struct {
+				Items map[string]struct {
+					TemplateId string `json:"templateId"`
+					Quantity   int    `json:"quantity"`
+				} `json:"items"`
+			} `json:"profile"`
+		} `json:"profileChanges"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return 0, fmt.Errorf("error parseando perfil: %w", err)
+	}
+	if len(parsed.ProfileChanges) == 0 {
+		return 0, fmt.Errorf("respuesta de perfil vacía")
+	}
+	// MtxPurchased = V-Bucks comprados; MtxGiveaway = V-Bucks regalados por
+	// Epic (Crew, compensaciones). Ambos se gastan igual al enviar un regalo,
+	// así que el balance real utilizable es la suma de los dos (una cuenta
+	// puede tener ambos tipos a la vez).
+	total := 0
+	for _, item := range parsed.ProfileChanges[0].Profile.Items {
+		if item.TemplateId == "Currency:MtxPurchased" || item.TemplateId == "Currency:MtxGiveaway" {
+			total += item.Quantity
+		}
+	}
+	return total, nil // 0 es una respuesta válida (cuenta sin V-Bucks), no un error
+}
+
 // ==================== GOROUTINE: Auto-accept friend requests ====================
 
 func StartFriendRequestAcceptor(database *sql.DB, intervalSeconds int) {

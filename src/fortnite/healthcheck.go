@@ -78,6 +78,19 @@ func checkAllTokens(database *sql.DB) {
 			failureCountsMu.Lock()
 			delete(failureCounts, account.ID) // se recuperó — resetear contador
 			failureCountsMu.Unlock()
+
+			// Sincronizar el balance real de V-Bucks desde Epic — así el panel
+			// admin nunca queda desactualizado ni depende de que alguien lo
+			// edite a mano tras cargar pavos a la cuenta.
+			if realVbucks, err := GetRealVBucksBalance(database, account); err != nil {
+				slog.Warn("HealthCheck: no se pudo sincronizar V-Bucks", "bot", account.DisplayName, "error", err)
+			} else if realVbucks != account.VBucks {
+				if err := db.UpdateBotVbucks(database, account.ID, realVbucks); err != nil {
+					slog.Warn("HealthCheck: error guardando V-Bucks sincronizados", "bot", account.DisplayName, "error", err)
+				} else {
+					slog.Info("HealthCheck: V-Bucks sincronizados", "bot", account.DisplayName, "anterior", account.VBucks, "real", realVbucks)
+				}
+			}
 			continue
 		}
 
