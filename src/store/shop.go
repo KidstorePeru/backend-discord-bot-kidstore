@@ -510,6 +510,7 @@ func processOrders(database *sql.DB) {
 	accounts, err := db.GetActiveGameAccounts(database, encryptionKey)
 	if err != nil || len(accounts) == 0 {
 		slog.Warn("Worker: no hay cuentas bot activas disponibles")
+		discordbot.AlertNoActiveBots(len(orders))
 		noBotsMsg := "Sin cuentas bot activas disponibles."
 		for _, order := range orders {
 			db.UpdateOrderStatus(database, order.ID, "failed", nil, &noBotsMsg)
@@ -554,6 +555,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 	if !hasSlots {
 		noSlotsMsg := "Todas las cuentas bot han agotado sus envíos del día. Los gifts se resetean diariamente."
 		slog.Warn("Worker: sin slots en ningún bot", "orderID", order.ID)
+		discordbot.AlertNoActiveBots(1)
 		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noSlotsMsg)
 		return
 	}
@@ -671,6 +673,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			strings.Contains(errLower, "deactivated") {
 			slog.Warn("Worker: token invalido, marcando bot como inactivo", "bot", bot.DisplayName)
 			db.DeactivateGameAccount(database, bot.ID)
+			discordbot.AlertBotDeactivated(bot.ID, bot.DisplayName, "error de autenticación al intentar enviar un regalo: "+errMsg)
 			bot.RemainingGifts = 0
 			continue // probar siguiente bot
 		}
@@ -680,6 +683,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			slog.Warn("Worker: límite de gifts alcanzado, probando siguiente bot",
 				"bot", bot.DisplayName, "orderID", order.ID)
 			db.UpdateRemainingGifts(database, bot.ID, 0)
+			discordbot.AlertNoGiftSlots(bot.ID, bot.DisplayName)
 			bot.RemainingGifts = 0
 			anyGiftLimit = true
 			continue // probar siguiente bot

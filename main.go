@@ -319,6 +319,7 @@ func main() {
 				slog.Error("Error reseteando gifts diarios", "error", err)
 			} else if n > 0 {
 				slog.Info("Gifts diarios reseteados", "cuentas", n)
+				discordbot.ClearAllNoGiftSlotsAlerts()
 			}
 			time.Sleep(10 * time.Minute)
 		}

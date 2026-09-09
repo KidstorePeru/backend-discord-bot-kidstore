@@ -2,7 +2,9 @@ package fortnite
 
 import (
 	"KidStoreStore/src/db"
+	"KidStoreStore/src/discordbot"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -78,18 +80,22 @@ func checkAllTokens(database *sql.DB) {
 			failureCountsMu.Lock()
 			delete(failureCounts, account.ID) // se recuperó — resetear contador
 			failureCountsMu.Unlock()
+			discordbot.ClearBotDeactivatedAlert(account.ID) // token OK → si se desactiva de nuevo, avisar otra vez
 
 			// Sincronizar el balance real de V-Bucks desde Epic — así el panel
 			// admin nunca queda desactualizado ni depende de que alguien lo
 			// edite a mano tras cargar pavos a la cuenta.
 			if realVbucks, err := GetRealVBucksBalance(database, account); err != nil {
 				slog.Warn("HealthCheck: no se pudo sincronizar V-Bucks", "bot", account.DisplayName, "error", err)
-			} else if realVbucks != account.VBucks {
-				if err := db.UpdateBotVbucks(database, account.ID, realVbucks); err != nil {
-					slog.Warn("HealthCheck: error guardando V-Bucks sincronizados", "bot", account.DisplayName, "error", err)
-				} else {
-					slog.Info("HealthCheck: V-Bucks sincronizados", "bot", account.DisplayName, "anterior", account.VBucks, "real", realVbucks)
+			} else {
+				if realVbucks != account.VBucks {
+					if err := db.UpdateBotVbucks(database, account.ID, realVbucks); err != nil {
+						slog.Warn("HealthCheck: error guardando V-Bucks sincronizados", "bot", account.DisplayName, "error", err)
+					} else {
+						slog.Info("HealthCheck: V-Bucks sincronizados", "bot", account.DisplayName, "anterior", account.VBucks, "real", realVbucks)
+					}
 				}
+				discordbot.CheckVBucksAlert(account.ID, account.DisplayName, realVbucks)
 			}
 			continue
 		}
@@ -120,6 +126,7 @@ func checkAllTokens(database *sql.DB) {
 				// (el dueño inició sesión directamente en el juego, o algo la invalidó)
 				slog.Warn("HealthCheck: refresh falló repetidamente, marcando como inactiva", "bot", account.DisplayName, "error", err, "fallos_seguidos", count)
 				db.DeactivateGameAccount(database, account.ID)
+				discordbot.AlertBotDeactivated(account.ID, account.DisplayName, fmt.Sprintf("el refresco de su token falló %d veces seguidas — probablemente alguien inició sesión directamente en el juego con esta cuenta", count))
 				failureCountsMu.Lock()
 				delete(failureCounts, account.ID)
 				failureCountsMu.Unlock()

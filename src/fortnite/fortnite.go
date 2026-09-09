@@ -219,6 +219,10 @@ func HandlerFinishConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "No se pudo guardar la cuenta bot", "details": err.Error()})
 			return
 		}
+		// Se acaba de (re)vincular con éxito — si estaba desactivada por una
+		// alerta anterior, permitir que vuelva a avisar si se desactiva de nuevo
+		// más adelante, en vez de quedar silenciada para siempre.
+		discordbot.ClearBotDeactivatedAlert(accountID)
 
 		// 3. Obtener device secrets para re-autenticación permanente (opcional pero importante)
 		reqSecrets, _ := http.NewRequest("POST",
