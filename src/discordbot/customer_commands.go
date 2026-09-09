@@ -201,11 +201,19 @@ func handleBotsCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	respondEmbedEphemeral(s, i, embed)
 }
 
+// "failed" y "refunded" se muestran distinto a propósito: un pedido queda
+// en "failed" apenas se intenta el reembolso, y solo pasa a "refunded"
+// cuando ese reembolso REALMENTE se confirma (ver failOrderAndRefund en
+// shop.go) — normalmente son segundos, pero en el caso raro de que el
+// reembolso falle y quede pendiente de reintento automático (unos
+// minutos, ver RetryFailedRefunds), decirle al cliente "Reembolsado" sin
+// que sea cierto todavía sería el mismo problema que se corrigió en el
+// correo de pedido fallido.
 var orderStatusLabel = map[string]string{
 	"pending":    "🟡 En procesamiento",
 	"processing": "🔵 En entrega",
 	"sent":       "🟢 Completado",
-	"failed":     "⚪ Reembolsado",
+	"failed":     "🟠 Reembolso en proceso",
 	"refunded":   "⚪ Reembolsado",
 }
 

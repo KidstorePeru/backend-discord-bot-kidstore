@@ -335,7 +335,12 @@ func SendOrderSentEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, it
 
 // ==================== PEDIDO NO COMPLETADO (reembolsado) ====================
 
-func SendOrderFailedEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, itemImage string, priceKC int, reason, lang string) {
+// refunded debe reflejar si el reembolso de KC REALMENTE se confirmó (ver
+// failOrderAndRefund en shop.go) — nunca se afirma en el correo que el KC
+// ya volvió sin haberlo confirmado primero. Antes este correo siempre decía
+// "ya te devolvimos el KC completo" sin importar si el reembolso había
+// fallado.
+func SendOrderFailedEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, itemImage string, priceKC int, reason string, refunded bool, lang string) {
 	if !hasEmailProvider(cfg) {
 		return
 	}
@@ -343,21 +348,35 @@ func SendOrderFailedEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, 
 	es := lang != "en"
 
 	subject := "KidStorePeru — "
-	intro, itemSub, accountLabel, reasonLabel, btnText, heroText := "", "", "", "", "", ""
+	intro, itemSub, accountLabel, reasonLabel, btnText, heroText, eyebrow := "", "", "", "", "", "", ""
 	if es {
 		subject += "Pedido no se pudo completar"
-		intro = "No pudimos entregar tu item — ya te devolvimos el KC completo."
 		itemSub = "No se pudo entregar"
 		accountLabel, reasonLabel = "Cuenta Epic", "Motivo"
 		btnText = "Ir a la tienda"
-		heroText = fmt.Sprintf("%d KC de vuelta", priceKC)
+		if refunded {
+			intro = "No pudimos entregar tu item — ya te devolvimos el KC completo."
+			heroText = fmt.Sprintf("%d KC de vuelta", priceKC)
+			eyebrow = "KC reembolsado"
+		} else {
+			intro = "No pudimos entregar tu item. Tu reembolso de KC está en proceso — te avisamos apenas se confirme, no hace falta que hagas nada."
+			heroText = fmt.Sprintf("%d KC en camino", priceKC)
+			eyebrow = "Reembolso en proceso"
+		}
 	} else {
 		subject += "Order could not be completed"
-		intro = "We couldn't deliver your item — we already refunded the full KC."
 		itemSub = "Could not be delivered"
 		accountLabel, reasonLabel = "Epic Account", "Reason"
 		btnText = "Go to the store"
-		heroText = fmt.Sprintf("%d KC back", priceKC)
+		if refunded {
+			intro = "We couldn't deliver your item — we already refunded the full KC."
+			heroText = fmt.Sprintf("%d KC back", priceKC)
+			eyebrow = "KC refunded"
+		} else {
+			intro = "We couldn't deliver your item. Your KC refund is being processed — we'll let you know as soon as it's confirmed, no action needed on your side."
+			heroText = fmt.Sprintf("%d KC pending", priceKC)
+			eyebrow = "Refund in progress"
+		}
 	}
 
 	rows := emailRow(accountLabel, epicUsername)
@@ -365,7 +384,7 @@ func SendOrderFailedEmail(cfg types.EnvConfig, toEmail, epicUsername, itemName, 
 		rows += emailRow(reasonLabel, reason)
 	}
 
-	body := emailEyebrow(map[bool]string{true: "KC reembolsado", false: "KC refunded"}[es]) +
+	body := emailEyebrow(eyebrow) +
 		emailItemRow(itemImage, itemName, itemSub) +
 		emailHero(emailKCIcon(22), heroText, true) +
 		emailCopy(intro) +

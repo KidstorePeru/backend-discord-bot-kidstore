@@ -1131,6 +1131,26 @@ func RecordSlotPlay(db *sql.DB, customerID uuid.UUID, betAmount int, won bool, p
 	return err
 }
 
+// GetOrdersPendingRefund lista pedidos 'failed' cuyo reembolso nunca llegó
+// a confirmarse — RefundOrder solo deja un pedido en 'refunded' cuando el
+// reembolso realmente se ejecuta; si falla, el pedido se queda en 'failed'
+// sin más. Eso es justo la señal que usa RetryFailedRefunds (shop.go) para
+// encontrar reembolsos pendientes y reintentarlos: es seguro reintentar
+// tantas veces como haga falta, porque RefundOrder por sí mismo ya rechaza
+// reembolsar un pedido que ya esté en 'refunded' (o 'sent'). El margen de 5
+// minutos evita pisarle el intento a failOrderAndRefund mientras todavía
+// está corriendo.
+func GetOrdersPendingRefund(db *sql.DB) ([]types.Order, error) {
+	rows, err := db.Query(`
+		SELECT id, customer_id, epic_username, item_offer_id, item_name,
+		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, delivery_evidence, created_at, updated_at
+		FROM orders WHERE status='failed' AND updated_at < NOW() - INTERVAL '5 minutes'
+		ORDER BY created_at ASC LIMIT 100`)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	return scanOrders(rows)
+}
+
 func RefundOrder(db *sql.DB, orderID uuid.UUID) error {
 	tx, err := db.Begin()
 	if err != nil { return err }

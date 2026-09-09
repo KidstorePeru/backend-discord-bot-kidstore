@@ -515,11 +515,7 @@ func processOrders(database *sql.DB) {
 		discordbot.AlertNoActiveBots(len(orders))
 		noBotsMsg := "Sin cuentas bot activas disponibles."
 		for _, order := range orders {
-			db.UpdateOrderStatus(database, order.ID, "failed", nil, &noBotsMsg)
-			db.RefundOrder(database, order.ID)
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
-				fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, noBotsMsg), "worker")
-			notifyOrderFailed(database, order, "No había cuentas disponibles para procesar tu pedido en ese momento.")
+			failOrderAndRefund(database, order, noBotsMsg, "No había cuentas disponibles para procesar tu pedido en ese momento.")
 		}
 		return
 	}
@@ -532,11 +528,68 @@ func processOrders(database *sql.DB) {
 	}
 }
 
-// notifyOrderFailed avisa por correo que un pedido no se pudo completar y
-// que el KC ya se reembolsó — antes esto no pasaba, y el cliente solo se
-// enteraba si entraba a revisar su panel manualmente. "reason" debe ser un
-// texto ya pensado para el cliente, no el error técnico crudo.
-func notifyOrderFailed(database *sql.DB, order types.Order, reason string) {
+// failOrderAndRefund centraliza lo que antes estaba repetido (con
+// variaciones inconsistentes) en cada punto donde un pedido falla: marca el
+// pedido fallido, intenta reembolsar el KC, y SOLO afirma en el audit log y
+// en el correo al cliente que "ya se reembolsó" cuando el reembolso
+// realmente se confirmó. Antes, algunas ramas ni siquiera revisaban el
+// error de RefundOrder y notificaban éxito igual — si el reembolso fallaba
+// (ej. un error transitorio de DB), el pedido quedaba 'failed' sin su KC
+// devuelto, pero el cliente recibía un correo diciendo "ya te devolvimos el
+// KC completo". El status del pedido queda como señal honesta de si el
+// reembolso se completó: RefundOrder deja el pedido en 'refunded' recién
+// cuando de verdad se ejecuta — si falla, el pedido se queda en 'failed'
+// (RefundOrder no vuelve a rechazarlo por eso, así que es seguro
+// reintentarlo más tarde — ver RetryFailedRefunds).
+func failOrderAndRefund(database *sql.DB, order types.Order, internalReason, customerReason string) {
+	db.UpdateOrderStatus(database, order.ID, "failed", nil, &internalReason)
+	refundErr := db.RefundOrder(database, order.ID)
+	refunded := refundErr == nil
+
+	if refunded {
+		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
+			fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, internalReason), "worker")
+	} else {
+		slog.Error("Worker: no se pudo reembolsar el pedido, queda pendiente de reintento", "orderID", order.ID, "error", refundErr)
+		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
+			fmt.Sprintf("pedido %s: %s — REEMBOLSO FALLÓ (%s), pendiente de reintento automático", order.ID, internalReason, refundErr), "worker")
+	}
+
+	notifyOrderFailed(database, order, customerReason, refunded)
+}
+
+// RetryFailedRefunds reintenta el reembolso de pedidos que quedaron en
+// 'failed' sin que su devolución de KC se haya confirmado nunca (ver
+// failOrderAndRefund) — la red de recuperación para el caso que el punto 11
+// pedía explícitamente: "permite recuperar devoluciones pendientes". Se
+// llama periódicamente desde main.go. Seguro de reintentar cualquier
+// cantidad de veces: RefundOrder por sí mismo rechaza reembolsar un pedido
+// que ya esté 'refunded' (o 'sent'), así que nunca duplica el KC devuelto.
+func RetryFailedRefunds(database *sql.DB) {
+	orders, err := db.GetOrdersPendingRefund(database)
+	if err != nil {
+		slog.Error("RetryFailedRefunds: error listando pedidos", "error", err)
+		return
+	}
+	for _, order := range orders {
+		o := order
+		safe.Run("RetryFailedRefunds.order", func() {
+			if err := db.RefundOrder(database, o.ID); err != nil {
+				slog.Warn("RetryFailedRefunds: reembolso sigue fallando, se reintentará más tarde", "orderID", o.ID, "error", err)
+				return
+			}
+			slog.Info("RetryFailedRefunds: reembolso pendiente recuperado", "orderID", o.ID, "customer", o.CustomerID)
+			db.AddAuditLog(database, &o.CustomerID, "ORDER_REFUND_RECOVERED",
+				fmt.Sprintf("pedido %s: reembolso pendiente se completó en un reintento automático", o.ID), "worker")
+		})
+	}
+}
+
+// notifyOrderFailed avisa por correo que un pedido no se pudo completar —
+// "refunded" refleja si el KC de verdad ya se devolvió (nunca se afirma sin
+// confirmarlo primero, ver failOrderAndRefund). "reason" debe ser un texto
+// ya pensado para el cliente, no el error técnico crudo.
+func notifyOrderFailed(database *sql.DB, order types.Order, reason string, refunded bool) {
 	customer, err := db.GetCustomerByID(database, order.CustomerID)
 	if err != nil {
 		return
@@ -544,7 +597,7 @@ func notifyOrderFailed(database *sql.DB, order types.Order, reason string) {
 	if customer.Email != nil && *customer.Email != "" {
 		itemImage := ""
 		if order.ItemImage != nil { itemImage = *order.ItemImage }
-		go SendOrderFailedEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, itemImage, order.PriceKC, reason, "es")
+		go SendOrderFailedEmail(smtpConfig, *customer.Email, order.EpicUsername, order.ItemName, itemImage, order.PriceKC, reason, refunded, "es")
 	}
 }
 
@@ -575,11 +628,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		if err != nil {
 			errMsg := fmt.Sprintf("no se encontró el usuario Epic '%s': %s", order.EpicUsername, err.Error())
 			slog.Error("Worker: usuario no encontrado", "orderID", order.ID, "msg", errMsg)
-			db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
-			db.RefundOrder(database, order.ID)
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
-				fmt.Sprintf("pedido %s: %s", order.ID, errMsg), "worker")
-			notifyOrderFailed(database, order, fmt.Sprintf("No pudimos encontrar la cuenta de Epic Games '%s'. Verifica que el usuario esté bien escrito.", order.EpicUsername))
+			failOrderAndRefund(database, order, errMsg, fmt.Sprintf("No pudimos encontrar la cuenta de Epic Games '%s'. Verifica que el usuario esté bien escrito.", order.EpicUsername))
 			return
 		}
 		receiverAccountID = id
@@ -764,15 +813,9 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		}
 
 		// Error permanente → fallar y reembolsar
-		if refundErr := db.RefundOrder(database, order.ID); refundErr != nil {
-			slog.Warn("Worker: error reembolsando pedido", "orderID", order.ID, "error", refundErr)
-		}
-		db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
-		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
-			fmt.Sprintf("pedido %s falló: %s — KC reembolsados", order.ID, errMsg), "worker")
 		// Al cliente no se le manda el error técnico crudo de Epic, solo un
 		// motivo genérico y entendible.
-		notifyOrderFailed(database, order, "Ocurrió un error técnico al procesar el envío.")
+		failOrderAndRefund(database, order, errMsg, "Ocurrió un error técnico al procesar el envío.")
 		return
 	}
 
@@ -786,11 +829,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		// El receptor no es amigo de ningún bot → error permanente
 		errMsg := fmt.Sprintf("el usuario '%s' no está en la lista de amigos de ningún bot disponible", order.EpicUsername)
 		slog.Error("Worker: usuario no es amigo de ningún bot", "orderID", order.ID)
-		db.UpdateOrderStatus(database, order.ID, "failed", nil, &errMsg)
-		db.RefundOrder(database, order.ID)
-		db.AddAuditLog(database, &order.CustomerID, "ORDER_FAILED",
-			fmt.Sprintf("pedido %s: %s — KC reembolsados", order.ID, errMsg), "worker")
-		notifyOrderFailed(database, order, "Tu cuenta de Epic Games no es amiga de ninguno de nuestros bots todavía. Agrega alguno desde la página de Bots y vuelve a intentar tu compra.")
+		failOrderAndRefund(database, order, errMsg, "Tu cuenta de Epic Games no es amiga de ninguno de nuestros bots todavía. Agrega alguno desde la página de Bots y vuelve a intentar tu compra.")
 	} else if activeBots == 0 && insufficientFundsBots > 0 {
 		// Ningún bot con slots tenía V-Bucks suficientes para este pedido en
 		// particular — no es que no haya bots, es que ninguno tiene fondos

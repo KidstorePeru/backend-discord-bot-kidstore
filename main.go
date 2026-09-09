@@ -332,6 +332,17 @@ func main() {
 		}
 	}()
 
+	// ── Reintento de reembolsos de pedidos que quedaron pendientes de
+	// confirmar (ver failOrderAndRefund / RetryFailedRefunds) ──
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			safe.Run("RetryFailedRefunds", func() {
+				store.RetryFailedRefunds(database)
+			})
+		}
+	}()
+
 	// ── Reset diario de gifts de bots (remaining_gifts vuelve a 5 cada día) ──
 	go func() {
 		for {
