@@ -257,6 +257,7 @@ func main() {
 		customer.GET("/voucher/order/:id",     store.HandlerOrderVoucher(database))
 		customer.GET("/voucher/recharge/:id",  store.HandlerRechargeVoucher(database))
 		customer.GET("/orders",            store.HandlerGetMyOrders(database))
+		customer.GET("/orders/stats",      store.HandlerGetMyOrderStats(database))
 		customer.GET("/recharges",         store.HandlerGetMyRecharges(database))
 		customer.PUT("/profile",           store.HandlerUpdateProfile(database, cfg.SecretKey))
 		customer.PUT("/avatar",            store.HandlerUpdateAvatar(database))

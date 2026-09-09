@@ -821,19 +821,38 @@ func UnlinkDiscordID(db *sql.DB, customerID uuid.UUID) error {
 	return err
 }
 
-func GetAllCustomers(db *sql.DB, page, limit int) ([]types.Customer, int, error) {
+// GetAllCustomers pagina la lista de clientes para el panel admin — antes
+// el frontend pedía un solo lote sin page/limit y paginaba/buscaba SOLO
+// dentro de esos primeros registros, así que con más clientes de los que
+// entraban en ese lote, ni la paginación ni la búsqueda podían llegar a
+// verlos nunca. search (opcional) filtra por epic_username o email
+// directamente en la base de datos — así la búsqueda cubre TODOS los
+// clientes, no solo la página cargada.
+func GetAllCustomers(db *sql.DB, page, limit int, search string) ([]types.Customer, int, error) {
 	if page < 1 { page = 1 }
-	if limit < 1 || limit > 200 { limit = 50 }
+	if limit < 1 { limit = 50 }
+	if limit > 200 { limit = 200 }
 	offset := (page - 1) * limit
+	search = strings.TrimSpace(search)
+
+	where := "WHERE is_active=true"
+	args := []interface{}{}
+	if search != "" {
+		where += " AND (epic_username ILIKE $1 OR email ILIKE $1)"
+		args = append(args, "%"+search+"%")
+	}
 
 	var total int
-	db.QueryRow(`SELECT COUNT(*) FROM customers WHERE is_active=true`).Scan(&total)
+	db.QueryRow(`SELECT COUNT(*) FROM customers `+where, args...).Scan(&total)
 
+	args = append(args, limit, offset)
+	limitPos := fmt.Sprintf("$%d", len(args)-1)
+	offsetPos := fmt.Sprintf("$%d", len(args))
 	rows, err := db.Query(`
     SELECT id, epic_username, email, kc_balance,
            google_id, discord_id, discord_username, avatar_url, phone, has_password, email_changed_at,
            is_active, is_verified, COALESCE(is_admin,false), totp_secret_enc, totp_enabled, totp_pending_secret_enc, created_at, updated_at
-    FROM customers WHERE is_active=true ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
+    FROM customers `+where+` ORDER BY created_at DESC LIMIT `+limitPos+` OFFSET `+offsetPos, args...)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
 	var customers []types.Customer
@@ -1271,15 +1290,28 @@ func GetCustomerOrderStats(db *sql.DB, customerID uuid.UUID) (totalOrders, sentO
 
 func GetOrdersByCustomer(db *sql.DB, customerID uuid.UUID, page, limit int) ([]types.Order, int, error) {
 	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 20 }
+	// Antes, CUALQUIER límite fuera de rango (incluido uno demasiado ALTO,
+	// como los 200 que pide el frontend de /perfil) se reseteaba a 20 en vez
+	// de recortarse al máximo permitido — un cliente con más de 20 pedidos
+	// nunca podía ver el resto, aunque el frontend pidiera explícitamente
+	// más. Ahora se recorta al máximo (100), no se descarta el pedido entero.
+	if limit < 1 { limit = 20 }
+	if limit > 100 { limit = 100 }
 	offset := (page - 1) * limit
 
 	var total int
 	db.QueryRow(`SELECT COUNT(*) FROM orders WHERE customer_id=$1`, customerID).Scan(&total)
 
+	// NOTA: bug encontrado en pruebas del punto 14 (misma clase que el del
+	// punto 7 — GetAllCustomers) — a esta consulta le faltaba
+	// delivery_evidence, pero scanOrders (compartida con GetAllOrders) SÍ
+	// intenta leerla: "expected 13 destination arguments in Scan, not 14".
+	// Esto rompía /store/orders (HandlerGetMyOrders, la página de pedidos
+	// del cliente) en cada llamada, sin relación con los cambios de límite
+	// de este mismo commit.
 	rows, err := db.Query(`
 		SELECT id, customer_id, epic_username, item_offer_id, item_name,
-		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, created_at, updated_at
+		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, delivery_evidence, created_at, updated_at
 		FROM orders WHERE customer_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`, customerID, limit, offset)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
@@ -1298,18 +1330,42 @@ func GetOrderByID(db *sql.DB, id uuid.UUID) (types.Order, error) {
 	return o, err
 }
 
-func GetAllOrders(db *sql.DB, page, limit int) ([]types.Order, int, error) {
+// GetAllOrders pagina el listado de pedidos del panel admin — mismo
+// problema y misma solución que GetAllCustomers: search (opcional) filtra
+// por epic_username o nombre del ítem directamente en la base de datos,
+// para que la búsqueda alcance a TODOS los pedidos, no solo al primer lote.
+func GetAllOrders(db *sql.DB, page, limit int, search, status string) ([]types.Order, int, error) {
 	if page < 1 { page = 1 }
-	if limit < 1 || limit > 200 { limit = 50 }
+	if limit < 1 { limit = 50 }
+	if limit > 200 { limit = 200 }
 	offset := (page - 1) * limit
+	search = strings.TrimSpace(search)
+
+	conds := []string{}
+	args := []interface{}{}
+	if search != "" {
+		args = append(args, "%"+search+"%")
+		conds = append(conds, fmt.Sprintf("(epic_username ILIKE $%d OR item_name ILIKE $%d)", len(args), len(args)))
+	}
+	if status != "" && status != "all" {
+		args = append(args, status)
+		conds = append(conds, fmt.Sprintf("status = $%d", len(args)))
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
 
 	var total int
-	db.QueryRow(`SELECT COUNT(*) FROM orders`).Scan(&total)
+	db.QueryRow(`SELECT COUNT(*) FROM orders `+where, args...).Scan(&total)
 
+	args = append(args, limit, offset)
+	limitPos := fmt.Sprintf("$%d", len(args)-1)
+	offsetPos := fmt.Sprintf("$%d", len(args))
 	rows, err := db.Query(`
 		SELECT id, customer_id, epic_username, item_offer_id, item_name,
 		       item_image, price_kc, price_vbucks, status, game_account_id, error_msg, delivery_evidence, created_at, updated_at
-		FROM orders ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
+		FROM orders `+where+` ORDER BY created_at DESC LIMIT `+limitPos+` OFFSET `+offsetPos, args...)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
 	orders, err := scanOrders(rows)
@@ -1679,15 +1735,32 @@ func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
 	return txs, nil
 }
 
-func GetAllPaymentTransactions(db *sql.DB, page, limit int) ([]types.PaymentTransaction, int, error) {
+// GetAllPaymentTransactions pagina los pagos del panel admin — status
+// (opcional, "all" o vacío = sin filtrar) se aplica en la base de datos
+// para que el filtro combine correctamente con la paginación real, en vez
+// de filtrar solo dentro del primer lote ya cargado.
+func GetAllPaymentTransactions(db *sql.DB, page, limit int, status string) ([]types.PaymentTransaction, int, error) {
 	if page < 1 { page = 1 }
-	if limit < 1 || limit > 200 { limit = 50 }
+	if limit < 1 { limit = 50 }
+	if limit > 200 { limit = 200 }
 	offset := (page - 1) * limit
+
+	where := ""
+	args := []interface{}{}
+	if status != "" && status != "all" {
+		args = append(args, status)
+		where = "WHERE status = $1"
+	}
+
 	var total int
-	db.QueryRow(`SELECT COUNT(*) FROM payment_transactions`).Scan(&total)
+	db.QueryRow(`SELECT COUNT(*) FROM payment_transactions `+where, args...).Scan(&total)
+
+	args = append(args, limit, offset)
+	limitPos := fmt.Sprintf("$%d", len(args)-1)
+	offsetPos := fmt.Sprintf("$%d", len(args))
 	rows, err := db.Query(`
 		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
-		FROM payment_transactions ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
+		FROM payment_transactions `+where+` ORDER BY created_at DESC LIMIT `+limitPos+` OFFSET `+offsetPos, args...)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
 	var txs []types.PaymentTransaction

@@ -19,7 +19,8 @@ func HandlerGetAllCustomers(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-		customers, total, err := db.GetAllCustomers(database, page, limit)
+		search := c.Query("search")
+		customers, total, err := db.GetAllCustomers(database, page, limit, search)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo clientes"})
 			return
@@ -210,7 +211,9 @@ func HandlerGetAllOrders(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-		orders, total, err := db.GetAllOrders(database, page, limit)
+		search := c.Query("search")
+		status := c.Query("status")
+		orders, total, err := db.GetAllOrders(database, page, limit, search, status)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo pedidos"})
 			return
@@ -224,7 +227,8 @@ func HandlerGetAllPayments(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-		payments, total, err := db.GetAllPaymentTransactions(database, page, limit)
+		status := c.Query("status")
+		payments, total, err := db.GetAllPaymentTransactions(database, page, limit, status)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo pagos"})
 			return

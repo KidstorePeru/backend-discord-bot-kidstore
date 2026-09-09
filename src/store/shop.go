@@ -413,6 +413,33 @@ func HandlerGetMyOrders(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// HandlerGetMyOrderStats devuelve totales calculados directamente en la
+// base de datos (no sobre una página de resultados ya recortada) — /perfil
+// los usaba mal: mostraba len(orders) de un solo lote (como mucho 100
+// pedidos, antes ni eso por el bug del límite) como si fuera el total real
+// del cliente. GetCustomerOrderStats ya existía y la usaba el bot de
+// Discord, pero nunca se había expuesto por HTTP para el sitio web.
+func HandlerGetMyOrderStats(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		customerIDStr, ok := middleware.GetCustomerID(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "no autorizado"})
+			return
+		}
+		customerID, err := uuid.Parse(customerIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		total, sent, spentKC, err := db.GetCustomerOrderStats(database, customerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo estadísticas"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "total_orders": total, "sent_orders": sent, "total_spent_kc": spentKC})
+	}
+}
+
 // ==================== COMPROBANTE DE PEDIDO ====================
 
 // HandlerOrderVoucher devuelve los datos para la página de comprobante de un
