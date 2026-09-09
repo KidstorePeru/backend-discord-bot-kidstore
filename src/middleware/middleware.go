@@ -298,9 +298,20 @@ func (r *IPRateLimiter) Allow(ip string) bool {
 			valid = append(valid, t)
 		}
 	}
+	// Antes se agregaba "now" SIEMPRE, incluso cuando la IP ya estaba sobre
+	// el límite — alguien mandando muchísimas peticiones rechazadas desde
+	// una sola IP hacía crecer attempts[ip] sin ningún tope mientras durara
+	// el ataque (y cada peticion nueva recorría un slice cada vez más
+	// grande para decidir el rechazo). Una vez alcanzado el límite dentro
+	// de la ventana, ya no se siguen sumando intentos — el tamaño del
+	// slice queda acotado a como mucho r.limit elementos.
+	if len(valid) >= r.limit {
+		r.attempts[ip] = valid
+		return false
+	}
 	valid = append(valid, now)
 	r.attempts[ip] = valid
-	return len(valid) <= r.limit
+	return true
 }
 
 // RateLimitMiddleware aplica rate limiting por IP.

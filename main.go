@@ -138,6 +138,35 @@ func main() {
 	// volver a registrarlos, eso duplicaba cada línea de log en producción.
 	router := gin.Default()
 
+	// Proxies confiables: sin esto, Gin confía por defecto en el
+	// X-Forwarded-For de CUALQUIERA (TrustedProxies = "confía en todos"),
+	// así que c.ClientIP() — la clave que usa TODO el rate limiting por
+	// IP — podía ser falsificada por cualquiera con solo mandar su propio
+	// header X-Forwarded-For, sin pasar por ningún proxy real. La app corre
+	// detrás de un proxy de borde (Railway u otro hosting equivalente) que
+	// la alcanza por red interna/privada — se confía únicamente en rangos
+	// privados (RFC 1918) + loopback, que es de donde realmente puede venir
+	// esa conexión interna. Si el hosting cambiara a un esquema distinto
+	// (ej. un CDN con IPs públicas propias por delante), esta lista
+	// tendría que actualizarse con esas IPs/rangos específicos.
+	if err := router.SetTrustedProxies([]string{
+		"127.0.0.1/8", "::1/128",
+		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+	}); err != nil {
+		log.Fatalf("Error configurando proxies confiables: %v", err)
+	}
+
+	// Límite de tamaño de request — sin esto, un cuerpo enorme (nadie lo
+	// necesita: el payload más pesado real es un avatar en base64 ya
+	// redimensionado a 256x256 del lado del cliente) se leía y parseaba
+	// entero antes de que cualquier validación pudiera rechazarlo,
+	// suficiente para agotar memoria/CPU con pocas peticiones grandes.
+	const maxRequestBodyBytes = 4 << 20 // 4 MB
+	router.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
+		c.Next()
+	})
+
 	// Construir lista de orígenes permitidos incluyendo siempre los dominios de producción
 	allowedOrigins := []string{
 		"https://www.kidstoreperu.net",
@@ -374,7 +403,21 @@ func main() {
 
 	port := cfg.Port
 	if port == "" { port = "8081" }
-	srv := &http.Server{Addr: ":" + port, Handler: router}
+	// Sin timeouts, el http.Server de Go no corta NUNCA una conexión lenta
+	// por su cuenta — un cliente que mande la petición a propósito muy
+	// despacio (ataque estilo Slowloris) o que simplemente nunca termine de
+	// leer la respuesta puede dejar la conexión (y la goroutine que la
+	// atiende) abierta indefinidamente. ReadHeaderTimeout/ReadTimeout cubren
+	// la lectura de la petición, WriteTimeout la respuesta, e IdleTimeout
+	// las conexiones keep-alive sin actividad.
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	go func() {
 		slog.Info("KidStore Store API iniciado", "port", port)

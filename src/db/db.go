@@ -421,6 +421,10 @@ func CreateTables(db *sql.DB) error {
 			created_at TIMESTAMP NOT NULL DEFAULT NOW()
 		)`,
 		`DELETE FROM oauth_login_codes WHERE expires_at < NOW()`,
+		// El código de reclamo pasó de 3 a 6 bytes al azar (24→48 bits de
+		// entropía) — "KS-YYMMDD-" + 12 caracteres hex ya no entra en el
+		// VARCHAR(20) original.
+		`ALTER TABLE consumer_complaints ALTER COLUMN reference TYPE VARCHAR(30)`,
 	}
 
 	for _, q := range queries {
@@ -2112,9 +2116,17 @@ func DeleteOwnAccount(db *sql.DB, customerID uuid.UUID) error {
 
 // generateComplaintReference crea un código corto y humano-legible para que
 // el consumidor pueda identificar y hacer seguimiento a su reclamo (ej:
-// "KS-260908-A1B2C3"). No es secreto — solo un identificador de seguimiento.
+// "KS-260908-A1B2C3D4E5F6"). Antes usaba solo 3 bytes al azar (24 bits) —
+// combinado con que el prefijo de fecha es adivinable (cualquiera sabe qué
+// día es hoy), la parte realmente desconocida para un atacante quedaba en
+// apenas ~16.7 millones de combinaciones por día. GET /store/complaints/:reference
+// es público (nadie necesita estar logueado) y solo tiene rate limit POR IP
+// (5/hora) — alguien con varias IPs podía intentar fuerza bruta contra el
+// código de otra persona. Ahora son 6 bytes (48 bits): ~281 billones de
+// combinaciones, inviable de recorrer por fuerza bruta a cualquier
+// velocidad realista, incluso repartida entre muchas IPs.
 func generateComplaintReference() (string, error) {
-	b := make([]byte, 3)
+	b := make([]byte, 6)
 	if _, err := cryptorand.Read(b); err != nil {
 		return "", err
 	}
