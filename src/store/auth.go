@@ -70,7 +70,10 @@ func HandlerRegister(database *sql.DB, secretKey string, cfg types.EnvConfig) gi
 				// solo el token. Así, quien complete la verificación en su bandeja
 				// de entrada real siempre activa la cuenta con los datos que
 				// ACABA de elegir, nunca con los de un intento anterior ajeno.
-				db.UpdatePendingRegistrationToken(database, req.EpicUsername, req.Email, string(hash), verificationToken, lang)
+				if updErr := db.UpdatePendingRegistrationToken(database, req.EpicUsername, req.Email, string(hash), verificationToken, lang); updErr != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error al iniciar registro"})
+					return
+				}
 			} else {
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error al iniciar registro"})
 				return
@@ -209,7 +212,14 @@ func HandlerResendVerification(database *sql.DB, cfg types.EnvConfig) gin.Handle
 			// Reenvío del mismo registro pendiente sin cambios — se pasan de
 			// vuelta su propio usuario/contraseña/idioma ya guardados, solo se
 			// renueva el token y la expiración.
-			db.UpdatePendingRegistrationToken(database, pending.EpicUsername, body.Email, pending.PasswordHash, newToken, body.Lang)
+			if updErr := db.UpdatePendingRegistrationToken(database, pending.EpicUsername, body.Email, pending.PasswordHash, newToken, body.Lang); updErr != nil {
+				// No se manda el correo con un token que no llegó a guardarse —
+				// el mensaje sigue siendo el mismo genérico (no delata si el
+				// correo existe), el error queda solo en el log del servidor.
+				slog.Error("resend-verification: no se pudo renovar el token pendiente", "email", body.Email, "error", updErr)
+				c.JSON(http.StatusOK, gin.H{"success": true, "message": genericMsg})
+				return
+			}
 			go sendVerificationEmail(cfg, body.Email, newToken, pending.EpicUsername, body.Lang)
 			c.JSON(http.StatusOK, gin.H{"success": true, "message": genericMsg})
 			return

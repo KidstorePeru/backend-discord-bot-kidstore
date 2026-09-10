@@ -702,11 +702,18 @@ func GetPendingRegistrationByEmail(db *sql.DB, email string) (PendingRegistratio
 // dueño real del correo, pero la cuenta que activa terminaría teniendo el
 // usuario/contraseña que haya elegido quien se registró primero — nunca
 // hay que asumir que el primer intento es el legítimo.
-func UpdatePendingRegistrationToken(db *sql.DB, epicUsername, email, passwordHash, newToken, lang string) {
-	db.Exec(`UPDATE pending_registrations
+func UpdatePendingRegistrationToken(db *sql.DB, epicUsername, email, passwordHash, newToken, lang string) error {
+	// Encontrado escribiendo pruebas de regresión: esta función descartaba
+	// el error de db.Exec (ni siquiera lo devolvía) — si el UPDATE fallaba
+	// por lo que sea, el llamador no tenía forma de saberlo y seguía
+	// adelante como si el reemplazo hubiera funcionado, mandando el correo
+	// de verificación igual. Ahora sí devuelve el error para que el
+	// llamador decida qué hacer.
+	_, err := db.Exec(`UPDATE pending_registrations
 		SET epic_username=$1, password_hash=$2, verification_token=$3, lang=$4, expires_at=NOW() + INTERVAL '24 hours'
 		WHERE email=$5`,
 		epicUsername, passwordHash, newToken, lang, email)
+	return err
 }
 
 func DeletePendingRegistration(db *sql.DB, token string) {
