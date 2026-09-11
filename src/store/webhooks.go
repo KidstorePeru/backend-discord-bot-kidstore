@@ -403,6 +403,17 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 				outcome = "error: status query failed"
 				return
 			}
+			if status == "partially_paid" {
+				// El cliente pagó menos cripto de lo esperado — antes esto se
+				// trataba igual que cualquier pago pendiente y simplemente
+				// expiraba en 30 min sin que nadie se enterara. Ahora se
+				// avisa por Discord para que soporte decida manualmente
+				// (acreditar proporcional o contactar al cliente) en vez de
+				// perderlo en silencio.
+				discordbot.AlertUnderpaidCryptoPayment(notification.PaymentID, orderID)
+				outcome = "ignored: partially paid, admin alerted"
+				return
+			}
 			if status != "confirmed" && status != "finished" {
 				return
 			}

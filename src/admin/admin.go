@@ -3,6 +3,7 @@ package admin
 import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/discordbot"
+	"KidStoreStore/src/middleware"
 	"KidStoreStore/src/store"
 	"KidStoreStore/src/types"
 	"database/sql"
@@ -14,6 +15,31 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// adminActor identifica quién ejecuta una acción de administrador, para que
+// el registro de auditoría deje de atribuir todo a la cadena genérica
+// "admin" (o a X-Approved-By, un header que manda el propio cliente y que
+// cualquiera con acceso de admin podía poner en cualquier valor). Cuando el
+// acceso fue por JWT (Método 2 de AdminAuthMiddleware, ej. login con 2FA),
+// el middleware ya dejó guardado el customer_id real y verificado — se usa
+// para buscar un nombre legible. Cuando el acceso fue por la clave de API
+// compartida (Método 1 — el método que usa hoy el panel de administración),
+// no existe ninguna identidad individual que verificar: se etiqueta como
+// tal en vez de inventar o confiar en un dato que el propio cliente puede
+// mandar. Dar responsabilidad individual real a cada admin requiere que el
+// panel inicie sesión con una cuenta propia en vez de la clave compartida —
+// un cambio más grande que queda fuera de este arreglo puntual.
+func adminActor(c *gin.Context, database *sql.DB) string {
+	if customerIDStr, ok := middleware.GetCustomerID(c); ok {
+		if id, err := uuid.Parse(customerIDStr); err == nil {
+			if customer, err := db.GetCustomerByID(database, id); err == nil {
+				return customer.EpicUsername
+			}
+		}
+		return customerIDStr
+	}
+	return "clave de API compartida"
+}
 
 func HandlerGetAllCustomers(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -53,8 +79,19 @@ func HandlerGetCustomer(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// maxManualKCAdjustment topa cuánto puede moverse el saldo de un cliente en
+// un solo ajuste manual (edición directa en el panel, o /admin/recharge).
+// Antes no había ningún tope — un cero de más al escribir el monto (o un
+// uso indebido) acreditaba una cantidad arbitraria sin que el sistema lo
+// cuestionara. 125 000 KC son 10 veces el paquete más grande que se vende
+// hoy (Legend, 12 500 KC) — generoso para una corrección real, pero
+// suficiente para frenar un error de tipeo evidente. Si este número no
+// encaja con cómo se usa el panel en la práctica, es solo una constante:
+// se ajusta acá.
+const maxManualKCAdjustment = 125000
+
 // HandlerUpdateCustomer — PUT /admin/customers/:id
-// Permite editar epic_username, email y kc_balance de un cliente
+// Permite editar epic_username, email, kc_balance e is_admin de un cliente.
 func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, err := uuid.Parse(c.Param("id"))
@@ -64,18 +101,18 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 		}
 
 		var req struct {
-			EpicUsername *string `json:"epic_username"`
-			Email        *string `json:"email"`
-			KCBalance    *int    `json:"kc_balance"`
-			IsAdmin      *bool   `json:"is_admin"`
+			EpicUsername   *string `json:"epic_username"`
+			Email          *string `json:"email" binding:"omitempty,email"`
+			KCBalance      *int    `json:"kc_balance"`
+			KCBalanceNote  *string `json:"kc_balance_note"`
+			IsAdmin        *bool   `json:"is_admin"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
 			return
 		}
 
-		// Verificar que el cliente existe
-		_, err = db.GetCustomerByID(database, id)
+		customer, err := db.GetCustomerByID(database, id)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado"})
 			return
@@ -85,6 +122,7 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 		if req.EpicUsername != nil { epic = strings.TrimSpace(*req.EpicUsername) }
 		email := ""
 		if req.Email != nil { email = strings.ToLower(strings.TrimSpace(*req.Email)) }
+		actor := adminActor(c, database)
 
 		if err := db.UpdateProfile(database, id, epic, "", nil); err != nil {
 			if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
@@ -104,58 +142,123 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 				return
 			}
 		}
+		if epic != "" || email != "" {
+			db.AddAuditLog(database, &id, "ADMIN_CUSTOMER_UPDATED",
+				fmt.Sprintf("datos del cliente editados por %s", actor), c.ClientIP())
+		}
 
-		// Actualizar balance KC si se especificó
+		// Ajustar balance KC si se especificó — antes esto era un SET directo
+		// (UPDATE customers SET kc_balance=$1 ...) que pisaba el número sin
+		// dejar ningún rastro de cuánto era antes, cuánto cambió, ni por qué
+		// — y era, de hecho, la ÚNICA forma que tenía el panel web de bajar
+		// el saldo de alguien (RechargeKC, la otra vía, solo suma). Ahora se
+		// calcula la diferencia contra el balance real y se aplica a través
+		// de los mismos mecanismos con ledger que ya usa la recarga manual
+		// (RechargeKC para subir, DeductKCManual para bajar — el mismo que
+		// ya usa el comando /kc remove de Discord), así que cualquier cambio
+		// de saldo desde el panel queda siempre en el mismo registro
+		// auditable, sin importar por qué puerta se hizo.
 		if req.KCBalance != nil {
 			if *req.KCBalance < 0 {
 				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "el balance KC no puede ser negativo"})
 				return
 			}
-			if _, err := database.Exec(`UPDATE customers SET kc_balance=$1, updated_at=NOW() WHERE id=$2`, *req.KCBalance, id); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando balance"})
+			delta := *req.KCBalance - customer.KCBalance
+			if delta > maxManualKCAdjustment || delta < -maxManualKCAdjustment {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": fmt.Sprintf("el ajuste (%+d KC) supera el máximo permitido de %d KC por operación", delta, maxManualKCAdjustment)})
 				return
+			}
+			note := "ajuste manual desde edición de cliente"
+			if req.KCBalanceNote != nil && strings.TrimSpace(*req.KCBalanceNote) != "" {
+				note = strings.TrimSpace(*req.KCBalanceNote)
+			}
+			switch {
+			case delta > 0:
+				if _, err := db.RechargeKC(database, id, delta, nil, &note, actor, "manual_admin_edit"); err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando balance"})
+					return
+				}
+			case delta < 0:
+				if _, err := db.DeductKCManual(database, id, -delta); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+					return
+				}
+			}
+			if delta != 0 {
+				db.AddAuditLog(database, &id, "ADMIN_BALANCE_ADJUSTED",
+					fmt.Sprintf("%s ajustó el balance de %d a %d KC (%+d) — nota: %s", actor, customer.KCBalance, *req.KCBalance, delta, note), c.ClientIP())
 			}
 		}
 
-		// Actualizar rol admin si se especificó
-		if req.IsAdmin != nil {
+		// Otorgar/quitar rol admin — se separa del log genérico de arriba a
+		// propósito: antes, cambiar is_admin pasaba por el mismo formulario
+		// y el mismo log ("cliente actualizado por admin") que cambiar un
+		// nombre de usuario, sin ninguna marca que distinguiera "esto fue un
+		// cambio de permisos". Si una clave de admin se filtrara alguna vez,
+		// así era fácil crear en silencio un segundo acceso permanente que
+		// sobrevive aunque se rote la clave filtrada. Ahora queda su propia
+		// entrada de auditoría, inconfundible.
+		if req.IsAdmin != nil && *req.IsAdmin != customer.IsAdmin {
 			if err := db.SetCustomerAdmin(database, id, *req.IsAdmin); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando rol"})
 				return
 			}
+			action := "ADMIN_PRIVILEGE_REVOKED"
+			verb := "quitó"
+			if *req.IsAdmin {
+				action = "ADMIN_PRIVILEGE_GRANTED"
+				verb = "otorgó"
+			}
+			db.AddAuditLog(database, &id, action,
+				fmt.Sprintf("%s %s el rol de administrador a %s", actor, verb, customer.EpicUsername), c.ClientIP())
 		}
 
-		db.AddAuditLog(database, &id, "ADMIN_CUSTOMER_UPDATED", "cliente actualizado por admin", c.ClientIP())
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "cliente actualizado correctamente"})
 	}
 }
 
 // HandlerDeleteCustomer — DELETE /admin/customers/:id
-// Desactiva (soft delete) o elimina definitivamente un cliente
+//
+// Antes esto borraba al cliente por completo con un DELETE directo. Como
+// orders.customer_id NO tiene ON DELETE CASCADE (a propósito, para no
+// perder historial de pedidos) pero payment_transactions/kc_recharges/
+// slot_plays SÍ lo tienen, el resultado real dependía de qué cliente
+// fuera: (a) uno con algún pedido → el DELETE fallaba con un error de
+// restricción de llave foránea, sin forma de eliminarlo desde el panel; (b)
+// uno sin pedidos pero que sí pagó o recargó → el DELETE funcionaba, pero
+// borraba para siempre su historial de pagos y recargas — justo el tipo de
+// registro financiero que un negocio necesita conservar. Ahora, en vez de
+// eliminar, se desactiva (is_active=false) — el mismo mecanismo que ya usa
+// la auto-eliminación de cuenta del propio cliente — dejando intacto todo
+// su historial de pedidos/pagos/recargas para poder consultarlo después
+// (soporte, disputas de pago, contabilidad). No se anonimizan sus datos
+// (a diferencia de la auto-eliminación): un admin puede necesitar seguir
+// viendo el correo/usuario real de una cuenta que desactivó, por ejemplo
+// para investigar fraude.
 func HandlerDeleteCustomer(database *sql.DB) gin.HandlerFunc {
-    return func(c *gin.Context) {
-        id, err := uuid.Parse(c.Param("id"))
-        if err != nil {
-            c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
-            return
-        }
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
 
-        var epicUsername string
-        err = database.QueryRow(`SELECT epic_username FROM customers WHERE id=$1`, id).Scan(&epicUsername)
-        if err != nil {
-            c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado"})
-            return
-        }
+		var epicUsername string
+		err = database.QueryRow(`SELECT epic_username FROM customers WHERE id=$1`, id).Scan(&epicUsername)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado"})
+			return
+		}
 
-        if _, err := database.Exec(`DELETE FROM customers WHERE id=$1`, id); err != nil {
-            c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error eliminando cliente"})
-            return
-        }
+		if err := db.DeactivateCustomerByAdmin(database, id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error desactivando cliente"})
+			return
+		}
 
-        db.AddAuditLog(database, nil, "ADMIN_CUSTOMER_DELETED",
-            fmt.Sprintf("cliente %s eliminado permanentemente por admin", epicUsername), c.ClientIP())
-        c.JSON(http.StatusOK, gin.H{"success": true, "message": "cliente eliminado correctamente"})
-    }
+		db.AddAuditLog(database, &id, "ADMIN_CUSTOMER_DEACTIVATED",
+			fmt.Sprintf("cliente %s desactivado por %s — historial de pedidos/pagos conservado", epicUsername, adminActor(c, database)), c.ClientIP())
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "cliente desactivado correctamente — su historial se conserva"})
+	}
 }
 
 func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
@@ -170,9 +273,15 @@ func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "customer_id inválido"})
 			return
 		}
-
-		approvedBy := strings.TrimSpace(c.GetHeader("X-Approved-By"))
-		if approvedBy == "" { approvedBy = "admin" }
+		// Antes "quién aprobó" salía de X-Approved-By, un header que manda
+		// el propio cliente HTTP (hoy el panel siempre manda el literal fijo
+		// "admin-panel") — no identificaba a nadie en particular y, al ser
+		// un dato que el cliente controla, tampoco era confiable como
+		// registro de auditoría. adminActor usa la identidad real verificada
+		// por el middleware cuando el acceso fue por JWT, o etiqueta
+		// honestamente "clave de API compartida" cuando no hay forma de
+		// saber quién individualmente ejecutó la acción.
+		approvedBy := adminActor(c, database)
 
 		rechargeID, err := db.RechargeKC(database, customerID, req.AmountKC, req.AmountSoles, req.Note, approvedBy, "manual")
 		if err != nil {

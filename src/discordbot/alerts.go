@@ -173,6 +173,26 @@ func ClearAllNoGiftSlotsAlerts() {
 	}
 }
 
+// AlertUnderpaidCryptoPayment se llama cuando NOWPayments reporta un pago
+// como "partially_paid" — el cliente mandó menos cripto de lo esperado
+// (comisión de red, o el precio de la cripto se movió justo en el momento
+// del pago). Antes esto no se distinguía de cualquier otro pago pendiente:
+// simplemente expiraba a los 30 minutos sin acreditar KC y sin que nadie de
+// soporte se enterara para decidir si acreditar proporcional o contactar al
+// cliente. Se alerta una sola vez por pago (no se repite si NOWPayments
+// reenvía el mismo IPN).
+func AlertUnderpaidCryptoPayment(paymentID int64, orderID string) {
+	key := fmt.Sprintf("underpaid_%d", paymentID)
+	if !shouldAlert(key) {
+		return
+	}
+	sendAdminAlert(
+		"🟡 Pago cripto incompleto",
+		fmt.Sprintf("NOWPayments reportó el pago **%d** (pedido %s) como pagado parcialmente — el cliente no acreditó KC. Revisa el pago en el panel y decide si acreditar el monto proporcional o contactar al cliente.", paymentID, orderID),
+		colorWarnSoft,
+	)
+}
+
 // AlertNoActiveBots es la más urgente de todas: el worker de pedidos no
 // encontró NINGÚN bot disponible para procesar la cola. Los pedidos quedan
 // pendientes hasta que se resuelva. Tiene cooldown propio en vez de

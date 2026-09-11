@@ -282,6 +282,11 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 
 const maxPendingOrdersPerCustomer = 10
 
+// friendGracePeriod — ver el comentario en processOrder, caso "el receptor
+// no es amigo de ningún bot". 10 minutos cubren al menos un ciclo completo
+// del aceptador automático de solicitudes de amistad (corre cada 5 min).
+const friendGracePeriod = 10 * time.Minute
+
 func HandlerCreateOrder(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		customerIDStr, ok := middleware.GetCustomerID(c)
@@ -355,25 +360,21 @@ func HandlerCreateOrder(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		// ── Límite de pedidos pendientes por cliente (máx. 10) ──
-		pendingCount, err := db.CountPendingOrdersByCustomer(database, customerID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error verificando pedidos"})
-			return
-		}
-		if pendingCount >= maxPendingOrdersPerCustomer {
-			c.JSON(http.StatusTooManyRequests, gin.H{
-				"success": false,
-				"error":   fmt.Sprintf("Tienes %d pedidos pendientes. Espera a que se procesen antes de crear nuevos (máximo %d).", pendingCount, maxPendingOrdersPerCustomer),
-				"code":    "TOO_MANY_ORDERS",
-			})
-			return
-		}
-
-		order, err := db.DeductKCAndCreateOrder(database, customerID, customer.EpicUsername, req)
+		// ── Límite de pedidos pendientes por cliente (máx. 10) — la cuenta
+		// se hace ahora dentro de la misma transacción que descuenta el
+		// saldo y crea el pedido (ver DeductKCAndCreateOrder), para que dos
+		// compras simultáneas del mismo cliente no puedan las dos pasar la
+		// comprobación antes de que cualquiera inserte su pedido. ──
+		order, err := db.DeductKCAndCreateOrder(database, customerID, customer.EpicUsername, req, maxPendingOrdersPerCustomer)
 		if err != nil {
 			if strings.Contains(err.Error(), "insufficient") {
 				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			} else if strings.Contains(err.Error(), "too many pending orders") {
+				c.JSON(http.StatusTooManyRequests, gin.H{
+					"success": false,
+					"error":   fmt.Sprintf("Tienes %d pedidos pendientes. Espera a que se procesen antes de crear nuevos (máximo %d).", maxPendingOrdersPerCustomer, maxPendingOrdersPerCustomer),
+					"code":    "TOO_MANY_ORDERS",
+				})
 			} else {
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error creando pedido"})
 			}
@@ -779,7 +780,13 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 				slog.Warn("Worker: error guardando evidencia de entrega", "orderID", order.ID, "error", markErr)
 				db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
 			}
-			db.UpdateRemainingGifts(database, bot.ID, bot.RemainingGifts-1)
+			// Resta atómica en SQL, no un SET absoluto calculado en memoria —
+			// evita que dos instancias del worker procesando la misma cuenta
+			// bot casi al mismo tiempo pisen el contador real de regalos
+			// (ver el comentario de DecrementRemainingGifts en db.go).
+			if decErr := db.DecrementRemainingGifts(database, bot.ID); decErr != nil {
+				slog.Warn("Worker: error descontando regalo restante del bot", "bot", bot.DisplayName, "error", decErr)
+			}
 			bot.RemainingGifts--
 
 			if order.PriceVBucks > 0 {
@@ -880,9 +887,29 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		slog.Warn("Worker: todos los bots agotaron límite de gifts", "orderID", order.ID)
 		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noSlotsMsg)
 	} else if activeBots > 0 && notFriendBots == activeBots {
-		// El receptor no es amigo de ningún bot → error permanente
+		// El receptor no es amigo de ningún bot. El flujo pensado es
+		// "agrega al bot, después compra" — pero nada impide comprar
+		// primero, y este mismo chequeo (sin distinción) también se
+		// cumple para un cliente que compró hace 10 segundos y todavía
+		// no tuvo tiempo de agregar al bot en Epic Games, o cuyo pedido
+		// de amistad ya está mandado pero el aceptador automático
+		// (corre cada 5 min, ver StartFriendRequestAcceptor en main.go)
+		// todavía no pasó por él. Antes esto se reembolsaba de inmediato
+		// (el worker corre cada 30s) sin darle a un cliente legítimo
+		// ninguna chance real de agregar al bot a tiempo. Ahora se da un
+		// margen de gracia: recién se reembolsa si el pedido lleva más
+		// de friendGracePeriod sin encontrar amistad con ningún bot —
+		// tiempo de sobra para que pase al menos un ciclo del aceptador
+		// automático, incluso si el cliente todavía no había agregado a
+		// nadie en el momento de comprar.
+		if time.Since(order.CreatedAt) < friendGracePeriod {
+			pendingMsg := "Esperando a que agregues alguno de nuestros bots como amigo en Fortnite."
+			slog.Info("Worker: usuario aún no es amigo de ningún bot, dentro del margen de gracia", "orderID", order.ID, "edad", time.Since(order.CreatedAt))
+			db.UpdateOrderStatus(database, order.ID, "pending", nil, &pendingMsg)
+			return
+		}
 		errMsg := fmt.Sprintf("el usuario '%s' no está en la lista de amigos de ningún bot disponible", order.EpicUsername)
-		slog.Error("Worker: usuario no es amigo de ningún bot", "orderID", order.ID)
+		slog.Error("Worker: usuario no es amigo de ningún bot tras el margen de gracia", "orderID", order.ID)
 		failOrderAndRefund(database, order, errMsg, "Tu cuenta de Epic Games no es amiga de ninguno de nuestros bots todavía. Agrega alguno desde la página de Bots y vuelve a intentar tu compra.")
 	} else if activeBots == 0 && insufficientFundsBots > 0 {
 		// Ningún bot con slots tenía V-Bucks suficientes para este pedido en

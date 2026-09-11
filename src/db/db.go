@@ -438,11 +438,11 @@ func CreateTables(db *sql.DB) error {
 // ==================== PRODUCT AVAILABILITY ====================
 
 type ProductAvailability struct {
-	ProductID       string `json:"product_id"`
+	ProductID       string `json:"product_id" binding:"required"`
 	Enabled         bool   `json:"enabled"`
 	ScheduleEnabled bool   `json:"schedule_enabled"`
-	StartHour       int    `json:"start_hour"`
-	EndHour         int    `json:"end_hour"`
+	StartHour       int    `json:"start_hour" binding:"min=0,max=23"`
+	EndHour         int    `json:"end_hour"   binding:"min=0,max=23"`
 	Timezone        string `json:"timezone"`
 }
 
@@ -728,15 +728,26 @@ func PendingRegistrationExists(db *sql.DB, email string) bool {
 
 // ==================== CUSTOMER ====================
 
+// Nota sobre EmailExists/EpicUsernameExists: si la consulta fallara (error
+// transitorio de conexión), count se queda en su valor cero y la función
+// reporta "no existe" en vez de "no se pudo comprobar" — el registro real
+// no se rompe porque el INSERT tiene su propia restricción UNIQUE como
+// segunda línea de defensa, pero antes ese error quedaba completamente
+// invisible. Se loguea para poder notar un problema de conexión recurrente
+// antes de que se vuelva más grave.
 func EmailExists(db *sql.DB, email string) bool {
 	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM customers WHERE email=$1`, email).Scan(&count)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM customers WHERE email=$1`, email).Scan(&count); err != nil {
+		slog.Error("EmailExists: error consultando", "error", err)
+	}
 	return count > 0
 }
 
 func EpicUsernameExists(db *sql.DB, epicUsername string) bool {
 	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM customers WHERE epic_username=$1`, epicUsername).Scan(&count)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM customers WHERE epic_username=$1`, epicUsername).Scan(&count); err != nil {
+		slog.Error("EpicUsernameExists: error consultando", "error", err)
+	}
 	return count > 0
 }
 
@@ -872,7 +883,9 @@ func GetAllCustomers(db *sql.DB, page, limit int, search string) ([]types.Custom
 	}
 
 	var total int
-	db.QueryRow(`SELECT COUNT(*) FROM customers `+where, args...).Scan(&total)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM customers `+where, args...).Scan(&total); err != nil {
+		slog.Error("GetAllCustomers: error contando total", "error", err)
+	}
 
 	args = append(args, limit, offset)
 	limitPos := fmt.Sprintf("$%d", len(args)-1)
@@ -976,23 +989,35 @@ func CreateOAuthCustomer(db *sql.DB, epicUsername string, email *string, randomP
 	return GetCustomerByID(db, customerID)
 }
 
+// UpdateProfile actualiza hasta 3 campos independientes del cliente. Antes
+// cada uno se guardaba con su propio Exec separado — si el segundo fallaba
+// justo después de que el primero ya se hubiera guardado, el cliente
+// quedaba con una actualización a medias (por ejemplo, el nombre de usuario
+// Epic cambiado pero la contraseña nueva no) y quien llamó a la función solo
+// se enteraba del error del paso que falló, sin saber que el anterior sí se
+// aplicó. Ahora los tres updates que se hayan pedido corren dentro de una
+// sola transacción — o se aplican todos, o no se aplica ninguno.
 func UpdateProfile(db *sql.DB, customerID uuid.UUID, epicUsername, passwordHash string, phone *string) error {
+	tx, err := db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+
 	if epicUsername != "" {
-		if _, err := db.Exec(`UPDATE customers SET epic_username=$1, updated_at=NOW() WHERE id=$2`, epicUsername, customerID); err != nil {
+		if _, err := tx.Exec(`UPDATE customers SET epic_username=$1, updated_at=NOW() WHERE id=$2`, epicUsername, customerID); err != nil {
 			return err
 		}
 	}
 	if passwordHash != "" {
-		if _, err := db.Exec(`UPDATE customers SET password_hash=$1, has_password=true, updated_at=NOW() WHERE id=$2`, passwordHash, customerID); err != nil {
+		if _, err := tx.Exec(`UPDATE customers SET password_hash=$1, has_password=true, updated_at=NOW() WHERE id=$2`, passwordHash, customerID); err != nil {
 			return err
 		}
 	}
 	if phone != nil {
-		if _, err := db.Exec(`UPDATE customers SET phone=$1, updated_at=NOW() WHERE id=$2`, *phone, customerID); err != nil {
+		if _, err := tx.Exec(`UPDATE customers SET phone=$1, updated_at=NOW() WHERE id=$2`, *phone, customerID); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // ==================== EMAIL VERIFICATION ====================
@@ -1126,7 +1151,7 @@ func DeductKCManual(db *sql.DB, customerID uuid.UUID, amount int) (int, error) {
 	return currentBalance - amount, nil
 }
 
-func DeductKCAndCreateOrder(db *sql.DB, customerID uuid.UUID, epicUsername string, req types.CreateOrderRequest) (types.Order, error) {
+func DeductKCAndCreateOrder(db *sql.DB, customerID uuid.UUID, epicUsername string, req types.CreateOrderRequest, maxPendingOrders int) (types.Order, error) {
 	tx, err := db.Begin()
 	if err != nil { return types.Order{}, err }
 	defer tx.Rollback()
@@ -1134,6 +1159,23 @@ func DeductKCAndCreateOrder(db *sql.DB, customerID uuid.UUID, epicUsername strin
 	err = tx.QueryRow(`SELECT kc_balance FROM customers WHERE id=$1 AND is_active=true FOR UPDATE`, customerID).Scan(&currentBalance)
 	if err != nil { return types.Order{}, fmt.Errorf("customer not found") }
 	if currentBalance < req.PriceKC { return types.Order{}, fmt.Errorf("insufficient KC balance: have %d, need %d", currentBalance, req.PriceKC) }
+	// El límite de pedidos pendientes se revisaba ANTES de esta transacción
+	// (en el handler), lo que dejaba una ventana: dos compras del mismo
+	// cliente hechas casi al mismo instante podían pasar la comprobación
+	// las dos antes de que cualquiera insertara su pedido, superando el
+	// límite por un margen pequeño. No afectaba el saldo (esa parte ya
+	// era atómica), solo este tope anti-abuso. Ahora se cuenta acá adentro,
+	// después de tomar el row lock del cliente (FOR UPDATE arriba) — una
+	// segunda compra concurrente del mismo cliente queda bloqueada hasta que
+	// la primera transacción termine, así que cuando por fin cuenta, ya ve
+	// el pedido recién insertado por la primera.
+	var pendingCount int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM orders WHERE customer_id=$1 AND status IN ('pending','processing')`, customerID).Scan(&pendingCount); err != nil {
+		return types.Order{}, err
+	}
+	if pendingCount >= maxPendingOrders {
+		return types.Order{}, fmt.Errorf("too many pending orders: %d", pendingCount)
+	}
 	_, err = tx.Exec(`UPDATE customers SET kc_balance=kc_balance-$1, updated_at=NOW() WHERE id=$2`, req.PriceKC, customerID)
 	if err != nil { return types.Order{}, err }
 	orderID := uuid.New()
@@ -1409,7 +1451,9 @@ func GetAllOrders(db *sql.DB, page, limit int, search, status string) ([]types.O
 	}
 
 	var total int
-	db.QueryRow(`SELECT COUNT(*) FROM orders `+where, args...).Scan(&total)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM orders `+where, args...).Scan(&total); err != nil {
+		slog.Error("GetAllOrders: error contando total", "error", err)
+	}
 
 	args = append(args, limit, offset)
 	limitPos := fmt.Sprintf("$%d", len(args)-1)
@@ -1501,18 +1545,51 @@ func scanGameAccounts(rows *sql.Rows, encKey string) ([]types.GameAccount, error
 			&a.IsActive, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
-		var err error
-		a.AccessToken, err = crypto.Decrypt(encAccess, encKey)
-		if err != nil {
-			return nil, fmt.Errorf("decrypting access token for %s: %w", a.ID, err)
+		// Antes, si el token de UNA sola cuenta no se podía descifrar (fila
+		// corrupta, o sobreviviente de antes de que ENCRYPTION_KEY quedara
+		// bien configurada), esta función devolvía el error y descartaba
+		// TODAS las cuentas ya leídas — GetActiveGameAccounts (que usa el
+		// worker de pedidos para elegir qué bot usar) se quedaba sin ninguna
+		// cuenta disponible, para TODOS los clientes, por un solo registro
+		// dañado. Ahora esa cuenta puntual se salta (queda registrada en los
+		// logs para poder revisarla) y el resto de la flota sigue
+		// funcionando con normalidad.
+		accessToken, errAccess := crypto.Decrypt(encAccess, encKey)
+		refreshToken, errRefresh := crypto.Decrypt(encRefresh, encKey)
+		if errAccess != nil || errRefresh != nil {
+			slog.Error("no se pudo descifrar el token de una cuenta bot — se salta esta cuenta, el resto de la flota sigue disponible",
+				"accountID", a.ID, "displayName", a.DisplayName, "errorAccess", errAccess, "errorRefresh", errRefresh)
+			continue
 		}
-		a.RefreshToken, err = crypto.Decrypt(encRefresh, encKey)
-		if err != nil {
-			return nil, fmt.Errorf("decrypting refresh token for %s: %w", a.ID, err)
-		}
+		a.AccessToken = accessToken
+		a.RefreshToken = refreshToken
 		accounts = append(accounts, a)
 	}
 	return accounts, nil
+}
+
+// DecrementRemainingGifts baja en 1 el contador de regalos de una cuenta,
+// de forma atómica — antes, el único lugar donde el contador bajaba (justo
+// después de mandar un regalo con éxito) leía "cuántos le quedan" en Go,
+// restaba 1 en memoria, y recién ahí escribía el resultado con
+// UpdateRemainingGifts (un SET absoluto). Si dos instancias del worker de
+// pedidos (local + producción corren contra la misma base, ver el
+// comentario de ClaimPendingOrders) procesaban un pedido con la misma
+// cuenta bot casi al mismo tiempo, las dos podían leer "1 regalo
+// disponible", las dos enviar su regalo, y las dos escribir el mismo
+// resultado — el contador quedaba mal (no reflejaba los 2 regalos
+// realmente enviados) y la cuenta podía terminar excediendo el límite
+// diario real que impone Epic Games. Ahora la resta ocurre directo en SQL
+// (remaining_gifts = remaining_gifts - 1), protegida por su propia
+// condición WHERE remaining_gifts > 0 — dos escrituras concurrentes se
+// serializan en la base de datos en vez de pisarse una a la otra.
+func DecrementRemainingGifts(db *sql.DB, accountID uuid.UUID) error {
+	result, err := db.Exec(`UPDATE game_accounts SET remaining_gifts=remaining_gifts-1, updated_at=NOW() WHERE id=$1 AND remaining_gifts > 0`, accountID)
+	if err != nil { return err }
+	if n, _ := result.RowsAffected(); n == 0 {
+		return fmt.Errorf("no se pudo descontar el regalo: la cuenta %s ya estaba en 0", accountID)
+	}
+	return nil
 }
 
 func UpdateRemainingGifts(db *sql.DB, accountID uuid.UUID, remaining int) error {
@@ -1842,7 +1919,9 @@ func GetAllPaymentTransactions(db *sql.DB, page, limit int, status string) ([]ty
 	}
 
 	var total int
-	db.QueryRow(`SELECT COUNT(*) FROM payment_transactions `+where, args...).Scan(&total)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM payment_transactions `+where, args...).Scan(&total); err != nil {
+		slog.Error("GetAllPaymentTransactions: error contando total", "error", err)
+	}
 
 	args = append(args, limit, offset)
 	limitPos := fmt.Sprintf("$%d", len(args)-1)
@@ -1920,8 +1999,15 @@ func DeleteAllRefreshTokensForCustomer(db *sql.DB, customerID uuid.UUID) error {
 func AddAuditLog(db *sql.DB, customerID *uuid.UUID, action, details, ip string) {
 	go func() {
 		defer safe.Recover("AddAuditLog")
-		db.Exec(`INSERT INTO audit_logs (id, customer_id, action, details, ip_address, created_at) VALUES ($1,$2,$3,$4,$5,NOW())`,
-			uuid.New(), customerID, action, details, ip)
+		if _, err := db.Exec(`INSERT INTO audit_logs (id, customer_id, action, details, ip_address, created_at) VALUES ($1,$2,$3,$4,$5,NOW())`,
+			uuid.New(), customerID, action, details, ip); err != nil {
+			// Sin este log, un INSERT fallido acá (pool agotado, error
+			// transitorio de conexión) desaparecía sin dejar rastro — el único
+			// mecanismo de trazabilidad de acciones de admin quedaba con
+			// huecos silenciosos, justo el tipo de gap que importa investigar
+			// después de un incidente o una disputa de pago.
+			slog.Error("no se pudo registrar audit_log", "action", action, "error", err)
+		}
 	}()
 }
 
@@ -2082,6 +2168,29 @@ func CountUnusedBackupCodes(db *sql.DB, customerID uuid.UUID) (int, error) {
 	return count, err
 }
 
+// DeactivateCustomerByAdmin desactiva una cuenta desde el panel de admin
+// (reemplaza al DELETE físico que usaba antes HandlerDeleteCustomer — ver
+// el comentario en ese handler). A diferencia de DeleteOwnAccount, NO
+// anonimiza los datos del cliente: un admin puede necesitar seguir viendo
+// el correo/usuario real de una cuenta desactivada (soporte, disputa de
+// pago, investigar fraude), y a diferencia de una auto-eliminación pedida
+// por el propio dueño de los datos, acá no hay una obligación de borrar su
+// información identificable. También revoca sus refresh tokens, para que
+// una sesión ya iniciada no pueda seguir usándose tras la desactivación.
+func DeactivateCustomerByAdmin(db *sql.DB, customerID uuid.UUID) error {
+	tx, err := db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`UPDATE customers SET is_active=false, updated_at=NOW() WHERE id=$1`, customerID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM refresh_tokens WHERE customer_id=$1`, customerID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ==================== ELIMINAR CUENTA PROPIA ====================
 
 // DeleteOwnAccount "elimina" la cuenta de un cliente a petición propia. No
@@ -2207,7 +2316,9 @@ func GetAllComplaints(db *sql.DB, page, limit int) ([]types.ConsumerComplaint, i
 	offset := (page - 1) * limit
 
 	var total int
-	db.QueryRow(`SELECT COUNT(*) FROM consumer_complaints`).Scan(&total)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM consumer_complaints`).Scan(&total); err != nil {
+		slog.Error("GetAllComplaints: error contando total", "error", err)
+	}
 
 	rows, err := db.Query(`SELECT `+complaintSelectCols+`
 		FROM consumer_complaints ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)

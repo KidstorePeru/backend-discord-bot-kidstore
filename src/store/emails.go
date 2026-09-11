@@ -191,6 +191,15 @@ func emailItemRow(imageURL, name, sub string) string {
 	if img == "" {
 		img = kcIconURL // si el item no tiene imagen, evita un <img> roto
 	}
+	// name/sub ya llegan escapados en todos los llamadores actuales (que
+	// siempre usan el nombre/imagen del catálogo oficial de Fortnite, nunca
+	// lo que mandó el cliente — ver el comentario en shop.go sobre por qué
+	// el precio y los datos del item se re-derivan del catálogo). Pero
+	// escaparla acá también, adentro de la función en vez de confiar en que
+	// cada llamador lo haga, es una segunda capa de defensa: si algún
+	// llamador futuro pasara un dato menos confiable, igual queda protegido
+	// contra quedar insertado sin escapar en un atributo HTML (src="...").
+	img = esc(img)
 	return fmt.Sprintf(`
 	<table width="100%%" cellpadding="0" cellspacing="0" style="background:#faf9f7;border:1px solid #e6e6e2;border-radius:12px;margin:0 0 16px;">
 	<tr>

@@ -6,6 +6,7 @@ import (
 	"KidStoreStore/src/types"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -209,10 +210,21 @@ func CustomerAuthMiddleware(secretKey string) gin.HandlerFunc {
 func AdminAuthMiddleware(database *sql.DB, adminAPIKey, secretKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Method 1: API Key header (legacy, still works)
+		// Comparación en tiempo constante — un == directo entre strings sale
+		// apenas encuentra el primer byte distinto, así que el tiempo de
+		// respuesta varía según cuántos bytes iniciales acertó quien intenta
+		// adivinar la clave, filtrando esa clave byte a byte con suficientes
+		// intentos. Se hashea ambos lados primero (largo fijo de 32 bytes)
+		// para que ConstantTimeCompare no filtre tampoco la diferencia de
+		// longitud entre el header recibido y la clave real.
 		apiKey := c.GetHeader("X-Admin-Key")
-		if apiKey != "" && adminAPIKey != "" && apiKey == adminAPIKey {
-			c.Next()
-			return
+		if apiKey != "" && adminAPIKey != "" {
+			apiKeyHash := sha256.Sum256([]byte(apiKey))
+			adminAPIKeyHash := sha256.Sum256([]byte(adminAPIKey))
+			if subtle.ConstantTimeCompare(apiKeyHash[:], adminAPIKeyHash[:]) == 1 {
+				c.Next()
+				return
+			}
 		}
 
 		// Method 2: JWT with is_admin=true — pero se verifica contra el

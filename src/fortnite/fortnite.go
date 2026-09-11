@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	mathrand "math/rand"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -74,7 +76,17 @@ func HandlerConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Error leyendo la respuesta del token de cliente"})
 			return
 		}
-		slog.Info("Epic client_credentials", "status", respToken.StatusCode, "body", string(tokenBodyBytes))
+		// El body de una respuesta 200 acá trae el access_token vivo — no se
+		// loguea completo para no dejarlo en texto plano en los logs (Railway
+		// u otro hosting), que suelen tener retención/acceso más amplios que
+		// la base de datos. En error sí se loguea completo: ahí no hay token
+		// real y el detalle ayuda a diagnosticar EPIC_CLIENT/EPIC_SECRET mal
+		// configurados.
+		if respToken.StatusCode == 200 {
+			slog.Info("Epic client_credentials", "status", respToken.StatusCode)
+		} else {
+			slog.Info("Epic client_credentials", "status", respToken.StatusCode, "body", string(tokenBodyBytes))
+		}
 
 		// Si Epic rechazó las credenciales de cliente (EPIC_CLIENT/EPIC_SECRET
 		// mal configuradas o vacías), cortar aquí — antes esto seguía de largo
@@ -115,7 +127,14 @@ func HandlerConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Error leyendo respuesta de Epic"})
 			return
 		}
-		slog.Info("Epic deviceAuthorization", "status", respDevice.StatusCode, "body", string(deviceBodyBytes))
+		// Mismo criterio que client_credentials arriba: en 200 el body trae
+		// device_code/user_code (credenciales de un login en curso), así que
+		// no se loguea completo salvo que Epic haya devuelto un error.
+		if respDevice.StatusCode == 200 {
+			slog.Info("Epic deviceAuthorization", "status", respDevice.StatusCode)
+		} else {
+			slog.Info("Epic deviceAuthorization", "status", respDevice.StatusCode, "body", string(deviceBodyBytes))
+		}
 
 		// Si Epic devolvió error (no 200), retornarlo directamente
 		if respDevice.StatusCode != 200 {
@@ -247,13 +266,21 @@ func HandlerFinishConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 			defer respSecrets.Body.Close()
 			var secrets types.EpicDeviceSecretsResult
 			if err := json.NewDecoder(respSecrets.Body).Decode(&secrets); err == nil {
-				db.UpsertGameAccountSecrets(database, types.GameAccountSecrets{
+				if err := db.UpsertGameAccountSecrets(database, types.GameAccountSecrets{
 					ID:        uuid.New(),
 					AccountID: accountID,
 					DeviceID:  secrets.DeviceId,
 					Secret:    secrets.Secret,
 					CreatedAt: time.Now(),
-				}, encryptionKey)
+				}, encryptionKey); err != nil {
+					// Si esto falla en silencio, la cuenta queda conectada
+					// pero sin secretos de respaldo — refreshWithDeviceSecrets
+					// fallará más adelante con un mensaje mucho menos claro
+					// ("no device secrets found") justo cuando de verdad se
+					// necesiten (el refresh_token normal expiró). Mejor dejar
+					// esta falla anterior visible en los logs desde ahora.
+					slog.Error("no se pudieron guardar los device secrets al conectar la cuenta bot", "accountID", accountID, "error", err)
+				}
 			}
 		}
 
@@ -326,6 +353,15 @@ func HandlerUpdateRemainingGifts(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Error actualizando gifts restantes"})
 			return
 		}
+		// Si un admin restablece manualmente los gifts de esta cuenta (fuera
+		// del reset diario automático), el aviso de "sin regalos" de esta
+		// cuenta puntual debe poder volver a dispararse si se agota otra vez
+		// más adelante — sin esto, quedaba silenciado para siempre tras la
+		// primera vez que se disparó, aunque la cuenta ya tuviera gifts de
+		// nuevo.
+		if req.RemainingGifts > 0 {
+			discordbot.ClearNoGiftSlotsAlert(id)
+		}
 		c.JSON(http.StatusOK, gin.H{"success": true})
 	}
 }
@@ -356,7 +392,32 @@ func HandlerUpdateBotVbucks(database *sql.DB) gin.HandlerFunc {
 
 // ==================== TOKEN REFRESH ====================
 
+// refreshLocks serializa el refresh de tokens por cuenta bot. El worker de
+// pedidos (cada 30s) y el health-check periódico corren por separado y
+// pueden operar sobre la misma cuenta casi al mismo tiempo — sin este
+// candado, los dos podían refrescar el token de la misma cuenta a la vez:
+// el segundo en terminar sobreescribe en la base de datos el token que el
+// primero acababa de guardar, y si Epic ya había invalidado el token
+// anterior al emitir el segundo, una request en curso con ese token
+// "viejo" podía fallar con 401 justo después de haberse refrescado —en el
+// peor caso, encadenando fallos que el chequeo de salud interpreta como
+// "cuenta muerta" y la desactiva sin estar realmente rota. El candado no
+// evita que el refresh se repita dos veces (la segunda goroutine, al
+// esperar, simplemente vuelve a llamar a Epic con su propia copia en
+// memoria una vez que la primera termina) pero sí evita que las dos
+// escrituras y usos del token se pisen entre sí.
+var refreshLocks sync.Map // uuid.UUID -> *sync.Mutex
+
+func lockForAccountRefresh(id uuid.UUID) *sync.Mutex {
+	m, _ := refreshLocks.LoadOrStore(id, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 func refreshAccessToken(database *sql.DB, account types.GameAccount) (types.GameAccount, error) {
+	mu := lockForAccountRefresh(account.ID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	reqToken, _ := http.NewRequest("POST",
@@ -545,7 +606,17 @@ func CheckFriendship(database *sql.DB, account types.GameAccount, receiverAccoun
 
 	createdAt, err := time.Parse(time.RFC3339, friend.Created)
 	if err != nil {
-		return true, time.Now().Add(-49 * time.Hour), nil // asumir 48h+ si no se puede parsear
+		// Antes esto asumía 48h+ ya cumplidas si la fecha no se podía leer —
+		// el criterio contrario al que usa checkFriendship48h dos funciones
+		// más abajo en este mismo archivo, que ante el mismo error prefiere
+		// saltarse ese amigo en vez de asumir que ya cumplió el plazo. Epic
+		// Games es quien de verdad hace cumplir la regla de 48h al momento
+		// de regalar (un intento prematuro simplemente lo rechazaría), así
+		// que el impacto práctico de este caso es bajo — pero no hay razón
+		// para que el criterio por defecto sea distinto en dos lugares del
+		// mismo archivo. Ahora se trata igual: se asume "recién ahora" (0h),
+		// no "hace 49h", así que el llamador espera en vez de intentar.
+		return true, time.Now(), nil
 	}
 
 	return true, createdAt, nil
@@ -661,7 +732,17 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 			switch errCode {
 			case "errors.com.epicgames.modules.gamesubcatalog.purchase_not_allowed":
 				db.UpdateRemainingGifts(database, account.ID, 0)
-				return "", fmt.Errorf("la cuenta bot no tiene slots de regalo disponibles")
+				// processOrder (shop.go) busca el texto "gift_limit_reached" en
+				// este mensaje para reconocer este caso específico y probar con
+				// el siguiente bot disponible en vez de reembolsar el pedido de
+				// una — ese texto nunca aparecía acá (Epic no lo devuelve, y
+				// este mensaje se escribía sin ese detalle), así que ese
+				// fallback nunca se activaba: cuando UN bot llegaba a su límite
+				// diario, el pedido se reembolsaba de inmediato aunque hubiera
+				// otros bots con regalos disponibles ese mismo momento. Se deja
+				// el texto explícito acá para que el chequeo de shop.go sí
+				// reconozca este caso, como estaba pensado desde el principio.
+				return "", fmt.Errorf("gift_limit_reached: la cuenta bot no tiene slots de regalo disponibles")
 			case "errors.com.epicgames.friends.friendship_not_found":
 				return "", fmt.Errorf("el cliente no tiene agregado al bot como amigo")
 			case "errors.com.epicgames.modules.gamesubcatalog.receiver_will_own_more_than_one":
@@ -757,13 +838,28 @@ func StartFriendRequestAcceptor(database *sql.DB, intervalSeconds int) {
 	slog.Info("Bots: auto-aceptar solicitudes de amistad", "intervalSeconds", intervalSeconds)
 }
 
+// jitterBetweenAccounts espera un momento corto y variable entre llamadas a
+// la API de Epic para cuentas distintas — sin esto, un barrido periódico de
+// las ~20 cuentas bot le pega a Epic con ráfagas de peticiones idénticas y
+// sin pausa entre sí, exactamente el patrón que los sistemas antifraude de
+// plataformas como Epic Games suelen usar para detectar automatización.
+// No es una garantía de nada, pero es una precaución barata para proteger
+// la flota de bots (perder una cuenta bot por un baneo es mucho más caro
+// que unos segundos extra por ciclo).
+func jitterBetweenAccounts() {
+	time.Sleep(time.Duration(300+mathrand.Intn(400)) * time.Millisecond)
+}
+
 func acceptPendingFriendRequests(database *sql.DB) {
 	accounts, err := db.GetActiveGameAccounts(database, encryptionKey)
 	if err != nil || len(accounts) == 0 {
 		return
 	}
 
-	for _, acc := range accounts {
+	for i, acc := range accounts {
+		if i > 0 {
+			jitterBetweenAccounts()
+		}
 		account := acc
 		func() {
 			defer safe.Recover("acceptPendingFriendRequests." + account.DisplayName)
@@ -833,46 +929,61 @@ func checkFriendship48h(database *sql.DB) {
 		createdAt time.Time
 	}
 
-	for _, account := range accounts {
-		friends, err := ListFriends(database, account)
-		if err != nil || len(friends) == 0 {
-			continue
+	for i, acc := range accounts {
+		if i > 0 {
+			jitterBetweenAccounts()
 		}
+		account := acc
+		// Antes, un panic procesando la lista de amigos de UNA cuenta
+		// abortaba el resto del ciclo entero (solo lo atrapaba el safe.Run
+		// de más afuera, en StartFriendship48hChecker) — las demás cuentas
+		// bot se quedaban sin revisar esa vuelta. acceptPendingFriendRequests
+		// (arriba en este mismo archivo) ya protege cada cuenta por
+		// separado; se le da el mismo tratamiento acá para que un problema
+		// con una sola cuenta no le cueste el ciclo a las otras 19.
+		func() {
+			defer safe.Recover("checkFriendship48h." + account.DisplayName)
 
-		var eligibleIDs []string
-		var eligible []eligibleFriend
-		for _, f := range friends {
-			createdAt, err := time.Parse(time.RFC3339, f.Created)
-			if err != nil || time.Since(createdAt) < 48*time.Hour {
-				continue
+			friends, err := ListFriends(database, account)
+			if err != nil || len(friends) == 0 {
+				return
 			}
-			eligibleIDs = append(eligibleIDs, f.AccountId)
-			eligible = append(eligible, eligibleFriend{f.AccountId, createdAt})
-		}
-		if len(eligibleIDs) == 0 {
-			continue
-		}
 
-		names, err := ResolveDisplayNames(database, account, eligibleIDs)
-		if err != nil {
-			continue
-		}
-
-		for _, f := range eligible {
-			displayName, ok := names[f.accountID]
-			if !ok {
-				continue
+			var eligibleIDs []string
+			var eligible []eligibleFriend
+			for _, f := range friends {
+				createdAt, err := time.Parse(time.RFC3339, f.Created)
+				if err != nil || time.Since(createdAt) < 48*time.Hour {
+					continue
+				}
+				eligibleIDs = append(eligibleIDs, f.AccountId)
+				eligible = append(eligible, eligibleFriend{f.AccountId, createdAt})
 			}
-			customer, err := db.GetCustomerByEpicUsername(database, displayName)
+			if len(eligibleIDs) == 0 {
+				return
+			}
+
+			names, err := ResolveDisplayNames(database, account, eligibleIDs)
 			if err != nil {
-				continue // no es un cliente nuestro
+				return
 			}
-			if db.HasBeenNotified48h(database, customer.ID, account.ID) {
-				continue
+
+			for _, f := range eligible {
+				displayName, ok := names[f.accountID]
+				if !ok {
+					continue
+				}
+				customer, err := db.GetCustomerByEpicUsername(database, displayName)
+				if err != nil {
+					continue // no es un cliente nuestro
+				}
+				if db.HasBeenNotified48h(database, customer.ID, account.ID) {
+					continue
+				}
+				discordbot.NotifyFriendship48h(customer)
+				db.MarkNotified48h(database, customer.ID, account.ID)
 			}
-			discordbot.NotifyFriendship48h(customer)
-			db.MarkNotified48h(database, customer.ID, account.ID)
-		}
+		}()
 	}
 }
 

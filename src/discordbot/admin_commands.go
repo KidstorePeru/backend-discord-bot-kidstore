@@ -33,7 +33,11 @@ func registerKCCommand() {
 		return &discordgo.ApplicationCommandOption{Type: discordgo.ApplicationCommandOptionString, Name: "epic_user", Description: "Usuario Epic del cliente (si no vinculó Discord)"}
 	}
 	amountOpt := func() *discordgo.ApplicationCommandOption {
-		return &discordgo.ApplicationCommandOption{Type: discordgo.ApplicationCommandOptionInteger, Name: "amount", Description: "Cantidad de KC", Required: true, MinValue: floatPtr(1)}
+		// MaxValue: sin esto, un error de tipeo (un cero de más) en /kc add o
+		// /kc remove podía mover una cantidad arbitraria de KC sin que nada
+		// lo cuestionara — mismo tope que ya se aplica en el panel web
+		// (maxManualKCAdjustment en admin/admin.go).
+		return &discordgo.ApplicationCommandOption{Type: discordgo.ApplicationCommandOptionInteger, Name: "amount", Description: "Cantidad de KC", Required: true, MinValue: floatPtr(1), MaxValue: 125000}
 	}
 	noteOpt := func() *discordgo.ApplicationCommandOption {
 		return &discordgo.ApplicationCommandOption{Type: discordgo.ApplicationCommandOptionString, Name: "note", Description: "Nota (opcional)"}

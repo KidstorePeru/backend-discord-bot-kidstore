@@ -105,6 +105,21 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
+		// CreditPaymentOnce (db.go) solo acredita KC cuando payment_type es
+		// exactamente "kc_recharge" — "product_purchase" existe en el schema
+		// (activation_code, autobuyer_task_id) pero nunca se implementó en
+		// ningún lado. Sin este chequeo, un payment_type distinto de
+		// "kc_recharge" (typo, cliente desactualizado, o alguien pegándole
+		// directo a la API) crea un cobro real que la pasarela aprueba y el
+		// webhook confirma correctamente, pero que nunca se acredita — el
+		// cliente paga y no recibe nada, sin ninguna alerta ni forma
+		// automática de recuperarlo. El frontend actual solo manda
+		// "kc_recharge", así que este chequeo no bloquea ningún flujo real.
+		if req.PaymentType != "kc_recharge" {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "payment_type invalido"})
+			return
+		}
+
 		// Lookup product price or use custom
 		var productName string
 		var pricePEN float64
@@ -133,7 +148,22 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			kcAmount = product.KCAmount
 		}
 
-		amountUSD := pricePEN * defaultUSDRate
+		// Antes esto siempre usaba defaultUSDRate (un valor fijo, pensado
+		// como respaldo para cuando la API de tasas no responde) para TODOS
+		// los pagos en USD, mientras que dLocal Go sí usaba la tasa real y
+		// actualizada vía convertPENToCurrency/currentConversionRates — dos
+		// clientes pagando el mismo paquete de KC el mismo día podían pagar
+		// montos distintos en USD según qué pasarela usaran, y esa
+		// diferencia solo crecería con el tiempo si el tipo de cambio
+		// real se aleja de 0.27. Ahora todas las pasarelas en USD (PayPal,
+		// NOWPayments) usan la misma tasa en vivo que dLocal Go; si la API
+		// de tasas falla, convertPENToCurrency ya cae sola al mismo
+		// defaultUSDRate como respaldo (vía fallbackRates en shop.go), así
+		// que el comportamiento de resguardo no cambia.
+		amountUSD, err := convertPENToCurrency(pricePEN, "USD")
+		if err != nil {
+			amountUSD = pricePEN * defaultUSDRate
+		}
 
 		txID := uuid.New()
 		tx := db.PaymentTransactionInput{
@@ -151,7 +181,6 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		// Create checkout URL based on gateway
 		var checkoutURL string
 		var externalID string
-		var err error
 
 		switch req.Gateway {
 		case "mercadopago":
@@ -853,6 +882,13 @@ func dlocalGoPaymentStatus(paymentID string) (status string, orderID string, err
 // verifyDLocalGoSignature valida la firma HMAC-SHA256 de una notificación:
 // HMAC-SHA256(secretKey, apiKey + payload) debe coincidir con la firma recibida.
 func verifyDLocalGoSignature(rawBody []byte, signatureHeader string) bool {
+	// Si el secreto no está configurado, HMAC(clave vacía, ...) es un valor
+	// fijo y calculable por cualquiera — la firma dejaría de verificar nada
+	// en la práctica. Mejor rechazar todo explícitamente que validar contra
+	// un secreto que no es tal.
+	if paymentCfg.DLocalGoSecretKey == "" {
+		return false
+	}
 	const prefix = "V2-HMAC-SHA256, Signature: "
 	if !strings.HasPrefix(signatureHeader, prefix) {
 		return false

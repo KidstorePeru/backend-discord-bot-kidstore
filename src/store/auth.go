@@ -4,6 +4,7 @@ import (
 	"KidStoreStore/src/db"
 	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/middleware"
+	"KidStoreStore/src/safe"
 	"KidStoreStore/src/types"
 	"crypto/rand"
 	"database/sql"
@@ -266,6 +267,39 @@ var (
 	loginFailures   = map[uuid.UUID][]time.Time{}
 )
 
+// A diferencia de IPRateLimiter (middleware.go), que sí limpia sus entradas
+// viejas cada minuto, este mapa nunca se limpiaba solo — una cuenta que
+// falló el login una vez y nunca volvió se quedaba ocupando memoria para
+// siempre (solo se borraba con un login exitoso posterior). El impacto real
+// era mínimo (acotado por el total de clientes que alguna vez escribieron
+// mal su contraseña), pero es la misma clase de fuga que IPRateLimiter ya
+// resuelve, así que se le da el mismo tratamiento por consistencia.
+func init() {
+	go func() {
+		for range time.Tick(time.Minute) {
+			func() {
+				defer safe.Recover("loginFailures.cleanup")
+				now := time.Now()
+				loginFailuresMu.Lock()
+				defer loginFailuresMu.Unlock()
+				for id, times := range loginFailures {
+					var valid []time.Time
+					for _, t := range times {
+						if now.Sub(t) < loginFailureWindow {
+							valid = append(valid, t)
+						}
+					}
+					if len(valid) == 0 {
+						delete(loginFailures, id)
+					} else {
+						loginFailures[id] = valid
+					}
+				}
+			}()
+		}
+	}()
+}
+
 // recordLoginFailure suma un intento fallido para esta cuenta. Devuelve
 // true si con este intento se alcanzó el máximo y la cuenta queda
 // bloqueada temporalmente.
@@ -317,6 +351,32 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 
 		customer, err := db.GetCustomerByEmail(database, req.Email)
 		if err != nil {
+			// Comparación bcrypt "de mentira" contra un hash fijo — sin esto,
+			// un correo inexistente responde casi instantáneo mientras que uno
+			// real (con contraseña incorrecta) tarda lo que tarda bcrypt. Esa
+			// diferencia de tiempo es suficiente para que alguien adivine, uno
+			// por uno, qué correos SÍ están registrados en el sitio, sin
+			// necesitar acertar ninguna contraseña. Se corre siempre, en las
+			// dos ramas de abajo, para que "no existe ninguna cuenta" y
+			// "existe un registro pendiente sin verificar" tarden lo mismo —
+			// ver el comentario sobre por qué SÍ se mantiene la distinción de
+			// contenido entre ambos casos, a diferencia del tiempo.
+			bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(req.Password))
+
+			// Este caso SÍ revela, sin necesidad de contraseña, que alguien
+			// empezó a registrarse con este correo y no lo verificó — una
+			// filtración de información real, pero de bajo riesgo (no dice
+			// si hay una cuenta ACTIVA, solo que alguien intentó registrarse
+			// alguna vez) frente al costo real de quitarla: el registro por
+			// email no crea una fila en customers hasta verificar (queda en
+			// pending_registrations — ver HandlerRegister), así que ESTE es
+			// el único momento en que un cliente legítimo que olvidó
+			// verificar se entera de por qué no puede entrar; el login no
+			// tiene ningún otro lugar donde ofrecer "reenviar verificación".
+			// Quitar este aviso cambiaría un mensaje accionable por un
+			// "credenciales inválidas" genérico y confuso para ese cliente
+			// real, a cambio de cerrar una filtración menor — no vale la
+			// pena ese cambio de comportamiento visible para el usuario.
 			if db.PendingRegistrationExists(database, req.Email) {
 				c.JSON(http.StatusForbidden, gin.H{
 					"success":               false,
@@ -326,13 +386,6 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 				})
 				return
 			}
-			// Comparación bcrypt "de mentira" contra un hash fijo — sin esto,
-			// un correo inexistente responde casi instantáneo mientras que uno
-			// real (con contraseña incorrecta) tarda lo que tarda bcrypt. Esa
-			// diferencia de tiempo es suficiente para que alguien adivine, uno
-			// por uno, qué correos SÍ están registrados en el sitio, sin
-			// necesitar acertar ninguna contraseña.
-			bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(req.Password))
 			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "credenciales inválidas"})
 			return
 		}

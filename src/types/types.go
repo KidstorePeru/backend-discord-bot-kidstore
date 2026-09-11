@@ -310,7 +310,11 @@ type LoginRequest struct {
 
 type RechargeRequest struct {
 	CustomerID  string   `json:"customer_id" binding:"required"`
-	AmountKC    int      `json:"amount_kc" binding:"required,min=1"`
+	// max=125000 — antes no había ningún tope: un cero de más al escribir
+	// el monto acreditaba una cantidad arbitraria sin que el sistema lo
+	// cuestionara. 125 000 es 10x el paquete más grande que se vende hoy
+	// (ver maxManualKCAdjustment en admin/admin.go, mismo número).
+	AmountKC    int      `json:"amount_kc" binding:"required,min=1,max=125000"`
 	AmountSoles *float64 `json:"amount_soles"`
 	Note        *string  `json:"note"`
 }
