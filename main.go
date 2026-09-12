@@ -318,6 +318,7 @@ func main() {
 		adminGroup.DELETE("/customers/:id", admin.HandlerDeleteCustomer(database))
 		adminGroup.POST("/recharge",        admin.HandlerRechargeKC(database))
 		adminGroup.GET("/orders",           admin.HandlerGetAllOrders(database))
+		adminGroup.PUT("/orders/:id/review", admin.HandlerResolveOrderReview(database))
 		adminGroup.GET("/stats",            admin.HandlerGetStats(database))
 		adminGroup.GET("/payments",         admin.HandlerGetAllPayments(database))
 		adminGroup.GET("/product-availability",  admin.HandlerGetProductAvailability(database))

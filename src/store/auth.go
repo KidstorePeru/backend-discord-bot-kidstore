@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -19,9 +20,37 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// friendlyBindError traduce los errores crudos del validador de Gin (del
+// estilo "Key: 'RegisterRequest.Password' Error:Field validation for
+// 'Password' failed on the 'min' tag") a un mensaje que un usuario pueda
+// entender, en vez de exponer nombres de structs y tags internos de Go.
+// Solo cubre los campos de contraseña (registro, recuperación y cambio de
+// contraseña) — el resto de errores de validación cae en un mensaje
+// genérico igual de comprensible.
+func friendlyBindError(err error) string {
+	var verrs validator.ValidationErrors
+	if errors.As(err, &verrs) {
+		for _, fe := range verrs {
+			switch fe.Field() {
+			case "Password", "NewPassword":
+				if fe.Tag() == "required" {
+					return "La contraseña es obligatoria."
+				}
+				return "La contraseña debe tener al menos 8 caracteres."
+			case "Email":
+				return "Ingresa un correo electrónico válido."
+			case "EpicUsername":
+				return "El usuario de Epic Games debe tener entre 3 y 50 caracteres."
+			}
+		}
+	}
+	return "Revisa los datos ingresados e intenta de nuevo."
+}
 
 // ==================== REGISTER ====================
 // La cuenta NO se crea hasta que el cliente verifica su correo.
@@ -31,7 +60,7 @@ func HandlerRegister(database *sql.DB, secretKey string, cfg types.EnvConfig) gi
 	return func(c *gin.Context) {
 		var req types.RegisterRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": friendlyBindError(err)})
 			return
 		}
 
@@ -604,7 +633,7 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 
 		var req types.UpdateProfileRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": friendlyBindError(err)})
 			return
 		}
 
@@ -1040,7 +1069,7 @@ func HandlerResetPassword(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req types.ResetPasswordRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": friendlyBindError(err)})
 			return
 		}
 

@@ -451,6 +451,15 @@ type PaymentTransaction struct {
 	AmountLocal  float64  `json:"amount_local,omitempty"`  // monto en CurrencyCode
 	KCAmount    int       `json:"kc_amount"`
 	ExternalID      string    `json:"external_id"`
+	// ProviderPaymentID: identificador REAL del pago en la pasarela, cuando es
+	// distinto del external_id que guardamos al crear la sesión (hoy solo
+	// aplica a NOWPayments: external_id es el ID de la FACTURA/invoice, pero
+	// para consultar el estado del pago real hace falta el ID del PAGO, que
+	// solo se conoce cuando llega el IPN). Se guarda apenas se conoce, para
+	// que la reconciliación automática pueda seguir consultando el pago real
+	// aunque el proceso se caiga justo después de recibir el webhook. Nunca
+	// se expone al cliente — es un detalle interno de recuperación.
+	ProviderPaymentID string `json:"-"`
 	Status          string    `json:"status"` // pending, approved, failed, expired, fulfilled
 	ActivationCode  string    `json:"activation_code,omitempty"`
 	AutobuyerTaskID string    `json:"autobuyer_task_id,omitempty"`

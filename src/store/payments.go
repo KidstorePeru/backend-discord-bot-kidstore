@@ -280,6 +280,28 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 
 // ==================== COMPROBANTE DE PAGO ====================
 
+// chargedAmountAndCurrency devuelve el monto y la divisa que la pasarela
+// REALMENTE cobró — antes el comprobante siempre mostraba "S/ {amount_pen}"
+// sin importar la pasarela, pero amount_pen es solo un precio de
+// REFERENCIA que se calcula al crear el pago; PayPal y NOWPayments cobran
+// en USD, y dLocal Go cobra en la divisa real del cliente (currency_code/
+// amount_local, ya guardados desde HandlerCreatePayment). Mostrar "S/" para
+// un cobro que en realidad fue en USD o en otra divisa es directamente
+// incorrecto, no solo impreciso.
+func chargedAmountAndCurrency(gateway string, amountPEN, amountUSD, amountLocal float64, currencyCode string) (amount float64, currency string) {
+	switch gateway {
+	case "paypal", "nowpayments":
+		return amountUSD, "USD"
+	case "dlocalgo":
+		if currencyCode != "" {
+			return amountLocal, currencyCode
+		}
+		return amountUSD, "USD"
+	default: // mercadopago, manual (yape/plin/transferencia) — siempre en soles
+		return amountPEN, "PEN"
+	}
+}
+
 // HandlerPaymentVoucher devuelve los datos para la página de comprobante de
 // una recarga — solo si ya está aprobada/cumplida y le pertenece al cliente
 // autenticado (mismo chequeo de propiedad que HandlerPaymentStatus).
@@ -314,19 +336,22 @@ func HandlerPaymentVoucher(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
 			return
 		}
+		chargedAmount, chargedCurrency := chargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"voucher": gin.H{
-				"type":          "payment",
-				"reference":     strings.ToUpper(id.String()[:8]),
-				"customer_name": customer.EpicUsername,
-				"product_name":  tx.ProductName,
-				"amount_pen":    tx.AmountPEN,
-				"kc_amount":     tx.KCAmount,
-				"gateway":       tx.Gateway,
-				"external_id":   tx.ExternalID,
-				"status":        tx.Status,
-				"created_at":    tx.CreatedAt,
+				"type":             "payment",
+				"reference":        strings.ToUpper(id.String()[:8]),
+				"customer_name":    customer.EpicUsername,
+				"product_name":     tx.ProductName,
+				"amount_pen":       tx.AmountPEN,
+				"charged_amount":   chargedAmount,
+				"charged_currency": chargedCurrency,
+				"kc_amount":        tx.KCAmount,
+				"gateway":          tx.Gateway,
+				"external_id":      tx.ExternalID,
+				"status":           tx.Status,
+				"created_at":       tx.CreatedAt,
 			},
 		})
 	}
@@ -366,18 +391,33 @@ func HandlerRechargeVoucher(database *sql.DB) gin.HandlerFunc {
 		if r.AmountSoles != nil { amountSoles = *r.AmountSoles }
 		productName := "Recarga manual de KC"
 		if r.Note != nil && *r.Note != "" { productName = *r.Note }
+		// Las recargas manuales (Yape/Plin/transferencia, o /kc add de Discord)
+		// siempre se cobran en soles — a diferencia de un pago automático, acá
+		// no hay ninguna pasarela de por medio que pudiera haber cobrado en
+		// otra divisa. Cuando amountSoles es 0 (recarga hecha desde Discord sin
+		// registrar un monto en soles), no se inventa un importe: se omite el
+		// campo en vez de mostrar "S/ 0.00" como si esa hubiera sido la cifra
+		// real cobrada.
+		var chargedAmount interface{}
+		var chargedCurrency interface{}
+		if amountSoles > 0 {
+			chargedAmount = amountSoles
+			chargedCurrency = "PEN"
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"voucher": gin.H{
-				"type":          "recharge",
-				"reference":     strings.ToUpper(id.String()[:8]),
-				"customer_name": customer.EpicUsername,
-				"product_name":  productName,
-				"amount_pen":    amountSoles,
-				"kc_amount":     r.AmountKC,
-				"gateway":       r.Method,
-				"status":        "approved",
-				"created_at":    r.CreatedAt,
+				"type":             "recharge",
+				"reference":        strings.ToUpper(id.String()[:8]),
+				"customer_name":    customer.EpicUsername,
+				"product_name":     productName,
+				"amount_pen":       amountSoles,
+				"charged_amount":   chargedAmount,
+				"charged_currency": chargedCurrency,
+				"kc_amount":        r.AmountKC,
+				"gateway":          r.Method,
+				"status":           "approved",
+				"created_at":       r.CreatedAt,
 			},
 		})
 	}
@@ -385,10 +425,27 @@ func HandlerRechargeVoucher(database *sql.DB) gin.HandlerFunc {
 
 // ==================== CANCELAR PAGO ====================
 
-// HandlerCancelPayment permite al cliente marcar su propio pago pendiente
-// como fallido en cuanto la pasarela le confirma en el navegador que lo
-// canceló — sin esto, la transacción se queda "pendiente" en su historial
-// hasta que el barrido automático la expira, hasta 30 minutos después.
+// HandlerCancelPayment lo llama el frontend cuando el cliente cierra la
+// ventana de pago o se agota el timeout de espera (~6 min) sin un status
+// definitivo. NINGUNA de esas dos cosas demuestra que el pago haya
+// fallado — una transferencia, una confirmación cripto o incluso una
+// tarjeta pueden seguir procesándose del lado de la pasarela después de
+// eso. Antes esto marcaba el pago "failed" sin más, lo que además lo sacaba
+// para siempre de ReconcilePendingPayments (que solo revisa status='pending')
+// — si luego SÍ llegaba una confirmación tardía, el webhook igual la
+// acreditaría (CreditPaymentOnce no depende del status), pero si el webhook
+// nunca llegaba, el pago quedaba "failed" para siempre sin que nada volviera
+// a consultar a la pasarela.
+//
+// Ahora, antes de tocar nada, se consulta directamente a la pasarela (misma
+// fuente de verdad que usa la reconciliación automática):
+//   - Si la pasarela confirma que se aprobó → se acredita (nunca se marca
+//     fallido un pago que en realidad sí se cobró).
+//   - Si la pasarela confirma un rechazo/cancelación DEFINITIVO → recién ahí
+//     se marca 'failed'.
+//   - Si sigue sin resolverse (pendiente en la pasarela, sin sesión creada
+//     aún, o no se pudo consultar) → se deja 'pending', tal cual, para que
+//     ReconcilePendingPayments y/o el webhook lo sigan intentando.
 func HandlerCancelPayment(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		customerIDStr, ok := middleware.GetCustomerID(c)
@@ -407,15 +464,43 @@ func HandlerCancelPayment(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		cancelled, err := db.CancelPendingPayment(database, txID, customerID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error cancelando pago"})
+		tx, err := db.GetPaymentTransaction(database, txID)
+		if err != nil || tx.CustomerID != customerID {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "transacción no encontrada"})
 			return
 		}
-		// Si no se canceló nada (no era tuya, o ya no estaba pending — pudo
-		// aprobarse justo en este instante) no es un error: el estado real de la
-		// transacción es el que ya tiene, y el frontend lo vuelve a consultar.
-		c.JSON(http.StatusOK, gin.H{"success": true, "cancelled": cancelled})
+		if tx.Status != "pending" {
+			// Ya se resolvió por otra vía (webhook, reconciliación, admin) — el
+			// frontend vuelve a consultar el estado real, no hay nada que hacer acá.
+			c.JSON(http.StatusOK, gin.H{"success": true, "status": tx.Status})
+			return
+		}
+
+		if tx.ExternalID == "" {
+			// Nunca se llegó a crear una sesión real en la pasarela (la llamada
+			// para generarla falló, o el cliente nunca fue redirigido) — no hay
+			// nada que la pasarela pueda haber cobrado, es seguro marcarlo fallido.
+			db.CancelPendingPayment(database, txID, customerID)
+			c.JSON(http.StatusOK, gin.H{"success": true, "status": "failed"})
+			return
+		}
+
+		outcome, gwErr := checkGatewayOutcome(tx)
+		switch outcome {
+		case gatewayApproved:
+			if err := processApprovedPayment(database, txID); err != nil {
+				slog.Error("HandlerCancelPayment: error acreditando pago aprobado", "txID", txID, "error", err)
+			}
+			c.JSON(http.StatusOK, gin.H{"success": true, "status": "approved"})
+		case gatewayRejected:
+			db.AdminUpdatePaymentStatus(database, txID, "failed")
+			c.JSON(http.StatusOK, gin.H{"success": true, "status": "failed"})
+		default: // gatewayStillPending, o la consulta a la pasarela falló
+			if gwErr != nil {
+				slog.Warn("HandlerCancelPayment: no se pudo verificar con la pasarela, se deja pendiente", "txID", txID, "gateway", tx.Gateway, "error", gwErr)
+			}
+			c.JSON(http.StatusOK, gin.H{"success": true, "status": "pending"})
+		}
 	}
 }
 
@@ -471,28 +556,36 @@ func createMercadoPagoPreference(tx db.PaymentTransactionInput) (string, string,
 	return result.InitPoint, result.ID, nil
 }
 
-// mercadoPagoStatusByReference busca si existe un pago APROBADO en
-// MercadoPago para nuestro external_reference (nuestro propio UUID de
-// pago). Es la única forma confiable de reconciliar MercadoPago sin
-// esperar al webhook: el external_id que guardamos al crear el pago es el
-// ID de la PREFERENCIA (la sesión de checkout), no el del pago real —
-// ese solo existe y se conoce después de que el cliente paga. La búsqueda
-// por external_reference es lo que ya usaba el poll de HandlerPaymentStatus;
-// se extrajo acá para que ReconcilePendingPayments (webhooks.go) también
-// pueda reusarla.
-func mercadoPagoStatusByReference(txID string) (approved bool, err error) {
+// mercadoPagoPaymentStatus busca el pago en MercadoPago para nuestro
+// external_reference (nuestro propio UUID de pago). Es la única forma
+// confiable de reconciliar MercadoPago sin esperar al webhook: el
+// external_id que guardamos al crear el pago es el ID de la PREFERENCIA (la
+// sesión de checkout), no el del pago real — ese solo existe y se conoce
+// después de que el cliente paga. La búsqueda por external_reference es lo
+// que ya usaba el poll de HandlerPaymentStatus; se extrajo acá para que
+// ReconcilePendingPayments (webhooks.go) también pueda reusarla.
+//
+// Devuelve el status crudo que MercadoPago tiene
+// registrado para este txID ("approved", "rejected", "cancelled", "pending",
+// "in_process", etc.), o "" si todavía no encuentra ningún pago asociado.
+// Se expone el status real (no solo un booleano) porque distinguir "MP dice
+// que se rechazó/canceló" de "MP todavía no tiene nada, o sigue pendiente"
+// importa para decidir si es seguro marcar un pago como fallido (ver
+// checkGatewayOutcome en webhooks.go) — cerrar la ventana de pago o un
+// timeout del lado del cliente no son, por sí mismos, ninguna de las dos cosas.
+func mercadoPagoPaymentStatus(txID string) (status string, err error) {
 	if paymentCfg.MercadoPagoToken == "" {
-		return false, fmt.Errorf("MercadoPago not configured")
+		return "", fmt.Errorf("MercadoPago not configured")
 	}
 	req, err := http.NewRequest("GET",
 		"https://api.mercadopago.com/v1/payments/search?external_reference="+url.QueryEscape(txID), nil)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+paymentCfg.MercadoPagoToken)
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	var result struct {
@@ -501,14 +594,27 @@ func mercadoPagoStatusByReference(txID string) (approved bool, err error) {
 		} `json:"results"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return false, err
+		return "", err
 	}
 	for _, r := range result.Results {
 		if r.Status == "approved" {
-			return true, nil
+			return "approved", nil
 		}
 	}
-	return false, nil
+	if len(result.Results) > 0 {
+		return result.Results[0].Status, nil
+	}
+	return "", nil
+}
+
+// mercadoPagoStatusByReference — conserva la firma booleana original para
+// los llamadores que solo necesitan saber si ya se aprobó.
+func mercadoPagoStatusByReference(txID string) (approved bool, err error) {
+	status, err := mercadoPagoPaymentStatus(txID)
+	if err != nil {
+		return false, err
+	}
+	return status == "approved", nil
 }
 
 // ==================== PAYPAL ====================

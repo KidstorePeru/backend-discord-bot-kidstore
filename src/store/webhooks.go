@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -81,62 +82,182 @@ func ReconcilePendingPayments(database *sql.DB) {
 	}
 }
 
-func reconcileOnePayment(database *sql.DB, p types.PaymentTransaction) {
+// gatewayOutcome resume lo que la pasarela dice REALMENTE sobre un pago —
+// nunca se infiere ninguno de los dos extremos (aprobado/rechazado) de
+// señales del lado del cliente (cerrar la ventana, un timeout, la URL de
+// retorno): esas solo pueden llevar a gatewayStillPending.
+type gatewayOutcome int
+
+const (
+	gatewayStillPending gatewayOutcome = iota
+	gatewayApproved
+	gatewayRejected
+)
+
+// classifyMercadoPagoStatus, classifyPayPalStatus, classifyDLocalGoStatus y
+// classifyNOWPaymentsStatus son funciones puras (sin red ni base de datos)
+// que traducen el status crudo que devuelve cada pasarela a un
+// gatewayOutcome — separadas de checkGatewayOutcome para poder cubrir con
+// tests unitarios simples la parte que de verdad importa: qué se considera
+// "aprobado", qué se considera "rechazado de forma definitiva", y qué se
+// trata como "todavía sin resolver" (nunca se infiere ninguno de los dos
+// primeros de que el cliente haya cerrado la ventana de pago o de un
+// timeout del lado del cliente — eso solo puede llegar acá como "sin
+// resolver").
+func classifyMercadoPagoStatus(status string) gatewayOutcome {
+	switch status {
+	case "approved":
+		return gatewayApproved
+	case "rejected", "cancelled":
+		return gatewayRejected
+	default: // "", "pending", "in_process", "authorized", etc.
+		return gatewayStillPending
+	}
+}
+
+func classifyPayPalStatus(status string) gatewayOutcome {
+	switch status {
+	case "COMPLETED":
+		return gatewayApproved
+	case "VOIDED":
+		return gatewayRejected
+	default: // CREATED, SAVED, APPROVED (todavía se puede capturar), PAYER_ACTION_REQUIRED, etc.
+		return gatewayStillPending
+	}
+}
+
+func classifyDLocalGoStatus(status string) gatewayOutcome {
+	switch status {
+	case "PAID":
+		return gatewayApproved
+	case "REJECTED", "CANCELLED", "EXPIRED":
+		return gatewayRejected
+	default: // PENDING
+		return gatewayStillPending
+	}
+}
+
+func classifyNOWPaymentsStatus(status string) gatewayOutcome {
+	switch status {
+	case "confirmed", "finished":
+		return gatewayApproved
+	case "failed", "expired", "refunded":
+		return gatewayRejected
+	default: // waiting, confirming, sending, partially_paid
+		return gatewayStillPending
+	}
+}
+
+// checkGatewayOutcome consulta directamente a la pasarela (con nuestras
+// propias credenciales, nunca confiando en datos que vengan del cliente o de
+// un webhook sin firmar) si un pago pendiente ya se resolvió. La usan tanto
+// HandlerCancelPayment (cuando el cliente cierra la ventana o se agota el
+// timeout) como reconcileOnePayment (el barrido automático) — MISMA fuente
+// de verdad para las dos rutas, así nunca dan respuestas distintas sobre el
+// mismo pago.
+func checkGatewayOutcome(p types.PaymentTransaction) (gatewayOutcome, error) {
 	switch p.Gateway {
 	case "mercadopago":
-		approved, err := mercadoPagoStatusByReference(p.ID.String())
+		status, err := mercadoPagoPaymentStatus(p.ID.String())
 		if err != nil {
-			slog.Warn("reconciliación MercadoPago falló", "txID", p.ID, "error", err)
-			return
+			return gatewayStillPending, err
 		}
-		if !approved {
-			return
-		}
+		return classifyMercadoPagoStatus(status), nil
 	case "paypal":
+		if p.ExternalID == "" {
+			return gatewayStillPending, nil
+		}
 		status, _, err := getPayPalOrder(p.ExternalID)
 		if err != nil {
-			slog.Warn("reconciliación PayPal falló", "txID", p.ID, "error", err)
-			return
+			return gatewayStillPending, err
 		}
-		if status == "APPROVED" {
-			// El cliente ya aprobó la orden en PayPal pero el webhook que
-			// dispara la captura nunca llegó — capturarla acá es lo mismo
-			// que hace HandlerPayPalWebhook al recibir CHECKOUT.ORDER.APPROVED.
-			if err := capturePayPalOrder(p.ExternalID); err != nil {
-				slog.Warn("reconciliación PayPal: captura falló", "txID", p.ID, "error", err)
-				return
-			}
-			status, _, err = getPayPalOrder(p.ExternalID)
-			if err != nil {
-				slog.Warn("reconciliación PayPal: re-consulta tras capturar falló", "txID", p.ID, "error", err)
-				return
-			}
-		}
-		if status != "COMPLETED" {
-			return
-		}
+		return classifyPayPalStatus(status), nil
 	case "dlocalgo":
+		if p.ExternalID == "" {
+			return gatewayStillPending, nil
+		}
 		status, _, err := dlocalGoPaymentStatus(p.ExternalID)
 		if err != nil {
-			slog.Warn("reconciliación dLocal Go falló", "txID", p.ID, "error", err)
-			return
+			return gatewayStillPending, err
 		}
-		if status != "PAID" {
-			return
+		return classifyDLocalGoStatus(status), nil
+	case "nowpayments":
+		// external_id acá es el ID de la FACTURA (invoice), no el del pago —
+		// para consultar el pago real hace falta provider_payment_id, que solo
+		// se conoce cuando llega al menos un IPN (ver HandlerNOWPaymentsWebhook).
+		// Sin él, no hay nada que consultar todavía: sigue "pendiente", ni
+		// aprobado ni rechazado.
+		if p.ProviderPaymentID == "" {
+			return gatewayStillPending, nil
 		}
+		paymentID, err := strconv.ParseInt(p.ProviderPaymentID, 10, 64)
+		if err != nil {
+			return gatewayStillPending, fmt.Errorf("provider_payment_id inválido: %w", err)
+		}
+		status, orderID, err := nowPaymentsStatus(paymentID)
+		if err != nil {
+			return gatewayStillPending, err
+		}
+		if orderID != p.ID.String() {
+			// No debería pasar nunca (provider_payment_id se guarda junto con
+			// el propio orderID que NOWPayments devolvió) — si pasa, algo está
+			// mal y es mejor no acreditar ni rechazar nada a ciegas.
+			return gatewayStillPending, fmt.Errorf("nowpayments: order_id de la pasarela (%s) no coincide con la transacción (%s)", orderID, p.ID.String())
+		}
+		return classifyNOWPaymentsStatus(status), nil
 	default:
-		// nowpayments: el external_id que guardamos es el ID de la FACTURA
-		// (invoice), no el del pago — la API de NOWPayments identifica los
-		// pagos por su propio ID, distinto y solo conocido cuando llega el
-		// IPN. Sin un ID de pago que consultar, no hay forma de reconciliar
-		// acá; ese gateway sigue dependiendo únicamente del webhook. Queda
-		// documentado como limitación conocida, no resuelto en silencio.
-		return
+		return gatewayStillPending, fmt.Errorf("pasarela desconocida: %s", p.Gateway)
 	}
-	if err := processApprovedPayment(database, p.ID); err != nil {
-		slog.Error("reconciliación: error acreditando pago", "txID", p.ID, "gateway", p.Gateway, "error", err)
-	} else {
+}
+
+// reconcileDeadLetterAfter — si un pago con sesión real en la pasarela lleva
+// todo este tiempo sin que la pasarela confirme nada (ni a favor ni en
+// contra), se da por perdido. Deliberadamente generoso: una confirmación
+// cripto (NOWPayments) puede tardar horas en la blockchain en momentos de
+// congestión, mucho más que cualquier tarjeta o transferencia.
+const reconcileDeadLetterAfter = 6 * time.Hour
+
+func reconcileOnePayment(database *sql.DB, p types.PaymentTransaction) {
+	outcome, err := checkGatewayOutcome(p)
+	if err != nil {
+		slog.Warn("reconciliación: consulta a la pasarela falló", "txID", p.ID, "gateway", p.Gateway, "error", err)
+	}
+
+	switch outcome {
+	case gatewayApproved:
+		// PayPal: si la orden está aprobada pero todavía no capturada, capturarla
+		// primero es lo mismo que hace HandlerPayPalWebhook al recibir
+		// CHECKOUT.ORDER.APPROVED — checkGatewayOutcome no la cuenta como
+		// aprobada hasta que además está COMPLETED, así que llegar acá con
+		// PayPal ya significa COMPLETED de verdad.
+		if err := processApprovedPayment(database, p.ID); err != nil {
+			slog.Error("reconciliación: error acreditando pago", "txID", p.ID, "gateway", p.Gateway, "error", err)
+			return
+		}
 		slog.Info("reconciliación: pago acreditado sin depender del webhook", "txID", p.ID, "gateway", p.Gateway)
+	case gatewayRejected:
+		if err := db.AdminUpdatePaymentStatus(database, p.ID, "failed"); err != nil {
+			slog.Error("reconciliación: error marcando pago rechazado", "txID", p.ID, "gateway", p.Gateway, "error", err)
+			return
+		}
+		slog.Info("reconciliación: pago rechazado confirmado por la pasarela", "txID", p.ID, "gateway", p.Gateway)
+	default: // gatewayStillPending — todavía nada resuelto, o PayPal APPROVED-sin-capturar
+		if p.Gateway == "paypal" {
+			// Intentar la captura mejora las chances de la próxima pasada, pero
+			// nunca decide por sí sola el resultado (checkGatewayOutcome vuelve
+			// a consultar la próxima vez).
+			if status, _, gerr := getPayPalOrder(p.ExternalID); gerr == nil && status == "APPROVED" {
+				capturePayPalOrder(p.ExternalID)
+			}
+		}
+		if time.Since(p.CreatedAt) > reconcileDeadLetterAfter {
+			slog.Warn("reconciliación: pago nunca se pudo confirmar ni descartar, se da por perdido", "txID", p.ID, "gateway", p.Gateway, "edad", time.Since(p.CreatedAt))
+			if err := db.AdminUpdatePaymentStatus(database, p.ID, "expired"); err != nil {
+				slog.Error("reconciliación: error expirando pago sin resolver", "txID", p.ID, "error", err)
+				return
+			}
+			discordbot.AlertUnresolvedPayment(p.ID.String(), p.Gateway)
+		}
 	}
 }
 
@@ -403,6 +524,24 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 				outcome = "error: status query failed"
 				return
 			}
+
+			txID, parseErr := uuid.Parse(orderID)
+			if parseErr != nil {
+				slog.Error("NOWPayments invalid order_id", "id", orderID)
+				outcome = "error: invalid order_id"
+				return
+			}
+
+			// Guardar el ID real del pago ANTES de decidir qué hacer con su
+			// estado — así, aunque el proceso se caiga justo después de esta
+			// línea, la reconciliación automática (cada 2 min, ver
+			// reconcileOnePayment) puede seguir consultando el pago real sin
+			// depender de que este webhook se repita (algo que este gateway no
+			// podía hacer antes: era el único excluido de esa reconciliación).
+			if serr := db.SetProviderPaymentID(database, txID, fmt.Sprintf("%d", notification.PaymentID)); serr != nil {
+				slog.Error("NOWPayments: no se pudo guardar el payment_id real", "txID", txID, "error", serr)
+			}
+
 			if status == "partially_paid" {
 				// El cliente pagó menos cripto de lo esperado — antes esto se
 				// trataba igual que cualquier pago pendiente y simplemente
@@ -415,13 +554,6 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 				return
 			}
 			if status != "confirmed" && status != "finished" {
-				return
-			}
-
-			txID, err := uuid.Parse(orderID)
-			if err != nil {
-				slog.Error("NOWPayments invalid order_id", "id", orderID)
-				outcome = "error: invalid order_id"
 				return
 			}
 

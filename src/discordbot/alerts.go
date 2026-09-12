@@ -173,6 +173,23 @@ func ClearAllNoGiftSlotsAlerts() {
 	}
 }
 
+// AlertOrderNeedsReview se llama cuando un pedido queda en 'review' —
+// entrega incierta tras una caída durante el envío a Epic Games (ver
+// MarkOrderSendAttempted en db.go). No se puede confirmar ni descartar la
+// entrega automáticamente sin arriesgarse a duplicarla o a reembolsar dos
+// veces, así que necesita que un admin lo revise a mano contra Epic Games.
+func AlertOrderNeedsReview(orderID, epicUsername, itemName string) {
+	key := "order_review_" + orderID
+	if !shouldAlert(key) {
+		return
+	}
+	sendAdminAlert(
+		"🟡 Pedido necesita revisión manual",
+		fmt.Sprintf("El pedido **%s** (%s → %s) quedó en revisión: no se pudo confirmar si un envío anterior llegó a completarse en Epic Games antes de una caída del proceso. Revísalo en el panel admin (pestaña Pedidos) y resuélvelo confirmando en Epic si el ítem llegó o no.", orderID, itemName, epicUsername),
+		colorWarnSoft,
+	)
+}
+
 // AlertUnderpaidCryptoPayment se llama cuando NOWPayments reporta un pago
 // como "partially_paid" — el cliente mandó menos cripto de lo esperado
 // (comisión de red, o el precio de la cripto se movió justo en el momento
@@ -189,6 +206,26 @@ func AlertUnderpaidCryptoPayment(paymentID int64, orderID string) {
 	sendAdminAlert(
 		"🟡 Pago cripto incompleto",
 		fmt.Sprintf("NOWPayments reportó el pago **%d** (pedido %s) como pagado parcialmente — el cliente no acreditó KC. Revisa el pago en el panel y decide si acreditar el monto proporcional o contactar al cliente.", paymentID, orderID),
+		colorWarnSoft,
+	)
+}
+
+// AlertUnresolvedPayment se llama cuando un pago con sesión real en una
+// pasarela lleva demasiado tiempo (ver reconcileDeadLetterAfter en
+// webhooks.go) sin que la pasarela confirme ni un cobro ni un rechazo — se
+// da por perdido (status 'expired') en vez de quedar "pending" para
+// siempre, pero a diferencia de un rechazo real, esto es poco común y vale
+// la pena que alguien lo revise a mano (podría ser un problema con las
+// credenciales de esa pasarela, no necesariamente un pago legítimamente
+// abandonado).
+func AlertUnresolvedPayment(txID, gateway string) {
+	key := "unresolved_payment_" + txID
+	if !shouldAlert(key) {
+		return
+	}
+	sendAdminAlert(
+		"🟡 Pago sin resolver tras varias horas",
+		fmt.Sprintf("El pago **%s** (%s) llevó más de 6 horas sin que la pasarela confirmara ni un cobro ni un rechazo. Se marcó como expirado automáticamente. Si el cliente reclama, revísalo a mano en el panel de esa pasarela.", txID, gateway),
 		colorWarnSoft,
 	)
 }

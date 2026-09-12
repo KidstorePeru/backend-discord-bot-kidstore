@@ -332,6 +332,47 @@ func HandlerGetAllOrders(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// HandlerResolveOrderReview resuelve a mano un pedido que quedó en 'review'
+// (entrega incierta tras una caída durante el envío — ver
+// MarkOrderSendAttempted en db.go). El admin debe verificar directamente en
+// Epic Games (buscando al receptor y revisando su inventario/historial de
+// regalos) si el ítem llegó o no ANTES de elegir una acción: "delivered" si
+// sí llegó (deja constancia de que es una confirmación manual, no la
+// respuesta automática de Epic), "refund" si no llegó.
+func HandlerResolveOrderReview(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "ID inválido"})
+			return
+		}
+		var req struct {
+			Action string `json:"action" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || (req.Action != "delivered" && req.Action != "refund") {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "acción inválida, usar: delivered o refund"})
+			return
+		}
+		order, err := db.GetOrderByID(database, id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "pedido no encontrado"})
+			return
+		}
+		if order.Status != "review" {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "este pedido no está en revisión"})
+			return
+		}
+		actor := adminActor(c, database)
+		if err := db.ResolveReviewOrder(database, id, req.Action, actor); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error resolviendo el pedido: " + err.Error()})
+			return
+		}
+		db.AddAuditLog(database, &order.CustomerID, "ORDER_REVIEW_RESOLVED",
+			fmt.Sprintf("pedido %s resuelto manualmente por %s: %s", id, actor, req.Action), c.ClientIP())
+		c.JSON(http.StatusOK, gin.H{"success": true})
+	}
+}
+
 func HandlerGetAllPayments(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))

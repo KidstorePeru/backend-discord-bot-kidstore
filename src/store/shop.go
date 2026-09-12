@@ -278,6 +278,27 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 	return shopItem{}, fmt.Errorf("item no encontrado en la tienda actual")
 }
 
+// alreadyOwnedResolution es la decisión pura (sin tocar DB ni red) que toma
+// processOrder cuando Epic responde ErrAlreadyOwned al intentar enviar un
+// regalo — separada del resto de la función para poder probarla con un
+// test unitario simple, sin necesitar una base de datos real:
+//
+//   - wasAlreadyAttempting=false (nunca se había intentado enviar ESTE
+//     pedido antes): el receptor obtuvo el ítem por su cuenta, ANTES de
+//     este pedido — nuestro pedido nunca lo entregó. Resolución:
+//     "refund_not_delivered" (reembolsar, nunca marcar "sent").
+//   - wasAlreadyAttempting=true (había un intento de ESTE pedido
+//     interrumpido, ver MarkOrderSendAttempted): no se puede confirmar si
+//     ese intento interrumpido fue el que entregó el ítem. Resolución:
+//     "needs_review" (ni se inventa evidencia de entrega, ni se reembolsa
+//     a ciegas arriesgando un reembolso duplicado).
+func alreadyOwnedResolution(wasAlreadyAttempting bool) string {
+	if wasAlreadyAttempting {
+		return "needs_review"
+	}
+	return "refund_not_delivered"
+}
+
 // ==================== CREAR PEDIDO ====================
 
 const maxPendingOrdersPerCustomer = 10
@@ -739,34 +760,58 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			continue // probar siguiente bot
 		}
 
-		// Intentar enviar el regalo
+		// Intentar enviar el regalo. Se marca "intento en curso" ANTES de
+		// llamar a Epic (persistido en la base, no solo en memoria) — si el
+		// proceso se cae justo durante esta llamada, la próxima vez que se
+		// reclame este pedido (ClaimPendingOrders) sabremos que hubo un
+		// intento real interrumpido, no solo que Epic dice "ya lo tiene" por
+		// una compra o regalo de otra persona ajena a nosotros. Ver el
+		// comentario completo en MarkOrderSendAttempted (db.go).
+		wasAlreadyAttempting, attemptErr := db.MarkOrderSendAttempted(database, order.ID, true)
+		if attemptErr != nil {
+			slog.Error("Worker: no se pudo registrar el intento de envío, se reintenta en el próximo ciclo", "orderID", order.ID, "error", attemptErr)
+			return
+		}
+
 		message := "¡Gracias por tu compra en KidStorePeru! 🎮"
 		var evidence string
 		evidence, err = fortnite.SendGift(database, *bot, receiverAccountID,
 			order.ItemOfferID, order.PriceVBucks, order.ItemName, message)
 
+		// Cualquier resultado a partir de acá es un desenlace CONOCIDO para
+		// este intento (éxito, ya-lo-tenía, o un error identificado) — se
+		// limpia la marca para que no quede prendida de más y confunda al
+		// siguiente bot que se pruebe en este mismo ciclo.
+		db.MarkOrderSendAttempted(database, order.ID, false)
+
 		if errors.Is(err, fortnite.ErrAlreadyOwned) {
-			// Recuperación de un pedido atascado en 'processing' (ver
-			// ClaimPendingOrders) — Epic confirma que el cliente YA tiene
-			// este ítem, es decir, un intento anterior (probablemente
-			// interrumpido por una caída del proceso justo después de
-			// enviarlo) sí llegó a completarse en Epic aunque acá nunca se
-			// haya registrado. NO se reintenta el envío (evitaría
-			// duplicarlo) — se marca como entregado directamente. No se
-			// vuelve a descontar V-Bucks/slot del bot en esta recuperación:
-			// si el intento original alcanzó a descontarlos, hacerlo de
-			// nuevo los dejaría mal contados; si no alcanzó, es un margen de
-			// error muchísimo más barato que enviar el ítem dos veces.
-			recoveryNote := fmt.Sprintf(`{"recovered":true,"note":"Epic confirmó que el ítem ya estaba entregado al recuperar un pedido atascado","bot_account_id":"%s","receiver_account_id":"%s"}`,
-				bot.ID.String(), receiverAccountID)
-			accountID := bot.ID
-			if markErr := db.MarkOrderDelivered(database, order.ID, accountID, recoveryNote); markErr != nil {
-				slog.Warn("Worker: error guardando evidencia de recuperación", "orderID", order.ID, "error", markErr)
-				db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
+			if alreadyOwnedResolution(wasAlreadyAttempting) == "needs_review" {
+				// Había un intento de envío de ESTE pedido interrumpido antes de
+				// esta llamada (el proceso se cayó a mitad de camino la vez
+				// anterior) — es razonable pensar que ese intento sí llegó a
+				// entregar el ítem, pero no hay ninguna evidencia real de Epic
+				// confirmando ESE envío puntual, así que no se inventa una. Se
+				// deja en revisión manual: ni se marca entregado sin pruebas, ni
+				// se reembolsa a ciegas (podría estar duplicando un reembolso si
+				// en realidad sí se entregó). No se vuelve a descontar
+				// V-Bucks/slot del bot: si el intento original ya los descontó,
+				// hacerlo de nuevo los dejaría mal contados.
+				reviewNote := fmt.Sprintf("Epic reportó que el receptor ya tiene el ítem, pero un intento de envío anterior de este mismo pedido se había interrumpido — no se puede confirmar si fue ese intento el que lo entregó. bot=%s receiver=%s", bot.DisplayName, receiverAccountID)
+				if markErr := db.MarkOrderNeedsReview(database, order.ID, reviewNote); markErr != nil {
+					slog.Error("Worker: error dejando pedido en revisión", "orderID", order.ID, "error", markErr)
+				}
+				discordbot.AlertOrderNeedsReview(order.ID.String(), order.EpicUsername, order.ItemName)
+				db.AddAuditLog(database, &order.CustomerID, "ORDER_NEEDS_REVIEW", reviewNote, "worker")
+				slog.Warn("Worker: pedido en revisión manual — entrega incierta tras una caída", "orderID", order.ID, "bot", bot.DisplayName)
+				return
 			}
-			db.AddAuditLog(database, &order.CustomerID, "ORDER_RECOVERED",
-				fmt.Sprintf("pedido %s recuperado tras atasco en 'processing' — Epic confirmó entrega previa", order.ID), "worker")
-			slog.Info("Worker: pedido recuperado (ya estaba entregado)", "orderID", order.ID, "bot", bot.DisplayName)
+			// Primer y único intento de envío de este pedido: si Epic dice que
+			// el receptor ya tiene el ítem, es porque lo obtuvo por su cuenta
+			// (lo compró él mismo, o se lo regaló otra persona) ANTES de este
+			// pedido — nuestro pedido nunca lo entregó. No corresponde marcarlo
+			// "sent" solo porque el cliente posee el artículo.
+			refundMsg := fmt.Sprintf("el receptor '%s' ya posee este ítem (adquirido por su cuenta, no por este pedido) — Epic no permite regalarlo de nuevo", order.EpicUsername)
+			failOrderAndRefund(database, order, refundMsg, "El destinatario ya tiene este ítem en su cuenta de Fortnite (obtenido por su cuenta), por lo que Epic Games no permite regalarlo de nuevo. Se reembolsó tu KC.")
 			return
 		}
 

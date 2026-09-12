@@ -62,6 +62,31 @@ func CreateTables(db *sql.DB) error {
 				ALTER TABLE orders ADD COLUMN delivery_evidence TEXT;
 			END IF;
 		END $$`,
+		// send_attempted: true mientras hay un intento de SendGift en curso (o
+		// interrumpido a mitad de camino) para este pedido — ver el comentario
+		// junto a MarkOrderSendAttempted en este archivo y su uso en
+		// processOrder (shop.go). Distingue "Epic dice que el receptor ya tiene
+		// este ítem porque lo compró/recibió por su cuenta, antes de este
+		// pedido" (send_attempted=false: nunca llegamos a intentar el envío) de
+		// "quedó incierto si nuestro propio intento fue el que lo entregó,
+		// porque el proceso se cayó justo durante la llamada a Epic"
+		// (send_attempted=true).
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='send_attempted') THEN
+				ALTER TABLE orders ADD COLUMN send_attempted BOOLEAN NOT NULL DEFAULT false;
+			END IF;
+		END $$`,
+		// 'review': entrega incierta tras una caída durante el envío — no se
+		// inventa evidencia de entrega ni se reembolsa a ciegas; un admin debe
+		// confirmar contra Epic Games y resolverlo manualmente (ver
+		// HandlerResolveOrderReview). No se incluye en la recuperación
+		// automática de ClaimPendingOrders — a propósito, para no reintentar
+		// solo ni duplicar un envío que podría haberse completado ya.
+		`DO $$ BEGIN
+			ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check;
+			ALTER TABLE orders ADD CONSTRAINT orders_status_check
+				CHECK (status IN ('pending','processing','sent','failed','refunded','review'));
+		END $$`,
 		`CREATE TABLE IF NOT EXISTS audit_logs (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
@@ -202,6 +227,14 @@ func CreateTables(db *sql.DB) error {
 			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payment_transactions' AND column_name='activation_code') THEN
 				ALTER TABLE payment_transactions ADD COLUMN activation_code VARCHAR(8);
 				ALTER TABLE payment_transactions ADD COLUMN autobuyer_task_id VARCHAR(100);
+			END IF;
+		END $$`,
+		// provider_payment_id: ver el comentario en types.PaymentTransaction —
+		// hoy solo lo usa NOWPayments (el external_id ahí es el ID de la
+		// factura, no el del pago real).
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payment_transactions' AND column_name='provider_payment_id') THEN
+				ALTER TABLE payment_transactions ADD COLUMN provider_payment_id VARCHAR(255);
 			END IF;
 		END $$`,
 		`CREATE INDEX IF NOT EXISTS idx_payment_tx_activation ON payment_transactions(activation_code)`,
@@ -1329,6 +1362,75 @@ func UpdateOrderStatus(db *sql.DB, orderID uuid.UUID, status string, gameAccount
 	return err
 }
 
+// MarkOrderSendAttempted se llama justo ANTES de intentar de verdad enviar el
+// regalo por Epic Games (fortnite.SendGift) para este pedido, y devuelve si
+// YA estaba marcado como "intento en curso" de una llamada anterior — la
+// señal que usa processOrder (shop.go) para distinguir, si Epic responde que
+// el receptor ya tiene el ítem, entre dos situaciones muy distintas:
+//
+//  1. wasAlreadyAttempted=false: esta es la primera vez que se intenta
+//     ENVIAR este pedido. Si Epic dice "ya lo tiene", es porque el cliente
+//     lo obtuvo por su cuenta (lo compró él mismo, o se lo regaló otra
+//     persona) ANTES de este pedido — nuestro pedido nunca lo entregó.
+//  2. wasAlreadyAttempted=true: ya había un intento de envío de ESTE pedido
+//     en curso cuando se llama de nuevo (típicamente porque el proceso se
+//     cayó a mitad de la llamada anterior a Epic, antes de poder registrar
+//     el resultado). Ahí sí es razonable pensar que ese intento anterior
+//     pudo haber completado la entrega — pero como no hay evidencia real
+//     guardada de Epic confirmando ESE envío, tampoco se puede afirmar con
+//     certeza. processOrder deja el pedido en 'review' en este caso, nunca
+//     lo marca 'sent' sin evidencia real.
+//
+// La llamada que seguía (después de SendGift, sin importar el resultado)
+// debe limpiar la marca con MarkOrderSendAttempted(db, id, false) — así un
+// bot que fallá por un motivo normal y bien identificado (gift_limit_reached,
+// fondos insuficientes, etc.) no deja la marca prendida para el siguiente
+// bot que se pruebe en el mismo ciclo.
+func MarkOrderSendAttempted(db *sql.DB, orderID uuid.UUID, attempting bool) (wasAlreadyAttempted bool, err error) {
+	tx, err := db.Begin()
+	if err != nil { return false, err }
+	defer tx.Rollback()
+	if err := tx.QueryRow(`SELECT send_attempted FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&wasAlreadyAttempted); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(`UPDATE orders SET send_attempted=$1, updated_at=NOW() WHERE id=$2`, attempting, orderID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil { return false, err }
+	return wasAlreadyAttempted, nil
+}
+
+// MarkOrderNeedsReview deja el pedido en 'review' — entrega incierta que no
+// se puede confirmar ni descartar automáticamente sin arriesgarse a duplicar
+// una entrega o un reembolso (ver MarkOrderSendAttempted). Un admin lo
+// resuelve a mano desde el panel (ver ResolveReviewOrder) tras verificar
+// directamente en Epic Games si el ítem llegó o no.
+func MarkOrderNeedsReview(db *sql.DB, orderID uuid.UUID, note string) error {
+	_, err := db.Exec(`UPDATE orders SET status='review', error_msg=$1, updated_at=NOW() WHERE id=$2`, note, orderID)
+	return err
+}
+
+// ResolveReviewOrder es la única forma de sacar un pedido de 'review' — a
+// mano, desde el panel admin, después de que alguien comprobó directamente
+// en Epic Games si el ítem se entregó o no. action="delivered" marca el
+// pedido enviado (dejando constancia de que la evidencia es una
+// confirmación manual del admin, no la respuesta automática de Epic).
+// action="refund" reembolsa el KC — reutiliza RefundOrder, que ya rechaza
+// reembolsar un pedido 'sent' o 'refunded', así que no hay forma de hacer
+// las dos cosas por error.
+func ResolveReviewOrder(db *sql.DB, orderID uuid.UUID, action, adminActor string) error {
+	switch action {
+	case "delivered":
+		note := fmt.Sprintf(`{"manual_review":true,"confirmed_by":%q,"note":"Admin confirmó manualmente en Epic Games que el ítem sí se entregó"}`, adminActor)
+		_, err := db.Exec(`UPDATE orders SET status='sent', delivery_evidence=$1, error_msg=NULL, updated_at=NOW() WHERE id=$2 AND status='review'`, note, orderID)
+		return err
+	case "refund":
+		return RefundOrder(db, orderID)
+	default:
+		return fmt.Errorf("acción desconocida: %s", action)
+	}
+}
+
 // MarkOrderDelivered marca un pedido como enviado Y guarda la evidencia de
 // entrega (la respuesta cruda de Epic Games confirmando el envío) en la
 // misma operación — esta es la prueba que se usa si algún día hay que
@@ -1688,9 +1790,9 @@ func GetPaymentTransaction(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, 
 	var t types.PaymentTransaction
 	var currencyCode sql.NullString
 	err := db.QueryRow(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, COALESCE(external_id,''), COALESCE(provider_payment_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions WHERE id=$1`, id).
-		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
+		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.KCAmount, &t.ExternalID, &t.ProviderPaymentID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
 	t.CurrencyCode = currencyCode.String
 	return t, err
 }
@@ -1884,7 +1986,7 @@ func ConsumeOAuthLoginCode(db *sql.DB, code string) (payload string, ok bool) {
 
 func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
 	rows, err := db.Query(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), COALESCE(provider_payment_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions
 		WHERE status='pending' AND COALESCE(external_id,'') != '' AND created_at < NOW() - INTERVAL '2 minutes'
 		ORDER BY created_at ASC LIMIT 100`)
@@ -1893,12 +1995,22 @@ func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
 	var txs []types.PaymentTransaction
 	for rows.Next() {
 		var t types.PaymentTransaction
-		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.ProviderPaymentID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		txs = append(txs, t)
 	}
 	return txs, nil
+}
+
+// SetProviderPaymentID guarda el identificador REAL del pago en la pasarela
+// (ver el comentario en types.PaymentTransaction) apenas se conoce — ANTES
+// de decidir qué hacer con su estado — para que quede disponible de forma
+// duradera para la reconciliación automática aunque el proceso se caiga
+// justo después de recibir el webhook.
+func SetProviderPaymentID(db *sql.DB, id uuid.UUID, providerPaymentID string) error {
+	_, err := db.Exec(`UPDATE payment_transactions SET provider_payment_id=$1, updated_at=NOW() WHERE id=$2`, providerPaymentID, id)
+	return err
 }
 
 // GetAllPaymentTransactions pagina los pagos del panel admin — status
@@ -2048,8 +2160,25 @@ func CountPendingOrdersByCustomer(db *sql.DB, customerID uuid.UUID) (int, error)
 
 // ==================== PAYMENT EXPIRATION ====================
 
+// ExpirePendingPayments cierra SOLO los intentos de pago que nunca llegaron
+// a tener una sesión real en la pasarela (external_id vacío — la llamada a
+// crear la preferencia/invoice/orden falló, o el cliente nunca llegó a ser
+// redirigido) — ahí no hay nada que esperar ni que reconciliar, así que 30
+// minutos de margen es de sobra.
+//
+// Los pagos que SÍ tienen una sesión real en la pasarela (external_id no
+// vacío) NUNCA se expiran a ciegas acá: cerrar la ventana del cliente o que
+// se agote un timeout en el frontend no demuestra que el pago haya fallado
+// (una transferencia bancaria o una confirmación cripto pueden tardar
+// bastante más que eso). Esos pagos los resuelve ReconcilePendingPayments
+// (webhooks.go), que los reintenta cada 2 minutos consultando directamente
+// a la pasarela — y solo los da por perdidos ('expired') tras un margen
+// mucho más generoso (ver deadLetterAfter en reconcileOnePayment) si de
+// verdad nunca se pudo confirmar nada, ni a favor ni en contra.
 func ExpirePendingPayments(db *sql.DB) (int64, error) {
-	result, err := db.Exec(`UPDATE payment_transactions SET status='expired', updated_at=NOW() WHERE status='pending' AND created_at < NOW() - INTERVAL '30 minutes'`)
+	result, err := db.Exec(`
+		UPDATE payment_transactions SET status='expired', updated_at=NOW()
+		WHERE status='pending' AND COALESCE(external_id,'')='' AND created_at < NOW() - INTERVAL '30 minutes'`)
 	if err != nil { return 0, err }
 	return result.RowsAffected()
 }
