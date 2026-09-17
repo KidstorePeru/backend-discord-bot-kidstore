@@ -248,10 +248,17 @@ func CreateTables(db *sql.DB) error {
 			updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 		)`,
 		// Update CHECK constraint to include fulfilled and activating statuses
+		// 'review': un pago con sesión real en la pasarela que llevó más de
+		// reconcileDeadLetterAfter (6h) sin que la pasarela confirmara ni un
+		// cobro ni un rechazo (ver reconcileOnePayment en webhooks.go). A
+		// diferencia de 'expired'/'failed', NO significa "no se realizó
+		// ningún cargo" — significa que no se pudo determinar, y sigue
+		// entrando en la reconciliación automática por si llega una
+		// confirmación tardía.
 		`DO $$ BEGIN
 			ALTER TABLE payment_transactions DROP CONSTRAINT IF EXISTS payment_transactions_status_check;
 			ALTER TABLE payment_transactions ADD CONSTRAINT payment_transactions_status_check
-				CHECK (status IN ('pending','approved','failed','expired','fulfilled','activating'));
+				CHECK (status IN ('pending','approved','failed','expired','fulfilled','activating','review'));
 		END $$`,
 		// Add is_admin column to customers
 		`DO $$ BEGIN
@@ -1400,13 +1407,60 @@ func MarkOrderSendAttempted(db *sql.DB, orderID uuid.UUID, attempting bool) (was
 	return wasAlreadyAttempted, nil
 }
 
-// MarkOrderNeedsReview deja el pedido en 'review' — entrega incierta que no
-// se puede confirmar ni descartar automáticamente sin arriesgarse a duplicar
-// una entrega o un reembolso (ver MarkOrderSendAttempted). Un admin lo
-// resuelve a mano desde el panel (ver ResolveReviewOrder) tras verificar
-// directamente en Epic Games si el ítem llegó o no.
-func MarkOrderNeedsReview(db *sql.DB, orderID uuid.UUID, note string) error {
-	_, err := db.Exec(`UPDATE orders SET status='review', error_msg=$1, updated_at=NOW() WHERE id=$2`, note, orderID)
+// ResolveOrderReview decide y aplica, en UNA sola transacción atómica, qué
+// hacer con la marca de intento de envío sin resolver de un pedido
+// (send_attempted, ver MarkOrderSendAttempted): si hay un intento sin
+// resolver, la MISMA escritura deja el pedido en 'review' (con reviewNote
+// como motivo) Y limpia la marca — nunca en dos pasos separados. Si no hay
+// ningún intento sin resolver, no escribe nada (no hay nada que resolver).
+//
+// Antes esto se hacía en dos escrituras separadas (MarkOrderSendAttempted
+// para leer-y-limpiar, después MarkOrderNeedsReview para guardar 'review')
+// — si la segunda fallaba, o el proceso se caía entre las dos, la marca
+// quedaba limpia SIN que 'review' se hubiera guardado: el pedido parecía
+// "sin ambigüedad" para el siguiente intento, que entonces sí podía
+// reembolsar un regalo que en realidad se había entregado. Al ser una
+// única transacción, o se aplican las dos escrituras juntas, o ninguna (la
+// marca queda como estaba antes, preservando la incertidumbre).
+//
+// Devuelve si había un intento sin resolver (y por lo tanto el pedido
+// quedó en 'review') — los llamadores usan este valor para decidir si
+// avisar al admin y registrar la auditoría, o seguir con el camino normal
+// (reembolso).
+func ResolveOrderReview(db *sql.DB, orderID uuid.UUID, reviewNote string) (wasAttempting bool, err error) {
+	tx, err := db.Begin()
+	if err != nil { return false, err }
+	defer tx.Rollback()
+	if err := tx.QueryRow(`SELECT send_attempted FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&wasAttempting); err != nil {
+		return false, err
+	}
+	if wasAttempting {
+		if _, err := tx.Exec(`UPDATE orders SET status='review', error_msg=$1, send_attempted=false, updated_at=NOW() WHERE id=$2`, reviewNote, orderID); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil { return false, err }
+	return wasAttempting, nil
+}
+
+// SetOrderReviewOrClear aplica, en UNA sola escritura atómica, una decisión
+// que el llamador YA TOMÓ de antemano (a partir del valor devuelto por una
+// llamada anterior a MarkOrderSendAttempted) — a diferencia de
+// ResolveOrderReview (que lee el estado actual y decide por sí sola), acá
+// hace falta que el llamador decida con un dato que ya no está en la base
+// (el valor de send_attempted ANTES de la llamada a Epic que se acaba de
+// hacer, que a esta altura ya se sobrescribió a "true" incondicionalmente
+// antes de intentar el envío). needsReview=true deja el pedido en 'review'
+// con reviewNote y limpia la marca; needsReview=false solo limpia la
+// marca. Cualquiera de las dos es una única sentencia UPDATE, así que no
+// hay ninguna ventana entre "decidir" y "guardar" en la que una caída del
+// proceso pudiera dejar un estado a medias.
+func SetOrderReviewOrClear(db *sql.DB, orderID uuid.UUID, needsReview bool, reviewNote string) error {
+	if needsReview {
+		_, err := db.Exec(`UPDATE orders SET status='review', error_msg=$1, send_attempted=false, updated_at=NOW() WHERE id=$2`, reviewNote, orderID)
+		return err
+	}
+	_, err := db.Exec(`UPDATE orders SET send_attempted=false, updated_at=NOW() WHERE id=$1`, orderID)
 	return err
 }
 
@@ -1435,11 +1489,40 @@ func ResolveReviewOrder(db *sql.DB, orderID uuid.UUID, action, adminActor string
 // entrega (la respuesta cruda de Epic Games confirmando el envío) en la
 // misma operación — esta es la prueba que se usa si algún día hay que
 // responder a una disputa de pago (el banco/pasarela pregunta "¿en verdad
-// se entregó lo que se cobró?").
+// se entregó lo que se cobró?"). send_attempted se limpia en esta MISMA
+// escritura atómica — no queda ninguna ventana entre "confirmar la
+// entrega" y "limpiar la marca de intento" donde una caída del proceso
+// pudiera dejar un estado contradictorio (pedido 'sent' pero con
+// send_attempted todavía en true, o viceversa).
 func MarkOrderDelivered(db *sql.DB, orderID, gameAccountID uuid.UUID, evidence string) error {
-	_, err := db.Exec(`UPDATE orders SET status='sent', game_account_id=$1, error_msg=NULL, delivery_evidence=$2, updated_at=NOW() WHERE id=$3`,
+	_, err := db.Exec(`UPDATE orders SET status='sent', game_account_id=$1, error_msg=NULL, delivery_evidence=$2, send_attempted=false, updated_at=NOW() WHERE id=$3`,
 		gameAccountID, evidence, orderID)
 	return err
+}
+
+// MarkOrderFailedIfNotTerminal transiciona un pedido a 'failed' SOLO si no
+// está ya en un estado que un reembolso jamás debería poder revertir:
+// 'refunded' (el KC ya se devolvió), 'sent' (el ítem ya se entregó) o
+// 'review' (entrega incierta, solo un admin puede resolverla — ver
+// ResolveReviewOrder). Antes, failOrderAndRefund pisaba el status a
+// 'failed' incondicionalmente ANTES de llamar a RefundOrder — si
+// failOrderAndRefund se llamaba una segunda vez para el mismo pedido
+// (reintento, condición de carrera) DESPUÉS de que el primer reembolso ya
+// se hubiera completado, ese pisotón devolvía el pedido de 'refunded' a
+// 'failed', lo que a su vez desactivaba la propia protección de
+// RefundOrder (que decide mirando el status actual) — permitiendo un
+// SEGUNDO reembolso real del mismo KC.
+//
+// Devuelve si la transición se aplicó — false significa "no había nada que
+// hacer, el pedido ya estaba en un estado definitivo", y el llamador debe
+// cortar ahí sin intentar reembolsar de nuevo.
+func MarkOrderFailedIfNotTerminal(db *sql.DB, orderID uuid.UUID, errMsg string) (applied bool, err error) {
+	result, err := db.Exec(`
+		UPDATE orders SET status='failed', error_msg=$1, updated_at=NOW()
+		WHERE id=$2 AND status NOT IN ('refunded','sent','review')`, errMsg, orderID)
+	if err != nil { return false, err }
+	n, err := result.RowsAffected()
+	return n > 0, err
 }
 
 // CountActiveCustomers devuelve cuántos clientes activos hay registrados —
@@ -1929,13 +2012,23 @@ func CreditPaymentOnce(db *sql.DB, id uuid.UUID) (credited bool, ptx types.Payme
 // diagnosticar: "¿nunca llegó el webhook, o llegó y algo falló después?").
 // No devuelve error al llamador si falla — nunca debe impedir que el
 // webhook responda 200 a la pasarela.
-func LogWebhookEvent(db *sql.DB, gateway, rawBody string) uuid.UUID {
+// LogWebhookEvent devuelve también el error de la escritura — antes se
+// descartaba (solo se logueaba) y el llamador seguía adelante como si el
+// evento hubiera quedado guardado, respondiendo 200 a la pasarela aunque
+// NO existiera ningún registro durable de que la notificación había
+// llegado. Sin ese registro, si el procesamiento en memoria también fallaba
+// (o el proceso se caía), no había ningún rastro del webhook — ni para
+// reintentarlo, ni para diagnosticar qué pasó. El llamador debe comprobar
+// este error y NO confirmar recepción (200) si la escritura falló, para
+// que la pasarela reintente el envío del webhook más tarde.
+func LogWebhookEvent(db *sql.DB, gateway, rawBody string) (uuid.UUID, error) {
 	id := uuid.New()
 	if _, err := db.Exec(`INSERT INTO webhook_events (id, gateway, raw_body, received_at) VALUES ($1,$2,$3,NOW())`,
 		id, gateway, rawBody); err != nil {
 		slog.Error("no se pudo registrar webhook_event", "gateway", gateway, "error", err)
+		return uuid.Nil, err
 	}
-	return id
+	return id, nil
 }
 
 // MarkWebhookEventProcessed anota cómo terminó de procesarse un webhook ya
@@ -1945,6 +2038,50 @@ func MarkWebhookEventProcessed(db *sql.DB, id uuid.UUID, outcome string) {
 	if _, err := db.Exec(`UPDATE webhook_events SET outcome=$1, processed_at=NOW() WHERE id=$2`, outcome, id); err != nil {
 		slog.Error("no se pudo actualizar webhook_event", "id", id, "error", err)
 	}
+}
+
+// GetUnresolvedWebhookEvents lista, para una pasarela dada, los eventos
+// registrados con LogWebhookEvent que NUNCA se terminaron de procesar con
+// éxito: o bien el proceso se cayó a mitad de camino (processed_at sigue
+// NULL — el defer que marca el resultado nunca llegó a correr), o bien el
+// primer intento falló con un error (outcome empieza con "error:" —
+// p. ej. la consulta a la pasarela falló por una caída de red transitoria).
+// minAge evita competir con el propio procesamiento asíncrono que dispara
+// el webhook en vivo (todavía podría estar corriendo); maxAge acota el
+// trabajo a una ventana razonable — pasado ese punto, la reconciliación
+// general de pagos (ver reconcileDeadLetterAfter en webhooks.go) es la que
+// termina dando por perdido el pago si de verdad nunca se pudo resolver.
+func GetUnresolvedWebhookEvents(db *sql.DB, gateway string, minAge, maxAge time.Duration) ([]types.WebhookEvent, error) {
+	// ORDER BY processed_at (no por received_at, que nunca cambia) para que
+	// el reintento avance de forma ROTATIVA: los eventos nunca intentados
+	// (processed_at IS NULL) van primero; entre los que ya fallaron al
+	// menos una vez, se prioriza el que lleva MÁS tiempo sin reintentarse
+	// (processed_at se actualiza en cada intento, exitoso o no, vía
+	// MarkWebhookEventProcessed). Antes, ordenar por received_at ASC hacía
+	// que, si había más de 50 eventos sin resolver, cada pasada volviera a
+	// traer exactamente los mismos 50 más antiguos — cualquiera más allá
+	// del puesto 50 nunca llegaba a reintentarse mientras esos 50 no se
+	// resolvieran.
+	rows, err := db.Query(`
+		SELECT id, raw_body
+		FROM webhook_events
+		WHERE gateway=$1
+		  AND (processed_at IS NULL OR outcome LIKE 'error:%')
+		  AND received_at < NOW() - $2::interval
+		  AND received_at > NOW() - $3::interval
+		ORDER BY processed_at ASC NULLS FIRST LIMIT 50`,
+		gateway, fmt.Sprintf("%d seconds", int(minAge.Seconds())), fmt.Sprintf("%d seconds", int(maxAge.Seconds())))
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var events []types.WebhookEvent
+	for rows.Next() {
+		var e types.WebhookEvent
+		var rawBody sql.NullString
+		if err := rows.Scan(&e.ID, &rawBody); err != nil { return nil, err }
+		e.RawBody = rawBody.String
+		events = append(events, e)
+	}
+	return events, nil
 }
 
 // CreateOAuthLoginCode genera un código de un solo uso (32 bytes al azar,
@@ -1984,12 +2121,30 @@ func ConsumeOAuthLoginCode(db *sql.DB, code string) (payload string, ok bool) {
 	return payload, err == nil
 }
 
+// GetStalePendingPayments incluye tanto 'pending' como 'review' — un pago
+// en 'review' (ver reconcileDeadLetterAfter) sigue siendo candidato a
+// reconciliación: si de verdad llega una confirmación tardía de la
+// pasarela, se debe poder acreditar igual, sin que quedarse ahí para
+// siempre por haber cambiado de status deje de revisarse.
+// GetStalePendingPayments ordena por updated_at (no por created_at) para
+// que el barrido avance de forma ROTATIVA por todos los pagos elegibles en
+// vez de quedarse siempre en los mismos. Antes, con ORDER BY created_at
+// ASC, si había más de 100 pagos sin resolver, cada pasada (cada 2 min)
+// volvía a traer exactamente los mismos 100 más antiguos — cualquier pago
+// más allá del puesto 100 nunca llegaba a consultarse mientras esos 100
+// primeros no se resolvieran. TouchPaymentReconciled actualiza updated_at
+// cada vez que se revisa un pago y sigue sin resolverse (ver
+// reconcileOnePayment), así que ordenar por updated_at empuja los que
+// acaban de revisarse hacia el final de la cola — la próxima pasada
+// atiende al siguiente lote, no al mismo de siempre. Un pago que SÍ se
+// resuelve (aprobado/rechazado) sale de este listado por su cambio de
+// status, sin necesitar ningún touch aparte.
 func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
 	rows, err := db.Query(`
 		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), COALESCE(provider_payment_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions
-		WHERE status='pending' AND COALESCE(external_id,'') != '' AND created_at < NOW() - INTERVAL '2 minutes'
-		ORDER BY created_at ASC LIMIT 100`)
+		WHERE status IN ('pending','review') AND COALESCE(external_id,'') != '' AND created_at < NOW() - INTERVAL '2 minutes'
+		ORDER BY updated_at ASC LIMIT 100`)
 	if err != nil { return nil, err }
 	defer rows.Close()
 	var txs []types.PaymentTransaction
@@ -2001,6 +2156,16 @@ func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
 		txs = append(txs, t)
 	}
 	return txs, nil
+}
+
+// TouchPaymentReconciled actualiza solo updated_at — se llama cada vez que
+// reconcileOnePayment revisa un pago y sigue sin poder resolverlo (ni
+// aprobado ni rechazado), para que GetStalePendingPayments (que ordena por
+// updated_at) lo empuje al final de la cola y la próxima pasada atienda a
+// otros pagos en vez de repetir siempre los mismos.
+func TouchPaymentReconciled(db *sql.DB, id uuid.UUID) error {
+	_, err := db.Exec(`UPDATE payment_transactions SET updated_at=NOW() WHERE id=$1`, id)
+	return err
 }
 
 // SetProviderPaymentID guarda el identificador REAL del pago en la pasarela
@@ -2039,36 +2204,91 @@ func GetAllPaymentTransactions(db *sql.DB, page, limit int, status string) ([]ty
 	limitPos := fmt.Sprintf("$%d", len(args)-1)
 	offsetPos := fmt.Sprintf("$%d", len(args))
 	rows, err := db.Query(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions `+where+` ORDER BY created_at DESC LIMIT `+limitPos+` OFFSET `+offsetPos, args...)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
 	var txs []types.PaymentTransaction
 	for rows.Next() {
 		var t types.PaymentTransaction
-		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		var currencyCode sql.NullString
+		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
+		t.CurrencyCode = currencyCode.String
 		txs = append(txs, t)
 	}
 	return txs, total, nil
 }
 
-func GetPaymentsByCustomer(db *sql.DB, customerID uuid.UUID) ([]types.PaymentTransaction, error) {
-	rows, err := db.Query(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
-		FROM payment_transactions WHERE customer_id=$1 ORDER BY created_at DESC LIMIT 50`, customerID)
-	if err != nil { return nil, err }
-	defer rows.Close()
-	var txs []types.PaymentTransaction
-	for rows.Next() {
-		var t types.PaymentTransaction
-		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
-			return nil, err
-		}
-		txs = append(txs, t)
+// GetRechargeHistoryByCustomer devuelve, ya combinado, deduplicado y paginado
+// EN LA BASE DE DATOS, el historial de recargas de un cliente: la unión de
+// sus recargas manuales genuinas (kc_recharges sin payment_transaction_id) y
+// sus pagos por pasarela de tipo kc_recharge (payment_transactions) — las
+// mismas dos fuentes que antes traía Dashboard.tsx completas (una con tope
+// fijo de 2000, la otra sin límite) para combinar y paginar en el navegador.
+// Esto se rompía con más de 2000 intentos de pago (los más viejos
+// desaparecían del historial Y de sus propios comprobantes, ya que el
+// frontend asume que todo pago con payment_type=kc_recharge SÍ va a estar en
+// la lista para no duplicar la recarga vinculada) y además cargaba dos
+// listas enteras en cada visita al panel sin importar cuánto historial
+// tuviera el cliente.
+//
+// El filtro "payment_transaction_id IS NULL" en la mitad de kc_recharges es
+// el mismo criterio de deduplicación que ya usaba el frontend (ver
+// manualRecharges en Dashboard.tsx): una recarga vinculada a un pago es la
+// MISMA operación, con más detalle, del lado de payment_transactions — nunca
+// debe contarse ni mostrarse dos veces.
+func GetRechargeHistoryByCustomer(db *sql.DB, customerID uuid.UUID, page, limit int) ([]types.RechargeHistoryItem, int, error) {
+	if page < 1 { page = 1 }
+	if limit < 1 { limit = 20 }
+	if limit > 100 { limit = 100 }
+	offset := (page - 1) * limit
+
+	var total int
+	if err := db.QueryRow(`
+		SELECT (SELECT COUNT(*) FROM kc_recharges WHERE customer_id=$1 AND payment_transaction_id IS NULL) +
+		       (SELECT COUNT(*) FROM payment_transactions WHERE customer_id=$1 AND payment_type='kc_recharge')`,
+		customerID).Scan(&total); err != nil {
+		return nil, 0, err
 	}
-	return txs, nil
+
+	rows, err := db.Query(`
+		SELECT * FROM (
+			SELECT 'kc' AS kind, id, amount_kc, amount_soles, method,
+			       ''::text AS gateway, ''::text AS payment_type, ''::text AS product_name,
+			       0::numeric AS amount_pen, 0::numeric AS amount_usd, ''::text AS currency_code, 0::numeric AS amount_local,
+			       ''::text AS status, created_at
+			FROM kc_recharges WHERE customer_id=$1 AND payment_transaction_id IS NULL
+			UNION ALL
+			SELECT 'pay' AS kind, id, kc_amount, NULL::numeric AS amount_soles, ''::text AS method,
+			       gateway, payment_type, product_name,
+			       amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0),
+			       status, created_at
+			FROM payment_transactions WHERE customer_id=$1 AND payment_type='kc_recharge'
+		) combined
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`, customerID, limit, offset)
+	if err != nil { return nil, 0, err }
+	defer rows.Close()
+
+	var items []types.RechargeHistoryItem
+	for rows.Next() {
+		var it types.RechargeHistoryItem
+		var amountSoles sql.NullFloat64
+		if err := rows.Scan(&it.Kind, &it.ID, &it.AmountKC, &amountSoles, &it.Method,
+			&it.Gateway, &it.PaymentType, &it.ProductName,
+			&it.AmountPEN, &it.AmountUSD, &it.CurrencyCode, &it.AmountLocal,
+			&it.Status, &it.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		if amountSoles.Valid {
+			v := amountSoles.Float64
+			it.AmountSoles = &v
+		}
+		items = append(items, it)
+	}
+	return items, total, rows.Err()
 }
 
 // ==================== REFRESH TOKENS ====================
@@ -2127,7 +2347,7 @@ func AddAuditLog(db *sql.DB, customerID *uuid.UUID, action, details, ip string) 
 
 func GetRechargesByCustomer(db *sql.DB, customerID uuid.UUID) ([]types.KCRecharge, error) {
 	rows, err := db.Query(`
-		SELECT id, customer_id, amount_kc, amount_soles, method, note, approved_by, created_at
+		SELECT id, customer_id, amount_kc, amount_soles, method, note, approved_by, payment_transaction_id, created_at
 		FROM kc_recharges WHERE customer_id=$1 ORDER BY created_at DESC`, customerID)
 	if err != nil { return nil, err }
 	defer rows.Close()
@@ -2135,7 +2355,7 @@ func GetRechargesByCustomer(db *sql.DB, customerID uuid.UUID) ([]types.KCRecharg
 	for rows.Next() {
 		var r types.KCRecharge
 		if err := rows.Scan(&r.ID, &r.CustomerID, &r.AmountKC, &r.AmountSoles,
-			&r.Method, &r.Note, &r.ApprovedBy, &r.CreatedAt); err != nil {
+			&r.Method, &r.Note, &r.ApprovedBy, &r.PaymentTransactionID, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		recharges = append(recharges, r)
@@ -2146,9 +2366,9 @@ func GetRechargesByCustomer(db *sql.DB, customerID uuid.UUID) ([]types.KCRecharg
 func GetKCRechargeByID(db *sql.DB, id uuid.UUID) (types.KCRecharge, error) {
 	var r types.KCRecharge
 	err := db.QueryRow(`
-		SELECT id, customer_id, amount_kc, amount_soles, method, note, approved_by, created_at
+		SELECT id, customer_id, amount_kc, amount_soles, method, note, approved_by, payment_transaction_id, created_at
 		FROM kc_recharges WHERE id=$1`, id).
-		Scan(&r.ID, &r.CustomerID, &r.AmountKC, &r.AmountSoles, &r.Method, &r.Note, &r.ApprovedBy, &r.CreatedAt)
+		Scan(&r.ID, &r.CustomerID, &r.AmountKC, &r.AmountSoles, &r.Method, &r.Note, &r.ApprovedBy, &r.PaymentTransactionID, &r.CreatedAt)
 	return r, err
 }
 
@@ -2183,9 +2403,41 @@ func ExpirePendingPayments(db *sql.DB) (int64, error) {
 	return result.RowsAffected()
 }
 
+// AdminUpdatePaymentStatus cambia el status de un pago — pero cuando el
+// destino es un status "negativo" (failed/expired/review), la escritura
+// queda condicionada a que el pago SIGA sin acreditarse (kc_credited_at
+// IS NULL). Sin esto: una reconciliación (o un admin) que arrancó cuando el
+// pago todavía estaba 'pending' puede terminar DESPUÉS de que un webhook
+// concurrente ya lo acreditó vía CreditPaymentOnce, y pisarle el status a
+// "failed"/"expired" — el cliente ya tendría su KC, pero su historial
+// diría "pago fallido", y encima ReconcilePendingPayments dejaría de volver
+// a mirarlo (ya no está 'pending'). kc_credited_at es la misma señal de
+// verdad que ya usa CreditPaymentOnce para la acreditación en sí (nunca el
+// status visible, que puede cambiar de ida y vuelta) — reusarla acá evita
+// inventar un mecanismo de bloqueo aparte.
+//
+// Ir HACIA "approved"/"fulfilled" no pasa por acá (ver
+// ProcessApprovedPayment/CreditPaymentOnce, que ya son idempotentes por su
+// cuenta vía row lock), así que este chequeo solo hace falta para las
+// transiciones que restan certeza sobre un pago.
 func AdminUpdatePaymentStatus(db *sql.DB, id uuid.UUID, status string) error {
-	_, err := db.Exec(`UPDATE payment_transactions SET status=$1, updated_at=NOW() WHERE id=$2`, status, id)
-	return err
+	negative := status == "failed" || status == "expired" || status == "review"
+	if !negative {
+		_, err := db.Exec(`UPDATE payment_transactions SET status=$1, updated_at=NOW() WHERE id=$2`, status, id)
+		return err
+	}
+	result, err := db.Exec(`
+		UPDATE payment_transactions SET status=$1, updated_at=NOW()
+		WHERE id=$2 AND kc_credited_at IS NULL`, status, id)
+	if err != nil { return err }
+	if n, _ := result.RowsAffected(); n == 0 {
+		// O el pago no existe, o ya se había acreditado antes de que esta
+		// escritura llegara — en ese segundo caso, no tocar nada es lo
+		// correcto: se queda con el status real (approved/fulfilled) en vez
+		// de pisarlo con uno que contradice que el KC ya se entregó.
+		slog.Warn("AdminUpdatePaymentStatus: no se sobrescribió el status (ya acreditado, o el pago no existe)", "id", id, "status", status)
+	}
+	return nil
 }
 
 func DeletePayment(db *sql.DB, id uuid.UUID) error {

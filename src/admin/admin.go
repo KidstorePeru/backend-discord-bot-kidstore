@@ -383,8 +383,23 @@ func HandlerGetAllPayments(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo pagos"})
 			return
 		}
-		if payments == nil { payments = []types.PaymentTransaction{} }
-		c.JSON(http.StatusOK, gin.H{"success": true, "payments": payments, "total": total, "page": page, "limit": limit})
+		// El monto real cobrado (charged_amount/charged_currency) — antes el
+		// panel siempre mostraba "S/ {amount_pen}" sin importar la pasarela,
+		// aunque PayPal/NOWPayments cobran en USD y dLocal Go en la divisa
+		// real del cliente (ver ChargedAmountAndCurrency en store/payments.go).
+		out := make([]gin.H, 0, len(payments))
+		for _, p := range payments {
+			chargedAmount, chargedCurrency := store.ChargedAmountAndCurrency(p.Gateway, p.AmountPEN, p.AmountUSD, p.AmountLocal, p.CurrencyCode)
+			out = append(out, gin.H{
+				"id": p.ID, "customer_id": p.CustomerID, "gateway": p.Gateway, "payment_type": p.PaymentType,
+				"product_id": p.ProductID, "product_name": p.ProductName, "amount_pen": p.AmountPEN,
+				"charged_amount": chargedAmount, "charged_currency": chargedCurrency,
+				"kc_amount": p.KCAmount, "external_id": p.ExternalID, "status": p.Status,
+				"activation_code": p.ActivationCode, "autobuyer_task_id": p.AutobuyerTaskID,
+				"created_at": p.CreatedAt, "updated_at": p.UpdatedAt,
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "payments": out, "total": total, "page": page, "limit": limit})
 	}
 }
 

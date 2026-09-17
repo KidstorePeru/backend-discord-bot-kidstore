@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -589,6 +590,13 @@ func HandlerMe(database *sql.DB) gin.HandlerFunc {
 
 // ==================== RECHARGE HISTORY ====================
 
+// HandlerGetMyRecharges pagina el historial combinado de recargas del
+// cliente (manuales + pagos por pasarela, ya deduplicado y ordenado en la
+// base de datos — ver db.GetRechargeHistoryByCustomer). Antes traía dos
+// listas completas en cada llamada (pagos con tope fijo de 2000, recargas
+// manuales sin ningún límite) y el frontend las combinaba, deduplicaba y
+// paginaba en el navegador — con más de 2000 intentos de pago los más
+// antiguos directamente desaparecían del historial y de sus comprobantes.
 func HandlerGetMyRecharges(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		customerIDStr, ok := middleware.GetCustomerID(c)
@@ -598,24 +606,45 @@ func HandlerGetMyRecharges(database *sql.DB) gin.HandlerFunc {
 		}
 		customerID, _ := uuid.Parse(customerIDStr)
 
-		recharges, err := db.GetRechargesByCustomer(database, customerID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo recargas"})
-			return
-		}
-		if recharges == nil { recharges = []types.KCRecharge{} }
+		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
 
-		payments, err := db.GetPaymentsByCustomer(database, customerID)
+		items, total, err := db.GetRechargeHistoryByCustomer(database, customerID, page, limit)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo pagos"})
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo historial de recargas"})
 			return
 		}
-		if payments == nil { payments = []types.PaymentTransaction{} }
+
+		// Cada pago lleva también el monto y la divisa REALES cobrados (ver
+		// ChargedAmountAndCurrency en payments.go) — el dashboard del
+		// cliente mostraba siempre "S/" sin importar la pasarela, aunque
+		// PayPal/NOWPayments cobran en USD y dLocal Go en la divisa real del
+		// cliente. Las recargas manuales (kind=="kc") no tienen pasarela ni
+		// divisa distinta: viajan con amount_soles tal cual.
+		itemsOut := make([]gin.H, 0, len(items))
+		for _, it := range items {
+			if it.Kind == "pay" {
+				chargedAmount, chargedCurrency := ChargedAmountAndCurrency(it.Gateway, it.AmountPEN, it.AmountUSD, it.AmountLocal, it.CurrencyCode)
+				itemsOut = append(itemsOut, gin.H{
+					"kind": "pay", "id": it.ID, "gateway": it.Gateway, "payment_type": it.PaymentType,
+					"product_name": it.ProductName, "amount_pen": it.AmountPEN,
+					"charged_amount": chargedAmount, "charged_currency": chargedCurrency,
+					"kc_amount": it.AmountKC, "status": it.Status, "created_at": it.CreatedAt,
+				})
+			} else {
+				itemsOut = append(itemsOut, gin.H{
+					"kind": "kc", "id": it.ID, "amount_kc": it.AmountKC, "amount_soles": it.AmountSoles,
+					"method": it.Method, "created_at": it.CreatedAt,
+				})
+			}
+		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"success":   true,
-			"recharges": recharges,
-			"payments":  payments,
+			"success": true,
+			"items":   itemsOut,
+			"total":   total,
+			"page":    page,
+			"limit":   limit,
 		})
 	}
 }

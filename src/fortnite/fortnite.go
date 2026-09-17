@@ -34,11 +34,30 @@ import (
 // enviar el mismo ítem dos veces — ver ClaimPendingOrders.
 var ErrAlreadyOwned = errors.New("el cliente ya tiene este item")
 
+// ErrRequestUncertain se devuelve cuando el request HTTP a Epic Games falló
+// a nivel de transporte (timeout, conexión cortada, EOF, etc.) DESPUÉS de
+// que el request ya se mandó — a diferencia de un fallo refrescando el
+// token (que pasa ANTES de mandar el request real, así que ahí sí sabemos
+// con certeza que Epic nunca recibió nada), acá no hay forma de saber si
+// Epic llegó a procesar el pedido antes de que se perdiera la respuesta.
+// SendGift envuelve con esto cualquier fallo de transporte del request que
+// de verdad intenta entregar el ítem — los llamadores (processOrder en
+// shop.go) deben tratar esto como un resultado INCIERTO, nunca como "no se
+// entregó nada": ni se marca como enviado sin evidencia, ni se reembolsa
+// asumiendo que no hubo entrega.
+var ErrRequestUncertain = errors.New("epic: fallo de transporte, resultado del request incierto")
+
 // ==================== CONSTANTS ====================
 
 var epicClient string
 var epicSecret string
 var encryptionKey string
+
+// mcpGiftCatalogBaseURL apunta al servicio real de Epic — variable (en vez
+// de un literal embebido en la URL) para que las pruebas puedan
+// redirigirlo a un httptest.Server que simule respuestas ambiguas (504,
+// conexión cortada a mitad de la respuesta) sin llamar a Epic de verdad.
+var mcpGiftCatalogBaseURL = "https://fngw-mcp-gc-livefn.ol.epicgames.com"
 
 func Init(client, secret, encKey string) {
 	epicClient = client
@@ -513,12 +532,24 @@ func executeWithRefresh(database *sql.DB, account types.GameAccount, req *http.R
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, account, err
+		// El request ya se mandó — un fallo acá (timeout, conexión cortada)
+		// no dice si Epic lo llegó a procesar antes de perder la respuesta.
+		// Ver ErrRequestUncertain.
+		return nil, account, fmt.Errorf("%w: %v", ErrRequestUncertain, err)
 	}
 
-	// Body buffering para poder re-leerlo
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	// Body buffering para poder re-leerlo — el error de esta lectura se
+	// propaga (antes se descartaba con "_"): si la conexión se corta a
+	// mitad del cuerpo, esto pasa ACÁ, no en la lectura que hace SendGift
+	// después (que a esta altura solo leería el buffer en memoria ya
+	// armado, nunca fallaría, y el corte real quedaría invisible). Un
+	// cuerpo incompleto es exactamente un resultado incierto: no hay forma
+	// de confirmar ni una entrega ni un rechazo con una respuesta a medias.
+	bodyBytes, readErr := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if readErr != nil {
+		return nil, account, fmt.Errorf("%w: error leyendo la respuesta (status %d): %v", ErrRequestUncertain, resp.StatusCode, readErr)
+	}
 	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	// Si 401/403 → intentar refresh y reintentar
@@ -530,10 +561,15 @@ func executeWithRefresh(database *sql.DB, account types.GameAccount, req *http.R
 		req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 		resp2, err := client.Do(req)
 		if err != nil {
-			return nil, account, err
+			// Mismo caso que arriba: el reintento ya se mandó, así que un
+			// fallo de transporte acá también es un resultado incierto.
+			return nil, account, fmt.Errorf("%w: %v", ErrRequestUncertain, err)
 		}
-		body2, _ := io.ReadAll(resp2.Body)
+		body2, readErr2 := io.ReadAll(resp2.Body)
 		resp2.Body.Close()
+		if readErr2 != nil {
+			return nil, account, fmt.Errorf("%w: error leyendo la respuesta del reintento (status %d): %v", ErrRequestUncertain, resp2.StatusCode, readErr2)
+		}
 		resp2.Body = io.NopCloser(bytes.NewBuffer(body2))
 		return resp2, account, nil
 	}
@@ -711,7 +747,7 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 	}
 
 	req, _ := http.NewRequest("POST",
-		fmt.Sprintf("https://fngw-mcp-gc-livefn.ol.epicgames.com/fortnite/api/game/v2/profile/%s/client/GiftCatalogEntry?profileId=common_core", botIDClean),
+		fmt.Sprintf("%s/fortnite/api/game/v2/profile/%s/client/GiftCatalogEntry?profileId=common_core", mcpGiftCatalogBaseURL, botIDClean),
 		bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
 
@@ -722,7 +758,15 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 	defer resp.Body.Close()
 	_ = updatedAccount
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		// El request llegó a mandarse y recibió encabezados (status
+		// resp.StatusCode), pero la conexión se cortó antes de terminar de
+		// leer el cuerpo — sin el cuerpo completo no hay forma de confirmar
+		// ni una entrega (evidencia incompleta) ni un rechazo (no se puede
+		// leer el errorCode). Mismo tratamiento que un fallo de transporte.
+		return "", fmt.Errorf("%w: error leyendo la respuesta de Epic (status %d): %v", ErrRequestUncertain, resp.StatusCode, readErr)
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 204 {
 		var errResp map[string]interface{}
@@ -750,6 +794,21 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 			default:
 				return "", fmt.Errorf("error de Epic Games: %s", errCode)
 			}
+		}
+
+		// Sin un errorCode reconocible de Epic en el cuerpo: si el status es
+		// 5xx, lo más probable es que la respuesta venga de un intermediario
+		// (balanceador, proxy, CDN) devolviendo SU PROPIO error — no una
+		// decisión real de la aplicación de Epic sobre el regalo. 502 (Bad
+		// Gateway), 503 (Service Unavailable) y 504 (Gateway Timeout) son
+		// exactamente eso por definición: ninguno es una respuesta de Epic,
+		// son quejas de la infraestructura intermedia sobre no poder
+		// completar la conexión hacia el servicio real. No hay forma de
+		// confirmar si Epic llegó a procesar el pedido antes de que el
+		// intermediario cortara la respuesta — resultado incierto, igual que
+		// un fallo de transporte, nunca un rechazo confirmado.
+		if resp.StatusCode >= 500 {
+			return "", fmt.Errorf("%w: status %d sin errorCode reconocible de Epic (probable intermediario, no una respuesta de la aplicación)", ErrRequestUncertain, resp.StatusCode)
 		}
 		return "", fmt.Errorf("error enviando gift, status: %d", resp.StatusCode)
 	}

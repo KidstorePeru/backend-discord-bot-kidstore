@@ -617,8 +617,61 @@ func processOrders(database *sql.DB) {
 // cuando de verdad se ejecuta — si falla, el pedido se queda en 'failed'
 // (RefundOrder no vuelve a rechazarlo por eso, así que es seguro
 // reintentarlo más tarde — ver RetryFailedRefunds).
+//
+// customerReason NUNCA debe afirmar por su cuenta si el reembolso se
+// completó ("se reembolsó tu KC") — eso lo decide esta función según el
+// resultado real de RefundOrder, y ya queda reflejado aparte en el correo
+// (SendOrderFailedEmail cambia intro/asunto según refunded). Si el texto
+// del motivo también lo afirmara a ciegas, el correo podría contradecirse a
+// sí mismo (intro: "reembolso en proceso" / motivo: "ya se reembolsó").
+//
+// Antes de reembolsar, comprueba si queda un intento de envío sin resolver
+// (send_attempted, ver MarkOrderSendAttempted) — puede venir de ESTE mismo
+// ciclo o de uno anterior que se cayó a mitad de camino o perdió la
+// respuesta de Epic (fortnite.ErrRequestUncertain). Si lo hay, NO es seguro
+// concluir "no se entregó": ese intento sin resolver podría haber
+// completado la entrega en Epic sin que quede registro acá, y reembolsar
+// en ese caso arriesgaría duplicar el pago. Esta comprobación y el paso a
+// 'review' se hacen en UNA sola transacción atómica (ResolveOrderReview) —
+// nunca en dos escrituras separadas, para que un fallo o una caída del
+// proceso entre "decidir" y "guardar" no pueda dejar la marca limpia sin
+// que 'review' quedara persistido. Este chequeo protege TODOS los puntos
+// del worker que llaman a esta función, no solo el que compara contra
+// ErrAlreadyOwned.
+//
+// Además, la transición a 'failed' es idempotente: MarkOrderFailedIfNotTerminal
+// solo se aplica si el pedido no está YA en un estado definitivo
+// (refunded/sent/review) — así, si failOrderAndRefund se llama más de una
+// vez para el mismo pedido (reintento, condición de carrera, un reinicio a
+// mitad de un reembolso previo), una llamada posterior nunca puede pisar
+// 'refunded' de vuelta a 'failed' y disparar un segundo reembolso real.
 func failOrderAndRefund(database *sql.DB, order types.Order, internalReason, customerReason string) {
-	db.UpdateOrderStatus(database, order.ID, "failed", nil, &internalReason)
+	reviewNote := fmt.Sprintf("%s — pero había un intento de envío sin resolver; no se puede confirmar si se entregó, así que no se reembolsó automáticamente", internalReason)
+	wasAttempting, resolveErr := db.ResolveOrderReview(database, order.ID, reviewNote)
+	if resolveErr != nil {
+		slog.Error("failOrderAndRefund: no se pudo resolver el intento de envío, se reintenta en el próximo ciclo", "orderID", order.ID, "error", resolveErr)
+		return
+	}
+	if wasAttempting {
+		discordbot.AlertOrderNeedsReview(order.ID.String(), order.EpicUsername, order.ItemName)
+		db.AddAuditLog(database, &order.CustomerID, "ORDER_NEEDS_REVIEW", reviewNote, "worker")
+		slog.Warn("failOrderAndRefund: pedido en revisión manual en vez de reembolso automático — entrega incierta", "orderID", order.ID)
+		return
+	}
+
+	applied, applyErr := db.MarkOrderFailedIfNotTerminal(database, order.ID, internalReason)
+	if applyErr != nil {
+		slog.Error("failOrderAndRefund: error marcando el pedido como fallido, se reintenta en el próximo ciclo", "orderID", order.ID, "error", applyErr)
+		return
+	}
+	if !applied {
+		// El pedido ya estaba en un estado definitivo (refunded/sent/review)
+		// — nada que hacer. Esto es justo lo que evita un segundo reembolso
+		// si failOrderAndRefund se llama de nuevo para el mismo pedido.
+		slog.Info("failOrderAndRefund: el pedido ya estaba en un estado definitivo, no se repite la acción", "orderID", order.ID)
+		return
+	}
+
 	refundErr := db.RefundOrder(database, order.ID)
 	refunded := refundErr == nil
 
@@ -778,40 +831,78 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		evidence, err = fortnite.SendGift(database, *bot, receiverAccountID,
 			order.ItemOfferID, order.PriceVBucks, order.ItemName, message)
 
-		// Cualquier resultado a partir de acá es un desenlace CONOCIDO para
-		// este intento (éxito, ya-lo-tenía, o un error identificado) — se
-		// limpia la marca para que no quede prendida de más y confunda al
-		// siguiente bot que se pruebe en este mismo ciclo.
-		db.MarkOrderSendAttempted(database, order.ID, false)
+		// IMPORTANTE: la marca "intento en curso" (send_attempted) NO se
+		// limpia acá de forma incondicional — antes se limpiaba apenas
+		// volvía SendGift, sin importar el resultado, lo que abría esta
+		// secuencia: Epic entrega el ítem → se pierde la respuesta (fallo de
+		// red) → se limpia la marca de todos modos → el siguiente intento
+		// recibe ErrAlreadyOwned → como la marca ya estaba limpia, se
+		// interpretaba como "lo tenía de antes" y se reembolsaba el KC pese
+		// a que el regalo sí se había entregado. Ahora cada rama decide por
+		// separado si es seguro limpiarla — solo cuando el resultado de ESTE
+		// intento resuelve con certeza cualquier ambigüedad pendiente.
+
+		if errors.Is(err, fortnite.ErrRequestUncertain) {
+			// El request a Epic falló a nivel de transporte DESPUÉS de
+			// mandarse (timeout, conexión cortada) — a diferencia de un
+			// rechazo real de Epic, acá no hay ninguna respuesta que
+			// confirme ni entrega ni rechazo. Un fallo de conexión no
+			// demuestra que no hubo entrega: la marca se deja prendida tal
+			// cual (ya quedó en true al principio de este intento), así que
+			// si un intento posterior recibe ErrAlreadyOwned, se tratará
+			// correctamente como entrega incierta y no como reembolso.
+			slog.Warn("Worker: resultado incierto (fallo de transporte), reintentando en el próximo ciclo", "orderID", order.ID, "bot", bot.DisplayName, "error", err)
+			db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
+			return
+		}
 
 		if errors.Is(err, fortnite.ErrAlreadyOwned) {
-			if alreadyOwnedResolution(wasAlreadyAttempting) == "needs_review" {
+			needsReview := alreadyOwnedResolution(wasAlreadyAttempting) == "needs_review"
+			reviewNote := fmt.Sprintf("Epic reportó que el receptor ya tiene el ítem, pero un intento de envío anterior de este mismo pedido se había interrumpido o perdido su respuesta — no se puede confirmar si fue ese intento el que lo entregó. bot=%s receiver=%s", bot.DisplayName, receiverAccountID)
+			// SetOrderReviewOrClear aplica la decisión (needsReview, ya
+			// tomada a partir de wasAlreadyAttempting) en UNA sola escritura
+			// atómica — nunca en dos pasos separados (leer/limpiar la marca y
+			// luego guardar 'review' aparte), para que un fallo o una caída
+			// del proceso entre esos dos pasos no pueda perder la marca de
+			// incertidumbre sin que 'review' quedara guardado.
+			if setErr := db.SetOrderReviewOrClear(database, order.ID, needsReview, reviewNote); setErr != nil {
+				slog.Error("Worker: no se pudo resolver la marca de intento de envío, se reintenta en el próximo ciclo", "orderID", order.ID, "error", setErr)
+				return
+			}
+			if needsReview {
 				// Había un intento de envío de ESTE pedido interrumpido antes de
 				// esta llamada (el proceso se cayó a mitad de camino la vez
-				// anterior) — es razonable pensar que ese intento sí llegó a
-				// entregar el ítem, pero no hay ninguna evidencia real de Epic
-				// confirmando ESE envío puntual, así que no se inventa una. Se
-				// deja en revisión manual: ni se marca entregado sin pruebas, ni
-				// se reembolsa a ciegas (podría estar duplicando un reembolso si
+				// anterior, o el intento anterior fue un ErrRequestUncertain) —
+				// es razonable pensar que ese intento sí llegó a entregar el
+				// ítem, pero no hay ninguna evidencia real de Epic confirmando
+				// ESE envío puntual, así que no se inventa una. Se deja en
+				// revisión manual: ni se marca entregado sin pruebas, ni se
+				// reembolsa a ciegas (podría estar duplicando un reembolso si
 				// en realidad sí se entregó). No se vuelve a descontar
 				// V-Bucks/slot del bot: si el intento original ya los descontó,
 				// hacerlo de nuevo los dejaría mal contados.
-				reviewNote := fmt.Sprintf("Epic reportó que el receptor ya tiene el ítem, pero un intento de envío anterior de este mismo pedido se había interrumpido — no se puede confirmar si fue ese intento el que lo entregó. bot=%s receiver=%s", bot.DisplayName, receiverAccountID)
-				if markErr := db.MarkOrderNeedsReview(database, order.ID, reviewNote); markErr != nil {
-					slog.Error("Worker: error dejando pedido en revisión", "orderID", order.ID, "error", markErr)
-				}
 				discordbot.AlertOrderNeedsReview(order.ID.String(), order.EpicUsername, order.ItemName)
 				db.AddAuditLog(database, &order.CustomerID, "ORDER_NEEDS_REVIEW", reviewNote, "worker")
 				slog.Warn("Worker: pedido en revisión manual — entrega incierta tras una caída", "orderID", order.ID, "bot", bot.DisplayName)
 				return
 			}
-			// Primer y único intento de envío de este pedido: si Epic dice que
-			// el receptor ya tiene el ítem, es porque lo obtuvo por su cuenta
-			// (lo compró él mismo, o se lo regaló otra persona) ANTES de este
-			// pedido — nuestro pedido nunca lo entregó. No corresponde marcarlo
-			// "sent" solo porque el cliente posee el artículo.
+			// No había ningún intento previo sin resolver: esta es la única
+			// llamada a Epic hecha hasta ahora para este pedido, y Epic
+			// responde que el receptor ya tiene el ítem — sin ambigüedad
+			// posible, lo obtuvo por su cuenta (lo compró él mismo, o se lo
+			// regaló otra persona) ANTES de este pedido, nuestro pedido nunca
+			// lo entregó. La marca ya quedó limpia (SetOrderReviewOrClear,
+			// arriba) antes de reembolsar. No corresponde marcarlo "sent" solo
+			// porque el cliente posee el artículo.
 			refundMsg := fmt.Sprintf("el receptor '%s' ya posee este ítem (adquirido por su cuenta, no por este pedido) — Epic no permite regalarlo de nuevo", order.EpicUsername)
-			failOrderAndRefund(database, order, refundMsg, "El destinatario ya tiene este ítem en su cuenta de Fortnite (obtenido por su cuenta), por lo que Epic Games no permite regalarlo de nuevo. Se reembolsó tu KC.")
+			// El motivo NO afirma que el reembolso ya se completó — failOrderAndRefund
+			// decide eso según si RefundOrder realmente tuvo éxito, y el correo
+			// (SendOrderFailedEmail) ya refleja el resultado real por su cuenta
+			// (intro/hero distintos si refunded es true o false). Si acá también
+			// se afirmara "se reembolsó tu KC" a ciegas, el correo podría decir
+			// "reembolso en proceso" en la intro y "ya se reembolsó" en el motivo
+			// al mismo tiempo.
+			failOrderAndRefund(database, order, refundMsg, "El destinatario ya tiene este ítem en su cuenta de Fortnite (obtenido por su cuenta), por lo que Epic Games no permite regalarlo de nuevo.")
 			return
 		}
 
@@ -821,6 +912,10 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			// Guardamos la respuesta cruda de Epic como evidencia de entrega:
 			// si algún día hay una disputa de pago/contracargo, esta es la
 			// prueba de que el ítem sí se entregó a la cuenta correcta.
+			// MarkOrderDelivered limpia send_attempted en la MISMA escritura
+			// atómica que marca 'sent' — no queda ninguna ventana entre
+			// "limpiar la marca" y "persistir la entrega" donde una caída del
+			// proceso pudiera dejar el pedido en un estado contradictorio.
 			if markErr := db.MarkOrderDelivered(database, order.ID, accountID, evidence); markErr != nil {
 				slog.Warn("Worker: error guardando evidencia de entrega", "orderID", order.ID, "error", markErr)
 				db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
@@ -867,6 +962,20 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		}
 
 		// ── Error al enviar gift ──
+		// A partir de acá, cualquier error es una respuesta REAL de Epic (no
+		// un fallo de transporte — ErrRequestUncertain ya se descartó arriba,
+		// y ErrAlreadyOwned ya tuvo su propio manejo) — se sabe con certeza
+		// que ESTE intento en particular no entregó el ítem. Si no había
+		// ningún intento previo sin resolver, es seguro limpiar la marca
+		// ahora; si lo había, se deja prendida — el resultado de este bot
+		// distinto no resuelve la ambigüedad de un intento anterior (podría
+		// ser, por ejemplo, que este bot llegó a su límite diario mientras
+		// OTRO bot, en un intento anterior interrumpido, sí llegó a entregar
+		// el ítem).
+		if !wasAlreadyAttempting {
+			db.MarkOrderSendAttempted(database, order.ID, false)
+		}
+
 		errMsg := err.Error()
 		errLower := strings.ToLower(errMsg)
 		slog.Error("Worker: error enviando gift", "orderID", order.ID, "bot", bot.DisplayName, "msg", errMsg)
@@ -906,17 +1015,11 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			continue // probar siguiente bot
 		}
 
-		// Error de red transitorio → mantener pending, dejar de intentar
-		isNetworkError := strings.Contains(errLower, "timeout") ||
-			strings.Contains(errLower, "connection refused") ||
-			strings.Contains(errLower, "no such host") ||
-			strings.Contains(errLower, "eof") ||
-			strings.Contains(errLower, "temporarily unavailable")
-		if isNetworkError {
-			slog.Warn("Worker: error de red transitorio, reintentando en siguiente ciclo", "orderID", order.ID)
-			db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
-			return
-		}
+		// Nota: los fallos de transporte (timeout, conexión cortada, etc.) ya
+		// se manejan arriba mediante fortnite.ErrRequestUncertain — llegar
+		// hasta acá significa que Epic sí respondió (con una razón real,
+		// aunque no esté en ninguna de las categorías de arriba), así que es
+		// seguro tratarlo como un rechazo definitivo.
 
 		// Error permanente → fallar y reembolsar
 		// Al cliente no se le manda el error técnico crudo de Epic, solo un

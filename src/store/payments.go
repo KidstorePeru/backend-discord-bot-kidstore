@@ -42,6 +42,11 @@ type PaymentConfig struct {
 
 var paymentCfg PaymentConfig
 
+// nowPaymentsBaseURL apunta a la API real de NOWPayments — variable (en
+// vez de un literal embebido) para que las pruebas puedan redirigirlo a un
+// httptest.Server que simule respuestas sin llamar a NOWPayments de verdad.
+var nowPaymentsBaseURL = "https://api.nowpayments.io/v1"
+
 func SetPaymentConfig(cfg PaymentConfig) {
 	paymentCfg = cfg
 }
@@ -280,7 +285,7 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 
 // ==================== COMPROBANTE DE PAGO ====================
 
-// chargedAmountAndCurrency devuelve el monto y la divisa que la pasarela
+// ChargedAmountAndCurrency devuelve el monto y la divisa que la pasarela
 // REALMENTE cobró — antes el comprobante siempre mostraba "S/ {amount_pen}"
 // sin importar la pasarela, pero amount_pen es solo un precio de
 // REFERENCIA que se calcula al crear el pago; PayPal y NOWPayments cobran
@@ -288,7 +293,7 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 // amount_local, ya guardados desde HandlerCreatePayment). Mostrar "S/" para
 // un cobro que en realidad fue en USD o en otra divisa es directamente
 // incorrecto, no solo impreciso.
-func chargedAmountAndCurrency(gateway string, amountPEN, amountUSD, amountLocal float64, currencyCode string) (amount float64, currency string) {
+func ChargedAmountAndCurrency(gateway string, amountPEN, amountUSD, amountLocal float64, currencyCode string) (amount float64, currency string) {
 	switch gateway {
 	case "paypal", "nowpayments":
 		return amountUSD, "USD"
@@ -336,7 +341,7 @@ func HandlerPaymentVoucher(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
 			return
 		}
-		chargedAmount, chargedCurrency := chargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
+		chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"voucher": gin.H{
@@ -387,14 +392,83 @@ func HandlerRechargeVoucher(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
 			return
 		}
+
+		// r.PaymentTransactionID no es nil cuando esta fila de kc_recharges
+		// es la acreditación automática de un pago por pasarela (ver
+		// CreditPaymentOnce) — no una recarga manual. El enlace
+		// /dashboard/comprobantes/recarga/:id sigue funcionando igual (nunca
+		// se rompe un enlace viejo, sea de un correo o guardado en algún
+		// lado), pero acá se reconoce el caso y se usa el importe y la
+		// divisa REALES que cobró esa pasarela — mostrar siempre "S/" sería
+		// directamente incorrecto para PayPal/NOWPayments (cobran en USD) o
+		// dLocal Go (cobra en la divisa real del cliente).
+		if r.PaymentTransactionID != nil {
+			tx, txErr := db.GetPaymentTransaction(database, *r.PaymentTransactionID)
+			if txErr == nil && tx.CustomerID == customerID {
+				chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
+				c.JSON(http.StatusOK, gin.H{
+					"success": true,
+					"voucher": gin.H{
+						"type":             "recharge",
+						"reference":        strings.ToUpper(id.String()[:8]),
+						"customer_name":    customer.EpicUsername,
+						"product_name":     tx.ProductName,
+						"amount_pen":       tx.AmountPEN,
+						"charged_amount":   chargedAmount,
+						"charged_currency": chargedCurrency,
+						"kc_amount":        r.AmountKC,
+						"gateway":          tx.Gateway,
+						"status":           "approved",
+						"created_at":       r.CreatedAt,
+					},
+				})
+				return
+			}
+			// Si por lo que sea el pago vinculado ya no se puede leer (fila
+			// borrada, error transitorio de DB), NUNCA se debe caer al bloque
+			// de "recarga manual" de más abajo: ese usa r.AmountSoles, que acá
+			// es solo el equivalente en PEN de referencia que CreditPaymentOnce
+			// guardó al acreditar (db.go) — no necesariamente lo que la
+			// pasarela cobró de verdad (PayPal/NOWPayments cobran en USD,
+			// dLocal Go en la divisa real del cliente). Presentarlo como
+			// "amount_pen"/"charged_currency: PEN" afirmaría una divisa que
+			// puede ser incorrecta. Se responde igual con éxito (el
+			// comprobante existe y el enlace sigue funcionando) pero sin
+			// inventar importe ni divisa — el frontend ya sabe mostrar "monto
+			// no disponible" cuando charged_amount/charged_currency vienen
+			// vacíos (ver Voucher.tsx, hasChargedInfo).
+			if txErr != nil {
+				slog.Warn("HandlerRechargeVoucher: no se pudo leer el pago vinculado, se muestra el comprobante sin importe/divisa en vez de inventarlos", "rechargeID", id, "paymentID", *r.PaymentTransactionID, "error", txErr)
+				productName := "Recarga vía pasarela"
+				if r.Note != nil && *r.Note != "" { productName = *r.Note }
+				c.JSON(http.StatusOK, gin.H{
+					"success": true,
+					"voucher": gin.H{
+						"type":               "recharge",
+						"reference":          strings.ToUpper(id.String()[:8]),
+						"customer_name":      customer.EpicUsername,
+						"product_name":       productName,
+						"amount_pen":         nil,
+						"charged_amount":     nil,
+						"charged_currency":   nil,
+						"kc_amount":          r.AmountKC,
+						"gateway":            r.Method,
+						"status":             "approved",
+						"created_at":         r.CreatedAt,
+						"amount_unavailable": true,
+					},
+				})
+				return
+			}
+		}
+
 		amountSoles := 0.0
 		if r.AmountSoles != nil { amountSoles = *r.AmountSoles }
 		productName := "Recarga manual de KC"
 		if r.Note != nil && *r.Note != "" { productName = *r.Note }
-		// Las recargas manuales (Yape/Plin/transferencia, o /kc add de Discord)
-		// siempre se cobran en soles — a diferencia de un pago automático, acá
-		// no hay ninguna pasarela de por medio que pudiera haber cobrado en
-		// otra divisa. Cuando amountSoles es 0 (recarga hecha desde Discord sin
+		// Recarga manual genuina (Yape/Plin/transferencia, o /kc add de
+		// Discord) — siempre se cobra en soles, no hay ninguna pasarela de
+		// por medio. Cuando amountSoles es 0 (recarga hecha desde Discord sin
 		// registrar un monto en soles), no se inventa un importe: se omite el
 		// campo en vez de mostrar "S/ 0.00" como si esa hubiera sido la cifra
 		// real cobrada.
@@ -802,7 +876,7 @@ func nowPaymentsStatus(paymentID int64) (status string, orderID string, err erro
 		return "", "", fmt.Errorf("NOWPayments not configured")
 	}
 
-	req, err := http.NewRequest("GET", fmt.Sprintf("https://api.nowpayments.io/v1/payment/%d", paymentID), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/payment/%d", nowPaymentsBaseURL, paymentID), nil)
 	if err != nil {
 		return "", "", fmt.Errorf("NOWPayments: error construyendo request: %w", err)
 	}

@@ -376,6 +376,18 @@ func main() {
 		}
 	}()
 
+	// ── Reintento de eventos de NOWPayments que nunca se terminaron de
+	// procesar (la consulta a la pasarela falló, o el proceso se cayó a
+	// mitad de camino) — ver RetryFailedWebhookEvents. ──
+	go func() {
+		for {
+			time.Sleep(3 * time.Minute)
+			safe.Run("RetryFailedWebhookEvents", func() {
+				store.RetryFailedWebhookEvents(database)
+			})
+		}
+	}()
+
 	// ── Reset diario de gifts de bots (remaining_gifts vuelve a 5 cada día) ──
 	go func() {
 		for {

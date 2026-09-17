@@ -172,7 +172,43 @@ type KCRecharge struct {
 	Method      string    `json:"method"`
 	Note        *string   `json:"note,omitempty"`
 	ApprovedBy  *string   `json:"approved_by,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	// PaymentTransactionID: cuando no es nil, esta fila es la acreditación
+	// automática de un pago por pasarela (ver CreditPaymentOnce en db.go) —
+	// no una recarga manual independiente. La MISMA operación ya aparece,
+	// con más detalle (pasarela, divisa real, external_id), como una fila
+	// de payment_transactions con este mismo ID. Se expone para que el
+	// dashboard del cliente pueda relacionar ambas filas y no las muestre
+	// como dos movimientos separados.
+	PaymentTransactionID *uuid.UUID `json:"payment_transaction_id,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
+}
+
+// RechargeHistoryItem es una fila del historial combinado de recargas de un
+// cliente (ver db.GetRechargeHistoryByCustomer) — la unión, ya deduplicada y
+// paginada en la base de datos, de las recargas manuales genuinas
+// (kc_recharges sin payment_transaction_id) y los pagos por pasarela de tipo
+// kc_recharge (payment_transactions). Antes el dashboard traía las DOS
+// listas completas sin paginar (una con tope fijo de 2000, la otra sin
+// límite) y las combinaba/paginaba en el navegador — con más de 2000
+// intentos de pago, o simplemente con una sola consulta lenta por cliente
+// con mucho historial, eso dejaba de ser sostenible. Kind distingue el
+// origen ("kc" = recarga manual, "pay" = pago por pasarela) para que el
+// handler sepa qué campos son relevantes.
+type RechargeHistoryItem struct {
+	Kind         string    `json:"kind"`
+	ID           uuid.UUID `json:"id"`
+	AmountKC     int       `json:"amount_kc"`
+	AmountSoles  *float64  `json:"amount_soles,omitempty"`
+	Method       string    `json:"method,omitempty"`
+	Gateway      string    `json:"gateway,omitempty"`
+	PaymentType  string    `json:"payment_type,omitempty"`
+	ProductName  string    `json:"product_name,omitempty"`
+	AmountPEN    float64   `json:"amount_pen,omitempty"`
+	AmountUSD    float64   `json:"amount_usd,omitempty"`
+	CurrencyCode string    `json:"currency_code,omitempty"`
+	AmountLocal  float64   `json:"amount_local,omitempty"`
+	Status       string    `json:"status,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // ==================== ORDER ====================
@@ -437,6 +473,17 @@ type AuthResponse struct {
 }
 
 // ==================== PAYMENT TRANSACTION ====================
+
+// WebhookEvent — copia mínima de una fila de webhook_events, usada solo para
+// reintentar el procesamiento de eventos que nunca se resolvieron (ver
+// db.GetUnresolvedWebhookEvents). RawBody es el cuerpo crudo tal cual llegó
+// de la pasarela, guardado ANTES de intentar procesarlo — de ahí se vuelve a
+// extraer lo necesario (p. ej. el payment_id de NOWPayments) sin depender de
+// que el webhook original se repita.
+type WebhookEvent struct {
+	ID      uuid.UUID
+	RawBody string
+}
 
 type PaymentTransaction struct {
 	ID          uuid.UUID `json:"id"`

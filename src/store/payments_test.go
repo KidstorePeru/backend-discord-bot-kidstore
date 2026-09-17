@@ -22,9 +22,9 @@ func TestChargedAmountAndCurrency(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotAmount, gotCurrency := chargedAmountAndCurrency(c.gateway, c.amountPEN, c.amountUSD, c.amountLocal, c.currencyCode)
+			gotAmount, gotCurrency := ChargedAmountAndCurrency(c.gateway, c.amountPEN, c.amountUSD, c.amountLocal, c.currencyCode)
 			if gotAmount != c.wantAmount || gotCurrency != c.wantCurrency {
-				t.Errorf("chargedAmountAndCurrency(%q, ...) = (%v, %v), want (%v, %v)",
+				t.Errorf("ChargedAmountAndCurrency(%q, ...) = (%v, %v), want (%v, %v)",
 					c.gateway, gotAmount, gotCurrency, c.wantAmount, c.wantCurrency)
 			}
 		})

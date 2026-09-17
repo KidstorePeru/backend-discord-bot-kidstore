@@ -212,9 +212,10 @@ func checkGatewayOutcome(p types.PaymentTransaction) (gatewayOutcome, error) {
 
 // reconcileDeadLetterAfter — si un pago con sesión real en la pasarela lleva
 // todo este tiempo sin que la pasarela confirme nada (ni a favor ni en
-// contra), se da por perdido. Deliberadamente generoso: una confirmación
-// cripto (NOWPayments) puede tardar horas en la blockchain en momentos de
-// congestión, mucho más que cualquier tarjeta o transferencia.
+// contra), pasa a 'review' (nunca a 'failed'/'expired' — eso afirmaría un
+// rechazo confirmado que no existe). Deliberadamente generoso: una
+// confirmación cripto (NOWPayments) puede tardar horas en la blockchain en
+// momentos de congestión, mucho más que cualquier tarjeta o transferencia.
 const reconcileDeadLetterAfter = 6 * time.Hour
 
 func reconcileOnePayment(database *sql.DB, p types.PaymentTransaction) {
@@ -232,12 +233,30 @@ func reconcileOnePayment(database *sql.DB, p types.PaymentTransaction) {
 		// PayPal ya significa COMPLETED de verdad.
 		if err := processApprovedPayment(database, p.ID); err != nil {
 			slog.Error("reconciliación: error acreditando pago", "txID", p.ID, "gateway", p.Gateway, "error", err)
+			// La pasarela YA confirmó el cobro — este intento falló por algo de
+			// nuestro lado (p. ej. una cuenta inactiva o un error transitorio de
+			// base de datos), no porque el pago no exista. No se marca 'failed'
+			// ni 'review' (CreditPaymentOnce sigue garantizando que, cuando la
+			// acreditación finalmente funcione, sea exactamente una vez), pero
+			// SÍ hay que rotar updated_at: si no, este mismo pago vuelve a ser
+			// el primero de GetStalePendingPayments en cada pasada y un solo
+			// pago que falla sistemáticamente (cuenta inactiva, por ejemplo)
+			// puede acaparar el barrido entero e impedir que se reintenten los
+			// pagos siguientes.
+			if terr := db.TouchPaymentReconciled(database, p.ID); terr != nil {
+				slog.Warn("reconciliación: no se pudo actualizar la marca de rotación tras fallo de acreditación", "txID", p.ID, "error", terr)
+			}
 			return
 		}
 		slog.Info("reconciliación: pago acreditado sin depender del webhook", "txID", p.ID, "gateway", p.Gateway)
 	case gatewayRejected:
 		if err := db.AdminUpdatePaymentStatus(database, p.ID, "failed"); err != nil {
 			slog.Error("reconciliación: error marcando pago rechazado", "txID", p.ID, "gateway", p.Gateway, "error", err)
+			// Mismo motivo que en gatewayApproved: si esta escritura falla, no
+			// dejar que el pago se quede clavado como primero de la cola.
+			if terr := db.TouchPaymentReconciled(database, p.ID); terr != nil {
+				slog.Warn("reconciliación: no se pudo actualizar la marca de rotación tras fallo al marcar rechazo", "txID", p.ID, "error", terr)
+			}
 			return
 		}
 		slog.Info("reconciliación: pago rechazado confirmado por la pasarela", "txID", p.ID, "gateway", p.Gateway)
@@ -250,15 +269,55 @@ func reconcileOnePayment(database *sql.DB, p types.PaymentTransaction) {
 				capturePayPalOrder(p.ExternalID)
 			}
 		}
-		if time.Since(p.CreatedAt) > reconcileDeadLetterAfter {
-			slog.Warn("reconciliación: pago nunca se pudo confirmar ni descartar, se da por perdido", "txID", p.ID, "gateway", p.Gateway, "edad", time.Since(p.CreatedAt))
-			if err := db.AdminUpdatePaymentStatus(database, p.ID, "expired"); err != nil {
-				slog.Error("reconciliación: error expirando pago sin resolver", "txID", p.ID, "error", err)
+		// Ver el paso del tiempo (o que esta consulta falle) NUNCA se trata
+		// como prueba de que no hubo cobro — 'review' es explícitamente
+		// distinto de 'failed'/'expired' (que sí afirman un rechazo
+		// confirmado): el pago sigue en la reconciliación automática (ver
+		// GetStalePendingPayments) por si llega una confirmación tardía, y
+		// el frontend muestra un mensaje honesto de "no pudimos confirmar",
+		// nunca "no se realizó ningún cargo". Solo se transiciona una vez
+		// (status=='pending') — si ya está en 'review', no hay nada nuevo
+		// que anunciar en cada pasada de 2 minutos, solo se sigue
+		// reconciliando en silencio hasta que se resuelva de verdad.
+		if p.Status == "pending" && time.Since(p.CreatedAt) > reconcileDeadLetterAfter {
+			slog.Warn("reconciliación: pago nunca se pudo confirmar ni descartar, queda en revisión", "txID", p.ID, "gateway", p.Gateway, "edad", time.Since(p.CreatedAt))
+			if err := db.AdminUpdatePaymentStatus(database, p.ID, "review"); err != nil {
+				slog.Error("reconciliación: error marcando pago en revisión", "txID", p.ID, "error", err)
 				return
 			}
 			discordbot.AlertUnresolvedPayment(p.ID.String(), p.Gateway)
+			return
+		}
+		// Sigue sin resolverse (y todavía no pasó el margen para darlo por
+		// perdido) — se actualiza updated_at para que GetStalePendingPayments
+		// (que ordena por esa columna) lo empuje al final de la cola: la
+		// próxima pasada del barrido atiende a otros pagos elegibles en vez
+		// de volver a traer siempre los mismos primeros 100. Sin esto, un
+		// grupo grande de pagos permanentemente ambiguos podía acaparar cada
+		// pasada e impedir que se llegara a revisar cualquier pago más nuevo.
+		if err := db.TouchPaymentReconciled(database, p.ID); err != nil {
+			slog.Warn("reconciliación: no se pudo actualizar la marca de rotación", "txID", p.ID, "error", err)
 		}
 	}
+}
+
+// logWebhookEventOrReject registra el webhook de forma duradera ANTES de
+// procesar nada — y, a diferencia de antes, si esa escritura falla, el
+// handler NO confirma recepción (200) a la pasarela: responde con un error
+// para que la pasarela reintente el envío más tarde. Confirmar recepción
+// sin una garantía durable de que el evento quedó registrado significaba
+// que, si el procesamiento en memoria también fallaba o el proceso se
+// caía, el webhook se perdía sin dejar ningún rastro — ni para
+// reintentarlo automáticamente, ni para diagnosticarlo después. Devuelve
+// ok=false cuando ya se respondió al request y no hay que seguir.
+func logWebhookEventOrReject(c *gin.Context, database *sql.DB, gateway, body string) (eventID uuid.UUID, ok bool) {
+	eventID, err := db.LogWebhookEvent(database, gateway, body)
+	if err != nil {
+		slog.Error("webhook: no se pudo registrar el evento de forma duradera, se rechaza para que la pasarela reintente", "gateway", gateway, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"received": false, "error": "no se pudo registrar el evento, reintenta"})
+		return uuid.Nil, false
+	}
+	return eventID, true
 }
 
 // ==================== MERCADOPAGO WEBHOOK ====================
@@ -270,7 +329,8 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 		// Registro duradero ANTES de intentar procesar nada — si el proceso
 		// se cae a mitad de camino, queda constancia de que la notificación
 		// sí llegó (ver ReconcilePendingPayments para la recuperación real).
-		eventID := db.LogWebhookEvent(database, "mercadopago", string(body))
+		eventID, ok := logWebhookEventOrReject(c, database, "mercadopago", string(body))
+		if !ok { return }
 
 		var notification struct {
 			Type string `json:"type"`
@@ -356,7 +416,8 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, _ := io.ReadAll(c.Request.Body)
 		slog.Info("PayPal webhook received", "body", string(body))
-		eventID := db.LogWebhookEvent(database, "paypal", string(body))
+		eventID, ok := logWebhookEventOrReject(c, database, "paypal", string(body))
+		if !ok { return }
 
 		var event struct {
 			EventType string `json:"event_type"`
@@ -497,75 +558,157 @@ func HandlerPayPalCapture(database *sql.DB) gin.HandlerFunc {
 
 func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		body, _ := io.ReadAll(c.Request.Body)
-		slog.Info("NOWPayments webhook received", "body", string(body))
-		eventID := db.LogWebhookEvent(database, "nowpayments", string(body))
-
-		var notification struct {
-			PaymentID int64 `json:"payment_id"`
+		body, readErr := io.ReadAll(c.Request.Body)
+		if readErr != nil {
+			slog.Error("NOWPayments webhook: no se pudo leer el cuerpo completo, se rechaza para que reintente", "error", readErr)
+			c.JSON(http.StatusBadRequest, gin.H{"received": false, "error": "no se pudo leer el cuerpo del request"})
+			return
 		}
-		if err := json.Unmarshal(body, &notification); err != nil || notification.PaymentID == 0 {
+		slog.Info("NOWPayments webhook received", "body", string(body))
+		eventID, logged := logWebhookEventOrReject(c, database, "nowpayments", string(body))
+		if !logged { return }
+
+		paymentID, ok := parseNOWPaymentsPaymentID(body)
+		if !ok {
 			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON or no payment_id")
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
 
 		go safe.Run("HandlerNOWPaymentsWebhook", func() {
-			outcome := "ignored: not confirmed"
-			defer func() { db.MarkWebhookEventProcessed(database, eventID, outcome) }()
-
-			// El IPN no viene firmado — no se le puede creer su "payment_status" ni
-			// su "order_id" a ciegas, cualquiera podría forjar este POST. Se vuelve
-			// a consultar el estado real directamente en la API de NOWPayments con
-			// nuestra propia API key, igual que ya se hace con MercadoPago.
-			status, orderID, err := nowPaymentsStatus(notification.PaymentID)
-			if err != nil {
-				slog.Error("NOWPayments status query failed", "paymentID", notification.PaymentID, "error", err)
-				outcome = "error: status query failed"
-				return
-			}
-
-			txID, parseErr := uuid.Parse(orderID)
-			if parseErr != nil {
-				slog.Error("NOWPayments invalid order_id", "id", orderID)
-				outcome = "error: invalid order_id"
-				return
-			}
-
-			// Guardar el ID real del pago ANTES de decidir qué hacer con su
-			// estado — así, aunque el proceso se caiga justo después de esta
-			// línea, la reconciliación automática (cada 2 min, ver
-			// reconcileOnePayment) puede seguir consultando el pago real sin
-			// depender de que este webhook se repita (algo que este gateway no
-			// podía hacer antes: era el único excluido de esa reconciliación).
-			if serr := db.SetProviderPaymentID(database, txID, fmt.Sprintf("%d", notification.PaymentID)); serr != nil {
-				slog.Error("NOWPayments: no se pudo guardar el payment_id real", "txID", txID, "error", serr)
-			}
-
-			if status == "partially_paid" {
-				// El cliente pagó menos cripto de lo esperado — antes esto se
-				// trataba igual que cualquier pago pendiente y simplemente
-				// expiraba en 30 min sin que nadie se enterara. Ahora se
-				// avisa por Discord para que soporte decida manualmente
-				// (acreditar proporcional o contactar al cliente) en vez de
-				// perderlo en silencio.
-				discordbot.AlertUnderpaidCryptoPayment(notification.PaymentID, orderID)
-				outcome = "ignored: partially paid, admin alerted"
-				return
-			}
-			if status != "confirmed" && status != "finished" {
-				return
-			}
-
-			if err := processApprovedPayment(database, txID); err != nil {
-				slog.Error("NOWPayments processing failed", "txID", txID, "error", err)
-				outcome = "error: " + err.Error()
-			} else {
-				outcome = "processed"
-			}
+			outcome := processNOWPaymentsPaymentID(database, paymentID)
+			db.MarkWebhookEventProcessed(database, eventID, outcome)
 		})
 
 		c.JSON(http.StatusOK, gin.H{"received": true})
+	}
+}
+
+// parseNOWPaymentsPaymentID extrae únicamente el payment_id del cuerpo
+// crudo del IPN — lo único que se necesita para consultar el estado real,
+// ya que el resto del cuerpo (payment_status, order_id) no viene firmado y
+// nunca se usa sin antes verificarlo contra la API de NOWPayments.
+func parseNOWPaymentsPaymentID(body []byte) (int64, bool) {
+	var notification struct {
+		PaymentID int64 `json:"payment_id"`
+	}
+	if err := json.Unmarshal(body, &notification); err != nil || notification.PaymentID == 0 {
+		return 0, false
+	}
+	return notification.PaymentID, true
+}
+
+// processNOWPaymentsPaymentID hace el trabajo real de un IPN de NOWPayments
+// — consulta el estado verdadero del pago y, si corresponde, acredita el
+// KC. Se extrajo del handler del webhook para que RetryFailedWebhookEvents
+// pueda reejecutar EXACTAMENTE la misma lógica sobre un evento guardado que
+// nunca se terminó de procesar (la consulta falló, o el proceso se cayó a
+// mitad de camino) — sin depender de que NOWPayments reenvíe el IPN.
+// Devuelve un outcome corto y legible para guardar en webhook_events.
+func processNOWPaymentsPaymentID(database *sql.DB, paymentID int64) string {
+	// El IPN no viene firmado — no se le puede creer su "payment_status" ni
+	// su "order_id" a ciegas, cualquiera podría forjar este POST. Se vuelve
+	// a consultar el estado real directamente en la API de NOWPayments con
+	// nuestra propia API key, igual que ya se hace con MercadoPago.
+	status, orderID, err := nowPaymentsStatus(paymentID)
+	if err != nil {
+		slog.Error("NOWPayments status query failed", "paymentID", paymentID, "error", err)
+		return "error: status query failed"
+	}
+
+	txID, parseErr := uuid.Parse(orderID)
+	if parseErr != nil {
+		slog.Error("NOWPayments invalid order_id", "id", orderID)
+		return "error: invalid order_id"
+	}
+
+	// Guardar el ID real del pago ANTES de decidir qué hacer con su
+	// estado — así, aunque el proceso se caiga justo después de esta
+	// línea, la reconciliación automática (cada 2 min, ver
+	// reconcileOnePayment) puede seguir consultando el pago real sin
+	// depender de que este webhook se repita (algo que este gateway no
+	// podía hacer antes: era el único excluido de esa reconciliación).
+	//
+	// Si esta escritura falla, la función CORTA ACÁ (antes seguía adelante
+	// y, si el status todavía no estaba confirmado, terminaba devolviendo
+	// "ignored: not confirmed" — un outcome que GetUnresolvedWebhookEvents
+	// nunca reintenta, dejando el pago sin provider_payment_id guardado Y
+	// sin ninguna forma de recuperarlo más adelante). Al devolver un
+	// outcome que empieza con "error:", RetryFailedWebhookEvents sí vuelve
+	// a intentar esta misma función completa más tarde.
+	if serr := db.SetProviderPaymentID(database, txID, fmt.Sprintf("%d", paymentID)); serr != nil {
+		slog.Error("NOWPayments: no se pudo guardar el payment_id real, se reintentará", "txID", txID, "error", serr)
+		return "error: no se pudo guardar el payment_id, pendiente de reintento"
+	}
+
+	if status == "partially_paid" {
+		// El cliente pagó menos cripto de lo esperado — antes esto se
+		// trataba igual que cualquier pago pendiente y simplemente
+		// expiraba en 30 min sin que nadie se enterara. Ahora se
+		// avisa por Discord para que soporte decida manualmente
+		// (acreditar proporcional o contactar al cliente) en vez de
+		// perderlo en silencio.
+		discordbot.AlertUnderpaidCryptoPayment(paymentID, orderID)
+		return "ignored: partially paid, admin alerted"
+	}
+	if status != "confirmed" && status != "finished" {
+		// Pago pendiente CORRECTAMENTE registrado (provider_payment_id ya
+		// se guardó arriba) — no es un fallo interno, es el estado normal
+		// mientras la pasarela todavía no confirma el cobro. No se
+		// reintenta como webhook (nada que "arreglar" acá); la
+		// reconciliación automática (GetStalePendingPayments, cada 2 min)
+		// ya lo sigue de cerca usando el provider_payment_id guardado.
+		return "pending: aún no confirmado por la pasarela"
+	}
+
+	if err := processApprovedPayment(database, txID); err != nil {
+		slog.Error("NOWPayments processing failed", "txID", txID, "error", err)
+		return "error: " + err.Error()
+	}
+	return "processed"
+}
+
+// nowPaymentsRetryMinAge / nowPaymentsRetryMaxAge acotan qué eventos
+// reintenta RetryFailedWebhookEvents: al menos 3 minutos de antigüedad para
+// no competir con el propio procesamiento asíncrono del webhook en vivo
+// (todavía podría estar corriendo), y como mucho 48 horas — pasado eso, si
+// el pago asociado nunca se pudo resolver, la reconciliación general de
+// pagos ya lo da por perdido con su propio aviso al admin (ver
+// reconcileDeadLetterAfter).
+const (
+	nowPaymentsRetryMinAge = 3 * time.Minute
+	nowPaymentsRetryMaxAge = 48 * time.Hour
+)
+
+// RetryFailedWebhookEvents reprocesa eventos de NOWPayments que quedaron
+// registrados (LogWebhookEvent) pero nunca se terminaron de procesar con
+// éxito — o porque la primera consulta a la pasarela falló (error de red
+// transitorio, por ejemplo), o porque el proceso se cayó a mitad de camino
+// y el resultado nunca se llegó a guardar. Confirmar la recepción de un
+// webhook con HTTP 200 no basta por sí solo — esto es lo que convierte ese
+// registro en un mecanismo de recuperación de verdad: nada se pierde solo
+// porque un intento falló o el servidor se reinició. Se llama
+// periódicamente desde main.go, igual que ReconcilePendingPayments.
+func RetryFailedWebhookEvents(database *sql.DB) {
+	events, err := db.GetUnresolvedWebhookEvents(database, "nowpayments", nowPaymentsRetryMinAge, nowPaymentsRetryMaxAge)
+	if err != nil {
+		slog.Error("RetryFailedWebhookEvents: error listando eventos sin resolver", "error", err)
+		return
+	}
+	for _, ev := range events {
+		ev := ev
+		safe.Run("RetryFailedWebhookEvents.nowpayments", func() {
+			paymentID, ok := parseNOWPaymentsPaymentID([]byte(ev.RawBody))
+			if !ok {
+				db.MarkWebhookEventProcessed(database, ev.ID, "ignored: invalid JSON or no payment_id")
+				return
+			}
+			outcome := processNOWPaymentsPaymentID(database, paymentID)
+			db.MarkWebhookEventProcessed(database, ev.ID, outcome)
+			if outcome == "processed" {
+				slog.Info("RetryFailedWebhookEvents: evento de NOWPayments recuperado", "eventID", ev.ID, "paymentID", paymentID)
+			}
+		})
 	}
 }
 
@@ -573,16 +716,27 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 
 func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		body, _ := io.ReadAll(c.Request.Body)
+		body, readErr := io.ReadAll(c.Request.Body)
+		if readErr != nil {
+			slog.Error("dLocal Go webhook: no se pudo leer el cuerpo completo, se rechaza para que reintente", "error", readErr)
+			c.JSON(http.StatusBadRequest, gin.H{"received": false, "error": "no se pudo leer el cuerpo del request"})
+			return
+		}
 		slog.Info("dLocal Go webhook received", "body", string(body))
 
 		if !verifyDLocalGoSignature(body, c.GetHeader("Authorization")) {
+			// Firma inválida: cualquiera pudo mandar este POST, no es una
+			// notificación real de dLocal Go — se deja constancia (best
+			// effort, sin bloquear la respuesta por ello) pero nunca se
+			// reintenta ni se le pide a un tercero no autenticado que
+			// vuelva a mandar nada.
 			slog.Warn("dLocal Go webhook: firma inválida, ignorando")
-			db.LogWebhookEvent(database, "dlocalgo", string(body)) // queda constancia igual, aunque se ignore
+			db.LogWebhookEvent(database, "dlocalgo", string(body))
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
-		eventID := db.LogWebhookEvent(database, "dlocalgo", string(body))
+		eventID, ok := logWebhookEventOrReject(c, database, "dlocalgo", string(body))
+		if !ok { return }
 
 		var notification struct {
 			PaymentID string `json:"payment_id"`
