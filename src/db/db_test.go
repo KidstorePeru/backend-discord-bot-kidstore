@@ -40,7 +40,6 @@ import (
 	"fmt"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -806,7 +805,7 @@ func TestGetUnresolvedWebhookEvents_DetectaEventosSinResolver(t *testing.T) {
 	MarkWebhookEventProcessed(conn, processedID, "processed")
 
 	// minAge=0 para no esperar el margen real de 3 minutos en la prueba.
-	unresolved, err := GetUnresolvedWebhookEvents(conn, "nowpayments", 0, 48*time.Hour)
+	unresolved, err := GetUnresolvedWebhookEvents(conn, "nowpayments", 0)
 	if err != nil {
 		t.Fatalf("GetUnresolvedWebhookEvents: %v", err)
 	}
@@ -822,6 +821,40 @@ func TestGetUnresolvedWebhookEvents_DetectaEventosSinResolver(t *testing.T) {
 	}
 	if ids[processedID] {
 		t.Error("un evento ya procesado con éxito NO debería reintentarse")
+	}
+}
+
+// TestGetUnresolvedWebhookEvents_NoDejaDeReintentarPorAntiguedad cubre "no
+// dejes de recuperar eventos únicamente por superar las 48 horas": antes
+// GetUnresolvedWebhookEvents tenía un maxAge de 48h que excluía cualquier
+// evento más viejo de la consulta, sin importar si alguna vez se había
+// podido procesar — un evento que llevaba, por ejemplo, 90 horas fallando
+// (típicamente porque nunca se pudo guardar su provider_payment_id, y por
+// lo tanto la reconciliación general tampoco podía consultar a NOWPayments
+// por su cuenta) dejaba de reintentarse PARA SIEMPRE.
+func TestGetUnresolvedWebhookEvents_NoDejaDeReintentarPorAntiguedad(t *testing.T) {
+	conn := setupTestDB(t)
+
+	oldFailedID, err := LogWebhookEvent(conn, "nowpayments", `{"payment_id":999111}`)
+	if err != nil { t.Fatalf("LogWebhookEvent: %v", err) }
+	defer conn.Exec(`DELETE FROM webhook_events WHERE id=$1`, oldFailedID)
+	MarkWebhookEventProcessed(conn, oldFailedID, "error: status query failed")
+	// Retrocede tanto el registro como el último intento a hace 90 horas —
+	// bien pasadas las 48h del límite que existía antes.
+	if _, err := conn.Exec(`UPDATE webhook_events SET received_at=NOW()-INTERVAL '90 hours', processed_at=NOW()-INTERVAL '90 hours' WHERE id=$1`, oldFailedID); err != nil {
+		t.Fatalf("no se pudo retrasar el evento: %v", err)
+	}
+
+	unresolved, err := GetUnresolvedWebhookEvents(conn, "nowpayments", 0)
+	if err != nil {
+		t.Fatalf("GetUnresolvedWebhookEvents: %v", err)
+	}
+	found := false
+	for _, e := range unresolved {
+		if e.ID == oldFailedID { found = true }
+	}
+	if !found {
+		t.Error("un evento que lleva más de 48h fallando debería seguir disponible para reintento — nunca debe dejar de recuperarse solo por su antigüedad")
 	}
 }
 

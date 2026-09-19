@@ -15,10 +15,13 @@ import (
 // store ya importa discordbot para las notificaciones (NotifyRecharge, etc.),
 // así que importar al revés crearía un ciclo. main.go conecta esta función
 // una sola vez al arrancar, con store.SendPaymentApprovedEmail (misma firma).
-var emailSender func(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, voucherURL, lang string)
+// chargedAmount/chargedCurrency: monto y divisa REALMENTE cobrados — nunca
+// se asume soles (ver el mismo comentario en store.SendPaymentApprovedEmail,
+// la implementación real que main.go conecta acá).
+var emailSender func(cfg types.EnvConfig, toEmail, productName string, chargedAmount float64, chargedCurrency string, kcAmount int, gateway, voucherURL, lang string)
 
 // SetEmailSender registra la función que manda el correo de pago aprobado.
-func SetEmailSender(fn func(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, voucherURL, lang string)) {
+func SetEmailSender(fn func(cfg types.EnvConfig, toEmail, productName string, chargedAmount float64, chargedCurrency string, kcAmount int, gateway, voucherURL, lang string)) {
 	emailSender = fn
 }
 

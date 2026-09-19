@@ -447,6 +447,83 @@ func TestProcessNOWPaymentsPaymentID_ConfirmadoAcreditaUnaVez(t *testing.T) {
 	}
 }
 
+// TestRetryFailedWebhookEvents_RecuperaEventoDeMasDe48HorasSinProviderPaymentID
+// cubre el flujo COMPLETO de "no dejes de recuperar pagos de NOWPayments
+// únicamente por superar las 48 horas": un evento cuyo primer intento falló
+// (nunca llegó a guardar provider_payment_id, así que la reconciliación
+// general tampoco podía consultar a la pasarela por su cuenta — ver
+// checkGatewayOutcome) y que lleva 90 horas sin resolverse. Antes,
+// GetUnresolvedWebhookEvents lo excluía de la consulta por su antigüedad y
+// el pago quedaba sin ninguna vía de recuperación automática. Usa un
+// servidor NOWPayments simulado (httptest) — nunca la pasarela real — para
+// confirmar que RetryFailedWebhookEvents SIGUE verificando el estado real
+// con la pasarela (nunca confía en el cuerpo crudo del webhook) antes de
+// acreditar.
+func TestRetryFailedWebhookEvents_RecuperaEventoDeMasDe48HorasSinProviderPaymentID(t *testing.T) {
+	conn := setupShopTestDB(t)
+	custID, cleanup := newShopTestCustomer(t, conn, 0)
+	defer cleanup()
+
+	txID := uuid.New()
+	if _, err := conn.Exec(`
+		INSERT INTO payment_transactions (id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, external_id, status, created_at, updated_at)
+		VALUES ($1,$2,'nowpayments','kc_recharge','starter','Starter',10.40,2.80,800,'invoice-old','pending',NOW()-INTERVAL '90 hours',NOW()-INTERVAL '90 hours')`,
+		txID, custID); err != nil {
+		t.Fatalf("insert payment_transactions: %v", err)
+	}
+	defer conn.Exec(`DELETE FROM payment_transactions WHERE id=$1`, txID)
+
+	const paymentID = 424242
+	eventID, err := db.LogWebhookEvent(conn, "nowpayments", fmt.Sprintf(`{"payment_id":%d}`, paymentID))
+	if err != nil { t.Fatalf("LogWebhookEvent: %v", err) }
+	defer conn.Exec(`DELETE FROM webhook_events WHERE id=$1`, eventID)
+	db.MarkWebhookEventProcessed(conn, eventID, "error: status query failed")
+	if _, err := conn.Exec(`UPDATE webhook_events SET received_at=NOW()-INTERVAL '90 hours', processed_at=NOW()-INTERVAL '90 hours' WHERE id=$1`, eventID); err != nil {
+		t.Fatalf("no se pudo retrasar el evento: %v", err)
+	}
+
+	prevURL := nowPaymentsBaseURL
+	prevCfg := paymentCfg
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"payment_status":"finished","order_id":%q}`, txID.String())
+	}))
+	defer server.Close()
+	nowPaymentsBaseURL = server.URL
+	paymentCfg.NOWPaymentsAPIKey = "test-key"
+	defer func() { nowPaymentsBaseURL = prevURL; paymentCfg = prevCfg }()
+
+	RetryFailedWebhookEvents(conn)
+
+	var balance int
+	conn.QueryRow(`SELECT kc_balance FROM customers WHERE id=$1`, custID).Scan(&balance)
+	if balance != 800 {
+		t.Fatalf("un evento de más de 48h debería seguir pudiendo recuperarse y acreditar el KC — esperaba 800, obtuve %d", balance)
+	}
+	var status string
+	var providerPaymentID sql.NullString
+	conn.QueryRow(`SELECT status, provider_payment_id FROM payment_transactions WHERE id=$1`, txID).Scan(&status, &providerPaymentID)
+	if status != "approved" {
+		t.Errorf("el pago debería quedar 'approved', obtuve %q", status)
+	}
+	if !providerPaymentID.Valid || providerPaymentID.String != fmt.Sprintf("%d", paymentID) {
+		t.Errorf("provider_payment_id debería haberse guardado (%d), obtuve %v", paymentID, providerPaymentID)
+	}
+	var outcome string
+	conn.QueryRow(`SELECT outcome FROM webhook_events WHERE id=$1`, eventID).Scan(&outcome)
+	if outcome != "processed" {
+		t.Errorf("el evento debería quedar marcado \"processed\", obtuve %q", outcome)
+	}
+
+	// Reintentar otra vez (como si un ciclo posterior de RetryFailedWebhookEvents
+	// volviera a correr) no debe acreditar una segunda vez.
+	RetryFailedWebhookEvents(conn)
+	conn.QueryRow(`SELECT kc_balance FROM customers WHERE id=$1`, custID).Scan(&balance)
+	if balance != 800 {
+		t.Errorf("un reintento posterior NUNCA debe acreditar KC dos veces — esperaba seguir en 800, obtuve %d", balance)
+	}
+}
+
 // ==================== COMPROBANTES INTERNACIONALES ANTIGUOS (punto 6) ====================
 
 // TestComprobanteDeRecargaVinculada_UsaImporteYDivisaReales cubre

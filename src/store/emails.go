@@ -257,7 +257,32 @@ func fmtDateEs() string {
 
 // ==================== PAGO APROBADO (automático o manual) ====================
 
-func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, amountPEN float64, kcAmount int, gateway, voucherURL, lang string) {
+// formatChargedAmount le da un formato legible a un monto+divisa para los
+// correos (del lado del servidor no hay Intl.NumberFormat) — coherente con
+// lo que ya muestra el comprobante del cliente (ver ChargedAmountAndCurrency
+// en payments.go, la MISMA fuente que usa el llamador para decidir qué
+// pasarle acá).
+func formatChargedAmount(amount float64, currency string) string {
+	switch currency {
+	case "PEN":
+		return fmt.Sprintf("S/ %.2f", amount)
+	case "USD":
+		return fmt.Sprintf("US$ %.2f", amount)
+	default:
+		return fmt.Sprintf("%s %.2f", currency, amount)
+	}
+}
+
+// chargedAmount/chargedCurrency: el monto y la divisa REALMENTE cobrados —
+// el llamador los calcula con ChargedAmountAndCurrency para pagos por
+// pasarela (PayPal/NOWPayments cobran en USD, dLocal Go en la divisa real
+// del cliente, nunca soles) o los arma directamente en PEN para recargas
+// manuales. Antes este correo mostraba siempre "S/ {amount_pen}" — el
+// equivalente en soles de referencia — como si fuera lo cobrado de verdad,
+// incorrecto para cualquier pasarela que no factura en soles. chargedAmount
+// <= 0 (o chargedCurrency vacía) omite la fila entera, igual que antes con
+// amountPEN <= 0 — nunca se inventa un importe.
+func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, chargedAmount float64, chargedCurrency string, kcAmount int, gateway, voucherURL, lang string) {
 	if !hasEmailProvider(cfg) {
 		return
 	}
@@ -279,8 +304,8 @@ func SendPaymentApprovedEmail(cfg types.EnvConfig, toEmail, productName string, 
 	}
 
 	rows := emailRow(productLabel, productName)
-	if amountPEN > 0 {
-		rows += emailRow(amountLabel, fmt.Sprintf("S/ %.2f", amountPEN))
+	if chargedAmount > 0 && chargedCurrency != "" {
+		rows += emailRow(amountLabel, formatChargedAmount(chargedAmount, chargedCurrency))
 	}
 	rows += emailRow(gatewayLabel, gateway)
 

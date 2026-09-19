@@ -137,7 +137,7 @@ func handleKCCommand(s *discordgo.Session, i *discordgo.InteractionCreate, data 
 				productName := "Recarga manual de KC"
 				if note != "" { productName = note }
 				voucherURL := fmt.Sprintf("https://www.kidstoreperu.net/dashboard/comprobantes/recarga/%s", rechargeID)
-				go emailSender(cfg, *updated.Email, productName, 0, int(amount), "Recarga manual (Discord)", voucherURL, "es")
+				go emailSender(cfg, *updated.Email, productName, 0, "", int(amount), "Recarga manual (Discord)", voucherURL, "es")
 			}
 		}
 	} else {

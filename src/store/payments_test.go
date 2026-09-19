@@ -30,3 +30,30 @@ func TestChargedAmountAndCurrency(t *testing.T) {
 		})
 	}
 }
+
+// TestFormatChargedAmount cubre la corrección del correo de "pago
+// aprobado": antes SendPaymentApprovedEmail mostraba siempre "S/ {amount_pen}"
+// sin importar la pasarela, mostrando el equivalente en soles de referencia
+// como si fuera lo realmente cobrado. formatChargedAmount es lo que arma esa
+// línea a partir del monto/divisa que devuelve ChargedAmountAndCurrency (la
+// MISMA función y los MISMOS datos que ya usa el comprobante) — mismo
+// criterio en los dos lugares.
+func TestFormatChargedAmount(t *testing.T) {
+	cases := []struct {
+		name             string
+		amount           float64
+		currency         string
+		want             string
+	}{
+		{"soles (mercadopago o recarga manual)", 10.40, "PEN", "S/ 10.40"},
+		{"dólares (PayPal o NOWPayments)", 2.80, "USD", "US$ 2.80"},
+		{"divisa local de dLocal Go", 55.30, "MXN", "MXN 55.30"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := formatChargedAmount(c.amount, c.currency); got != c.want {
+				t.Errorf("formatChargedAmount(%v, %q) = %q, want %q", c.amount, c.currency, got, c.want)
+			}
+		})
+	}
+}

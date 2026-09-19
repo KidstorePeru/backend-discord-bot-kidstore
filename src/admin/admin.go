@@ -301,12 +301,19 @@ func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
 		// tenia vinculado) — un cliente que paga por Yape/Plin sin Discord
 		// nunca se enteraba de que ya se le acredito el KC.
 		if customer.Email != nil && *customer.Email != "" {
-			amountSoles := 0.0
-			if req.AmountSoles != nil { amountSoles = *req.AmountSoles }
+			// Recarga manual genuina (Yape/Plin/transferencia) — siempre en
+			// soles, nunca hay pasarela de por medio. Sin importe registrado
+			// (0), se omite la fila en vez de mostrar "S/ 0.00" como si esa
+			// hubiera sido la cifra real cobrada (misma convención que el
+			// comprobante, HandlerRechargeVoucher).
+			amountSoles, currency := 0.0, ""
+			if req.AmountSoles != nil && *req.AmountSoles > 0 {
+				amountSoles, currency = *req.AmountSoles, "PEN"
+			}
 			productName := "Recarga manual de KC"
 			if req.Note != nil && *req.Note != "" { productName = *req.Note }
 			voucherURL := fmt.Sprintf("https://www.kidstoreperu.net/dashboard/comprobantes/recarga/%s", rechargeID)
-			go store.SendPaymentApprovedEmail(store.GetSMTPConfig(), *customer.Email, productName, amountSoles, req.AmountKC, "Recarga manual", voucherURL, "es")
+			go store.SendPaymentApprovedEmail(store.GetSMTPConfig(), *customer.Email, productName, amountSoles, currency, req.AmountKC, "Recarga manual", voucherURL, "es")
 		}
 
 		c.JSON(http.StatusOK, gin.H{

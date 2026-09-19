@@ -2047,11 +2047,22 @@ func MarkWebhookEventProcessed(db *sql.DB, id uuid.UUID, outcome string) {
 // primer intento falló con un error (outcome empieza con "error:" —
 // p. ej. la consulta a la pasarela falló por una caída de red transitoria).
 // minAge evita competir con el propio procesamiento asíncrono que dispara
-// el webhook en vivo (todavía podría estar corriendo); maxAge acota el
-// trabajo a una ventana razonable — pasado ese punto, la reconciliación
-// general de pagos (ver reconcileDeadLetterAfter en webhooks.go) es la que
-// termina dando por perdido el pago si de verdad nunca se pudo resolver.
-func GetUnresolvedWebhookEvents(db *sql.DB, gateway string, minAge, maxAge time.Duration) ([]types.WebhookEvent, error) {
+// el webhook en vivo (todavía podría estar corriendo).
+//
+// SIN cota superior de antigüedad a propósito: antes había un maxAge de 48h
+// que excluía de esta consulta cualquier evento más viejo, sin importar si
+// alguna vez se había podido resolver — un evento que llevaba 48h fallando
+// (por ejemplo porque SetProviderPaymentID nunca llegó a guardar el
+// provider_payment_id) dejaba de reintentarse PARA SIEMPRE, aunque el pago
+// asociado siguiera "pending" sin que la reconciliación general
+// (ReconcilePendingPayments) pudiera hacer nada por él — esa reconciliación
+// depende de tener un provider_payment_id ya guardado para poder consultar
+// a NOWPayments (ver checkGatewayOutcome), así que un evento sin ese dato
+// guardado y excluido de acá era un pago sin ninguna vía de recuperación.
+// La rotación de más abajo (ORDER BY processed_at) ya evita que un lote de
+// eventos viejos acapare cada pasada e impida que se reintenten los demás,
+// así que no hace falta una fecha límite además de eso.
+func GetUnresolvedWebhookEvents(db *sql.DB, gateway string, minAge time.Duration) ([]types.WebhookEvent, error) {
 	// ORDER BY processed_at (no por received_at, que nunca cambia) para que
 	// el reintento avance de forma ROTATIVA: los eventos nunca intentados
 	// (processed_at IS NULL) van primero; entre los que ya fallaron al
@@ -2068,9 +2079,8 @@ func GetUnresolvedWebhookEvents(db *sql.DB, gateway string, minAge, maxAge time.
 		WHERE gateway=$1
 		  AND (processed_at IS NULL OR outcome LIKE 'error:%')
 		  AND received_at < NOW() - $2::interval
-		  AND received_at > NOW() - $3::interval
 		ORDER BY processed_at ASC NULLS FIRST LIMIT 50`,
-		gateway, fmt.Sprintf("%d seconds", int(minAge.Seconds())), fmt.Sprintf("%d seconds", int(maxAge.Seconds())))
+		gateway, fmt.Sprintf("%d seconds", int(minAge.Seconds())))
 	if err != nil { return nil, err }
 	defer rows.Close()
 	var events []types.WebhookEvent

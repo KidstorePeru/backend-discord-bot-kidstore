@@ -46,11 +46,17 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 	}
 	slog.Info("KC credited via payment", "customer", tx.CustomerID, "kc", tx.KCAmount, "gateway", tx.Gateway)
 
-	// Send payment approved email notification
+	// Send payment approved email notification — chargedAmount/chargedCurrency
+	// son el monto y la divisa REALMENTE cobrados (misma función y mismos
+	// datos que usa el comprobante, ChargedAmountAndCurrency): antes este
+	// correo mostraba siempre tx.AmountPEN como "S/ …" aunque la pasarela
+	// hubiera cobrado en USD (PayPal/NOWPayments) o en la divisa real del
+	// cliente (dLocal Go).
 	if customer, err := db.GetCustomerByID(database, tx.CustomerID); err == nil {
 		if customer.Email != nil && *customer.Email != "" {
 			voucherURL := fmt.Sprintf("https://www.kidstoreperu.net/dashboard/comprobantes/pago/%s", tx.ID)
-			go SendPaymentApprovedEmail(smtpConfig, *customer.Email, tx.ProductName, tx.AmountPEN, tx.KCAmount, tx.Gateway, voucherURL, "es")
+			chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
+			go SendPaymentApprovedEmail(smtpConfig, *customer.Email, tx.ProductName, chargedAmount, chargedCurrency, tx.KCAmount, tx.Gateway, voucherURL, "es")
 		}
 		if tx.PaymentType == "kc_recharge" && tx.KCAmount > 0 {
 			discordbot.NotifyRecharge(customer, tx.KCAmount, customer.KCBalance, tx.Gateway)
@@ -668,17 +674,15 @@ func processNOWPaymentsPaymentID(database *sql.DB, paymentID int64) string {
 	return "processed"
 }
 
-// nowPaymentsRetryMinAge / nowPaymentsRetryMaxAge acotan qué eventos
-// reintenta RetryFailedWebhookEvents: al menos 3 minutos de antigüedad para
-// no competir con el propio procesamiento asíncrono del webhook en vivo
-// (todavía podría estar corriendo), y como mucho 48 horas — pasado eso, si
-// el pago asociado nunca se pudo resolver, la reconciliación general de
-// pagos ya lo da por perdido con su propio aviso al admin (ver
-// reconcileDeadLetterAfter).
-const (
-	nowPaymentsRetryMinAge = 3 * time.Minute
-	nowPaymentsRetryMaxAge = 48 * time.Hour
-)
+// nowPaymentsRetryMinAge acota qué eventos reintenta RetryFailedWebhookEvents:
+// al menos 3 minutos de antigüedad para no competir con el propio
+// procesamiento asíncrono del webhook en vivo (todavía podría estar
+// corriendo). A propósito NO hay un límite superior de antigüedad — ver el
+// comentario en db.GetUnresolvedWebhookEvents: un evento que lleva mucho
+// tiempo fallando (típicamente porque nunca se pudo guardar su
+// provider_payment_id) es exactamente el que más necesita seguir
+// reintentándose, no el que hay que dejar de intentar.
+const nowPaymentsRetryMinAge = 3 * time.Minute
 
 // RetryFailedWebhookEvents reprocesa eventos de NOWPayments que quedaron
 // registrados (LogWebhookEvent) pero nunca se terminaron de procesar con
@@ -690,7 +694,7 @@ const (
 // porque un intento falló o el servidor se reinició. Se llama
 // periódicamente desde main.go, igual que ReconcilePendingPayments.
 func RetryFailedWebhookEvents(database *sql.DB) {
-	events, err := db.GetUnresolvedWebhookEvents(database, "nowpayments", nowPaymentsRetryMinAge, nowPaymentsRetryMaxAge)
+	events, err := db.GetUnresolvedWebhookEvents(database, "nowpayments", nowPaymentsRetryMinAge)
 	if err != nil {
 		slog.Error("RetryFailedWebhookEvents: error listando eventos sin resolver", "error", err)
 		return
