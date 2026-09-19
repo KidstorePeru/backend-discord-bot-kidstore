@@ -60,6 +60,13 @@ type EnvConfig struct {
 	PayPalClientSecret     string `envconfig:"PAYPAL_CLIENT_SECRET"`
 	PayPalMode             string `envconfig:"PAYPAL_MODE" default:"sandbox"`
 	NOWPaymentsAPIKey      string `envconfig:"NOWPAYMENTS_API_KEY"`
+	// NOWPaymentsIPNSecret firma los callbacks IPN de NOWPayments (header
+	// x-nowpayments-sig) — se genera en el dashboard de NOWPayments, en
+	// Payment Settings → Instant Payment Notifications ("IPN Secret Key"),
+	// NO es la misma API key. Sin esta variable, HandlerNOWPaymentsWebhook
+	// rechaza todos los IPN entrantes (ver verifyNOWPaymentsSignature en
+	// payments.go) en vez de aceptarlos sin firma.
+	NOWPaymentsIPNSecret string `envconfig:"NOWPAYMENTS_IPN_SECRET"`
 
 	// dLocal Go (tarjetas y metodos locales fuera de Peru)
 	DLocalGoAPIKey    string `envconfig:"DLOCALGO_API_KEY"`

@@ -173,11 +173,24 @@ func checkGatewayOutcome(p types.PaymentTransaction) (gatewayOutcome, error) {
 		if p.ExternalID == "" {
 			return gatewayStillPending, nil
 		}
-		status, _, err := getPayPalOrder(p.ExternalID)
+		order, err := getPayPalOrder(p.ExternalID)
 		if err != nil {
 			return gatewayStillPending, err
 		}
-		return classifyPayPalStatus(status), nil
+		outcome := classifyPayPalStatus(order.Status)
+		if outcome == gatewayApproved && !payPalOrderMatchesTx(order, p.AmountUSD) {
+			// La orden dice COMPLETED, pero la captura real y/o el importe
+			// cobrado no coinciden con lo que esta transacción esperaba —
+			// nunca se acredita a ciegas solo por el status de la orden (ver
+			// payPalOrderMatchesTx). Se trata como "todavía sin resolver",
+			// nunca como rechazo definitivo: puede ser un instante en que la
+			// captura aún no propagó su status.
+			slog.Warn("PayPal: orden COMPLETED pero no coincide con la transacción, no se acredita",
+				"txID", p.ID, "orderID", p.ExternalID, "orderAmount", order.AmountValue,
+				"orderCurrency", order.CurrencyCode, "captureStatus", order.CaptureStatus, "expectedUSD", p.AmountUSD)
+			return gatewayStillPending, nil
+		}
+		return outcome, nil
 	case "dlocalgo":
 		if p.ExternalID == "" {
 			return gatewayStillPending, nil
@@ -271,7 +284,7 @@ func reconcileOnePayment(database *sql.DB, p types.PaymentTransaction) {
 			// Intentar la captura mejora las chances de la próxima pasada, pero
 			// nunca decide por sí sola el resultado (checkGatewayOutcome vuelve
 			// a consultar la próxima vez).
-			if status, _, gerr := getPayPalOrder(p.ExternalID); gerr == nil && status == "APPROVED" {
+			if order, gerr := getPayPalOrder(p.ExternalID); gerr == nil && order.Status == "APPROVED" {
 				capturePayPalOrder(p.ExternalID)
 			}
 		}
@@ -477,25 +490,44 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 			// estado real de la orden directamente en la API de PayPal con
 			// nuestras propias credenciales, igual que ya se hace con MercadoPago
 			// y dLocal Go. Solo esa respuesta decide si se acredita KC.
-			status, refID, err := getPayPalOrder(orderID)
+			order, err := getPayPalOrder(orderID)
 			if err != nil {
 				slog.Error("PayPal order query failed", "orderID", orderID, "error", err)
 				outcome = "error: order query failed"
 				return
 			}
-			if status != "COMPLETED" {
+			if order.Status != "COMPLETED" {
 				return
 			}
-			if refID == "" {
+			if order.ReferenceID == "" {
 				slog.Warn("PayPal order sin reference_id", "orderID", orderID)
 				outcome = "error: no reference_id"
 				return
 			}
 
-			txID, err := uuid.Parse(refID)
+			txID, err := uuid.Parse(order.ReferenceID)
 			if err != nil {
-				slog.Error("PayPal invalid reference_id", "ref", refID)
+				slog.Error("PayPal invalid reference_id", "ref", order.ReferenceID)
 				outcome = "error: invalid reference_id"
+				return
+			}
+
+			// El status COMPLETED de la orden no basta por sí solo — hace falta
+			// además que la transacción exista, que esta orden sea de verdad la
+			// que se creó para ella (ExternalID coincide) y que la captura real
+			// y el importe/divisa cobrados coincidan (ver payPalOrderMatchesTx).
+			tx, err := db.GetPaymentTransaction(database, txID)
+			if err != nil {
+				slog.Error("PayPal webhook: transacción no encontrada", "txID", txID, "error", err)
+				outcome = "error: transaction not found"
+				return
+			}
+			if tx.ExternalID != orderID || !payPalOrderMatchesTx(order, tx.AmountUSD) {
+				slog.Warn("PayPal webhook: la orden no corresponde a la transacción esperada, no se acredita",
+					"txID", txID, "orderID", orderID, "txExternalID", tx.ExternalID,
+					"orderAmount", order.AmountValue, "orderCurrency", order.CurrencyCode,
+					"captureStatus", order.CaptureStatus, "expectedUSD", tx.AmountUSD)
+				outcome = "ignored: amount or reference mismatch"
 				return
 			}
 
@@ -532,20 +564,42 @@ func HandlerPayPalCapture(database *sql.DB) gin.HandlerFunc {
 		// realmente pagó. El txID a acreditar siempre sale del reference_id que la
 		// propia orden de PayPal tiene guardado desde que se creó, verificado
 		// directamente contra la API de PayPal.
-		status, refID, err := getPayPalOrder(paypalToken)
+		order, err := getPayPalOrder(paypalToken)
 		if err != nil {
 			slog.Error("PayPal order query on return failed", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error verificando pago"})
 			return
 		}
-		if status != "COMPLETED" {
+		if order.Status != "COMPLETED" {
 			c.JSON(http.StatusOK, gin.H{"success": false, "error": "pago aun no completado"})
 			return
 		}
 
-		txID, err := uuid.Parse(refID)
+		txID, err := uuid.Parse(order.ReferenceID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "orden sin referencia valida"})
+			return
+		}
+
+		// Igual que en el webhook: el status COMPLETED de la orden no basta —
+		// se exige además que la transacción exista, que esta orden sea
+		// realmente la suya (ExternalID coincide) y que la captura/importe/
+		// divisa cobrados coincidan (ver payPalOrderMatchesTx). Sin esto, el
+		// parámetro ?token= de la URL de retorno (visible y manipulable por
+		// el propio cliente) podría usarse para intentar acreditar cualquier
+		// orden ajena que resultara tener status COMPLETED.
+		tx, err := db.GetPaymentTransaction(database, txID)
+		if err != nil {
+			slog.Error("PayPal return: transacción no encontrada", "txID", txID, "error", err)
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "transacción no encontrada"})
+			return
+		}
+		if tx.ExternalID != paypalToken || !payPalOrderMatchesTx(order, tx.AmountUSD) {
+			slog.Warn("PayPal return: la orden no corresponde a la transacción esperada, no se acredita",
+				"txID", txID, "orderID", paypalToken, "txExternalID", tx.ExternalID,
+				"orderAmount", order.AmountValue, "orderCurrency", order.CurrencyCode,
+				"captureStatus", order.CaptureStatus, "expectedUSD", tx.AmountUSD)
+			c.JSON(http.StatusOK, gin.H{"success": false, "error": "no se pudo verificar el pago, contacta soporte"})
 			return
 		}
 
@@ -571,6 +625,36 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 		slog.Info("NOWPayments webhook received", "body", string(body))
+
+		// La firma (x-nowpayments-sig, HMAC-SHA512 sobre el cuerpo con sus
+		// claves ordenadas — ver verifyNOWPaymentsSignature) se valida ANTES
+		// de registrar el evento como uno "a procesar". Una notificación sin
+		// firma válida no viene de NOWPayments — cualquiera podría forjar
+		// este POST — así que nunca debe poder convertirse en un trabajo de
+		// recuperación: RetryFailedWebhookEvents reprocesa TODO evento
+		// "nowpayments" sin resolver sin volver a exigir firma, así que
+		// dejar uno de estos a medias (o tratarlo igual que un evento
+		// legítimo) terminaría acreditando lo que diga un payment_id ajeno o
+		// inventado en cuanto pasara el margen de reintento.
+		sigHeader := c.GetHeader("x-nowpayments-sig")
+		if !verifyNOWPaymentsSignature(body, sigHeader) {
+			slog.Warn("NOWPayments webhook: firma inválida, se rechaza sin crear un trabajo de recuperación")
+			if eventID, err := db.LogWebhookEvent(database, "nowpayments", string(body)); err == nil {
+				// outcome que NO empieza con "error:" — GetUnresolvedWebhookEvents
+				// filtra exactamente por eso, así que esto queda marcado como
+				// resuelto para siempre y RetryFailedWebhookEvents nunca lo toma.
+				db.MarkWebhookEventProcessed(database, eventID, "rejected: invalid signature")
+			}
+			// 401, no 200: si esto fuera una notificación real de NOWPayments
+			// que falló por un secreto mal configurado de nuestro lado, su
+			// propio mecanismo de reintentos (ver "Recurrent payment
+			// notifications" en la documentación oficial) seguirá reintentando
+			// la entrega — mejor eso que responder 200 y perder la
+			// notificación hasta el aviso de 6h de ReconcilePendingPayments.
+			c.JSON(http.StatusUnauthorized, gin.H{"received": false, "error": "firma inválida"})
+			return
+		}
+
 		eventID, logged := logWebhookEventOrReject(c, database, "nowpayments", string(body))
 		if !logged { return }
 

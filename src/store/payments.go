@@ -7,14 +7,17 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/sha512"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +36,11 @@ type PaymentConfig struct {
 	PayPalClientSecret  string
 	PayPalMode          string // sandbox or live
 	NOWPaymentsAPIKey   string
+	// NOWPaymentsIPNSecret firma los callbacks IPN (header x-nowpayments-sig)
+	// — se genera aparte de NOWPaymentsAPIKey, en el dashboard de
+	// NOWPayments (Payment Settings → Instant Payment Notifications). Ver
+	// verifyNOWPaymentsSignature.
+	NOWPaymentsIPNSecret string
 	DLocalGoAPIKey      string
 	DLocalGoSecretKey   string
 	DLocalGoSandbox     bool
@@ -785,16 +793,31 @@ func createPayPalOrder(tx db.PaymentTransactionInput) (string, string, error) {
 	return approveURL, result.ID, nil
 }
 
+// payPalOrderDetails junta todo lo que hace falta para decidir con
+// confianza si una orden de PayPal realmente pagó lo que esperábamos — el
+// status de la orden por sí solo no alcanza: dice si el flujo de checkout
+// terminó, pero no confirma que la CAPTURA del dinero (el cobro real) haya
+// quedado completa, ni que el importe/divisa cobrados sean los que fijamos
+// al crear la orden.
+type payPalOrderDetails struct {
+	Status        string // status de la ORDEN: CREATED, APPROVED, COMPLETED, VOIDED, etc.
+	ReferenceID   string // nuestro propio txID, tal como lo fijamos al crear la orden
+	AmountValue   string // importe realmente capturado (o, a falta de captura, el autorizado)
+	CurrencyCode  string // divisa del importe de arriba
+	CaptureStatus string // status de la captura más reciente: COMPLETED, DECLINED, PENDING… ("" si aún no hay ninguna)
+}
+
 // getPayPalOrder consulta el estado real de una orden directamente en la API
 // de PayPal, usando nuestras propias credenciales. Nunca hay que confiar en el
 // contenido de un webhook o de un parámetro de la URL para decidir si un pago
 // se aprobó — cualquiera podría forjar esa llamada. Esta es la única fuente de
-// verdad: si PayPal dice que la orden está COMPLETED y a qué reference_id
-// (nuestro txID) pertenece, recién ahí se acredita el pago.
-func getPayPalOrder(orderID string) (status, referenceID string, err error) {
+// verdad: si PayPal dice que la orden está COMPLETED, con una captura
+// COMPLETED y por el importe/divisa correctos, y a qué reference_id (nuestro
+// txID) pertenece, recién ahí se acredita el pago (ver payPalOrderMatchesTx).
+func getPayPalOrder(orderID string) (payPalOrderDetails, error) {
 	token, err := getPayPalAccessToken()
 	if err != nil {
-		return "", "", err
+		return payPalOrderDetails{}, err
 	}
 
 	baseURL := "https://api-m.sandbox.paypal.com"
@@ -807,34 +830,95 @@ func getPayPalOrder(orderID string) (status, referenceID string, err error) {
 	// esta función) — nunca se interpola crudo en la URL.
 	req, err := http.NewRequest("GET", baseURL+"/v2/checkout/orders/"+url.PathEscape(orderID), nil)
 	if err != nil {
-		return "", "", fmt.Errorf("PayPal: orderID inválido: %w", err)
+		return payPalOrderDetails{}, fmt.Errorf("PayPal: orderID inválido: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("PayPal order query failed: %w", err)
+		return payPalOrderDetails{}, fmt.Errorf("PayPal order query failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", "", fmt.Errorf("PayPal order query error %d: %s", resp.StatusCode, string(respBody))
+		return payPalOrderDetails{}, fmt.Errorf("PayPal order query error %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
 		Status        string `json:"status"`
 		PurchaseUnits []struct {
 			ReferenceID string `json:"reference_id"`
+			Amount      struct {
+				Value        string `json:"value"`
+				CurrencyCode string `json:"currency_code"`
+			} `json:"amount"`
+			Payments struct {
+				Captures []struct {
+					Status string `json:"status"`
+					Amount struct {
+						Value        string `json:"value"`
+						CurrencyCode string `json:"currency_code"`
+					} `json:"amount"`
+				} `json:"captures"`
+			} `json:"payments"`
 		} `json:"purchase_units"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", "", fmt.Errorf("PayPal: respuesta de orden inesperada: %s", string(respBody))
+		return payPalOrderDetails{}, fmt.Errorf("PayPal: respuesta de orden inesperada: %s", string(respBody))
 	}
+
+	details := payPalOrderDetails{Status: result.Status}
 	if len(result.PurchaseUnits) == 0 {
-		return result.Status, "", nil
+		return details, nil
 	}
-	return result.Status, result.PurchaseUnits[0].ReferenceID, nil
+	pu := result.PurchaseUnits[0]
+	details.ReferenceID = pu.ReferenceID
+	details.AmountValue = pu.Amount.Value
+	details.CurrencyCode = pu.Amount.CurrencyCode
+	if n := len(pu.Payments.Captures); n > 0 {
+		// La más reciente es la que manda si hubo más de un intento de
+		// captura (no debería pasar en nuestro flujo de intent=CAPTURE, pero
+		// no cuesta nada ser explícitos sobre cuál se usa).
+		cap := pu.Payments.Captures[n-1]
+		details.CaptureStatus = cap.Status
+		// El importe de la CAPTURA es lo que PayPal realmente cobró — más
+		// confiable que el importe autorizado en la orden, que es lo único
+		// que queda si todavía no hay ninguna captura.
+		if cap.Amount.Value != "" {
+			details.AmountValue = cap.Amount.Value
+			details.CurrencyCode = cap.Amount.CurrencyCode
+		}
+	}
+	return details, nil
+}
+
+// payPalOrderMatchesTx es el chequeo final antes de acreditar KC por un pago
+// de PayPal: no alcanza con que la ORDEN diga COMPLETED (ver
+// payPalOrderDetails) — hace falta además que exista una captura realmente
+// COMPLETED (no DECLINED, PENDING, REFUNDED, etc.) y que el importe/divisa
+// que PayPal dice haber cobrado coincidan con lo que esta transacción
+// esperaba cobrar. Sin esto, un status "COMPLETED" a nivel de orden podía
+// tomarse como aprobación aunque la captura real hubiera fallado o el
+// importe cobrado no fuera el esperado.
+func payPalOrderMatchesTx(order payPalOrderDetails, expectedUSD float64) bool {
+	if order.Status != "COMPLETED" {
+		return false
+	}
+	if order.CaptureStatus != "COMPLETED" {
+		return false
+	}
+	if order.CurrencyCode != "USD" {
+		return false
+	}
+	amount, err := strconv.ParseFloat(order.AmountValue, 64)
+	if err != nil {
+		return false
+	}
+	// Margen de un centavo para tolerar redondeo de punto flotante entre lo
+	// que calculamos al crear la orden (fmt.Sprintf("%.2f", …)) y lo que
+	// PayPal devuelve como string — nunca para tolerar un importe distinto.
+	return math.Abs(amount-expectedUSD) < 0.01
 }
 
 func capturePayPalOrder(orderID string) error {
@@ -1081,4 +1165,84 @@ func verifyDLocalGoSignature(rawBody []byte, signatureHeader string) bool {
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
 
 	return hmac.Equal([]byte(receivedSig), []byte(expectedSig))
+}
+
+// sortJSONForNOWPaymentsSignature reordena alfabéticamente (de forma
+// recursiva, en todos los niveles) las claves del JSON crudo de un IPN de
+// NOWPayments, y lo vuelve a serializar de forma compacta — el mismo paso
+// de "sort object keys recursively + JSON.stringify" que describen los
+// ejemplos oficiales en Node.js/PHP/Python. Separada de
+// verifyNOWPaymentsSignature para poder probarla por sí sola con casos
+// conocidos (incluyendo el ejemplo de la propia documentación).
+func sortJSONForNOWPaymentsSignature(rawBody []byte) ([]byte, error) {
+	// UseNumber() evita decodificar los números como float64 — eso
+	// redondearía enteros grandes y podría reformatear decimales al volver
+	// a serializar, produciendo bytes distintos de los que NOWPayments usó
+	// para firmar. json.Number preserva el literal exacto tal como llegó.
+	var parsed interface{}
+	dec := json.NewDecoder(bytes.NewReader(rawBody))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("NOWPayments: cuerpo del IPN no es JSON válido: %w", err)
+	}
+
+	// encoding/json ordena alfabéticamente las claves de cualquier
+	// map[string]any al serializarlo, en TODOS los niveles de anidamiento
+	// (recursivo por construcción, porque cada objeto anidado se serializa
+	// con la misma regla) — exactamente el "sort object keys recursively"
+	// que piden los ejemplos oficiales, sin necesidad de implementarlo a mano.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	// Por default, Marshal/Encoder escapan '<', '>' y '&' como <, etc.
+	// — JSON.stringify/json_encode/json.dumps (los lenguajes de los
+	// ejemplos oficiales de NOWPayments) no lo hacen. Si algún campo del
+	// pedido (p. ej. order_description) tuviera alguno de esos caracteres,
+	// dejar el escape por defecto activado produciría una firma distinta a
+	// la que NOWPayments calculó.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(parsed); err != nil {
+		return nil, fmt.Errorf("NOWPayments: error re-serializando el cuerpo ordenado: %w", err)
+	}
+	// Encoder.Encode agrega un '\n' final que JSON.stringify no tiene.
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// verifyNOWPaymentsSignature valida la firma HMAC-SHA512 de un IPN de
+// NOWPayments siguiendo su documentación oficial
+// (https://nowpayments.zendesk.com/hc/en-us/articles/21395546303389):
+// las claves del cuerpo recibido se ordenan alfabéticamente en todos los
+// niveles, el resultado se firma con HMAC-SHA512 usando el IPN secret key
+// (una clave DISTINTA de la API key, generada aparte en el dashboard de
+// NOWPayments), y esa firma debe coincidir con el header x-nowpayments-sig.
+// Sin esto, cualquiera podía mandar un POST fabricado a
+// /store/webhook/nowpayments haciéndose pasar por una notificación real —
+// el handler solo consultaba el estado real del pago DESPUÉS de aceptar
+// cualquier payment_id que viniera en el cuerpo, así que un atacante que
+// conociera o adivinara el payment_id de un pago pendiente ajeno podía
+// forzar que se reconsultara (sin poder alterar el resultado real, gracias
+// a processNOWPaymentsPaymentID), pero sí podía generar ruido/reintentos
+// arbitrarios y saturar webhook_events con eventos falsos.
+func verifyNOWPaymentsSignature(rawBody []byte, sigHeader string) bool {
+	// Sin secreto configurado no hay nada contra qué comparar — mejor
+	// rechazar todo explícitamente que aceptar cualquier cosa sin firma.
+	if paymentCfg.NOWPaymentsIPNSecret == "" {
+		return false
+	}
+	if sigHeader == "" {
+		return false
+	}
+
+	sortedJSON, err := sortJSONForNOWPaymentsSignature(rawBody)
+	if err != nil {
+		return false
+	}
+
+	mac := hmac.New(sha512.New, []byte(paymentCfg.NOWPaymentsIPNSecret))
+	mac.Write(sortedJSON)
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+	// NOWPayments manda el hex en minúsculas; se normaliza por si acaso para
+	// no rechazar por una diferencia de mayúsculas/minúsculas que no afecta
+	// la validez criptográfica de la firma.
+	return hmac.Equal([]byte(strings.ToLower(sigHeader)), []byte(expectedSig))
 }

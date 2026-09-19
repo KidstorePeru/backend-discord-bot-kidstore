@@ -749,33 +749,68 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 
 	// (El pedido ya quedó marcado "processing" al reclamarlo en ClaimPendingOrders.)
 
-	// Obtener el Epic account ID del receptor (igual para todos los bots, basta con uno)
+	// Obtener el Epic account ID del receptor (igual para todos los bots, basta con uno).
+	// Antes, el primer error de CUALQUIER bot (token vencido, límite de
+	// solicitudes, Epic caído, un fallo de red) se trataba igual que un 404
+	// real de Epic: cancelaba el pedido de inmediato diciéndole al cliente
+	// que su usuario podía estar mal escrito, sin siquiera probar otro bot.
+	// Ahora se prueban todos los bots disponibles, y solo un
+	// fortnite.ErrEpicUserNotFound (404 real de Epic) se toma como
+	// confirmación de que el usuario no existe — cualquier otro fallo es
+	// temporal y no dice nada sobre si el usuario existe o no.
 	var receiverAccountID string
+	userConfirmedNotFound := false
 	for i := range accounts {
 		if accounts[i].RemainingGifts <= 0 { continue }
 		id, err := fortnite.GetReceiverAccountID(database, accounts[i], order.EpicUsername)
 		if err != nil {
-			errMsg := fmt.Sprintf("no se encontró el usuario Epic '%s': %s", order.EpicUsername, err.Error())
-			slog.Error("Worker: usuario no encontrado", "orderID", order.ID, "msg", errMsg)
-			failOrderAndRefund(database, order, errMsg, fmt.Sprintf("No pudimos encontrar la cuenta de Epic Games '%s'. Verifica que el usuario esté bien escrito.", order.EpicUsername))
-			return
+			if errors.Is(err, fortnite.ErrEpicUserNotFound) {
+				// Concluyente: no depende de qué bot preguntó, así que no hace
+				// falta seguir probando los demás.
+				userConfirmedNotFound = true
+				break
+			}
+			slog.Warn("Worker: no se pudo verificar el usuario Epic con este bot, probando el siguiente",
+				"orderID", order.ID, "bot", accounts[i].DisplayName, "error", err)
+			continue
 		}
 		receiverAccountID = id
 		break
 	}
 
-	// Defensive: receiverAccountID must be set at this point (loop above either sets
-	// it or returns early on error). Guard against unexpected empty string.
-	if receiverAccountID == "" {
-		noSlotsMsg := "no se pudo resolver el ID de la cuenta Epic del receptor"
-		slog.Error("Worker: receiverAccountID vacío inesperadamente", "orderID", order.ID)
-		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noSlotsMsg)
+	if userConfirmedNotFound {
+		errMsg := fmt.Sprintf("Epic confirmó (404) que el usuario '%s' no existe", order.EpicUsername)
+		slog.Error("Worker: usuario Epic no encontrado, confirmado por Epic", "orderID", order.ID)
+		failOrderAndRefund(database, order, errMsg, fmt.Sprintf("No pudimos encontrar la cuenta de Epic Games '%s'. Verifica que el usuario esté bien escrito.", order.EpicUsername))
 		return
 	}
 
-	// Contadores para determinar el resultado final si todos los bots fallan
+	if receiverAccountID == "" {
+		// Ningún bot pudo confirmar NI descartar al usuario — todos los
+		// intentos fallaron por motivos temporales (token, límite de
+		// solicitudes, Epic caído, red). Nunca se cancela el pedido ni se le
+		// dice al cliente que su usuario está mal escrito por algo que no se
+		// pudo verificar: se deja pendiente para que el próximo ciclo del
+		// worker lo reintente.
+		pendingMsg := "No pudimos verificar tu usuario de Epic por un problema temporal, reintentando automáticamente."
+		slog.Warn("Worker: no se pudo resolver el usuario Epic con ningún bot disponible (fallos temporales), se reintenta", "orderID", order.ID)
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, &pendingMsg)
+		return
+	}
+
+	// Contadores para determinar el resultado final si todos los bots fallan.
+	// notFriendBots solo cuenta bots que CONFIRMARON (sin error) que el
+	// receptor no es su amigo — friendCheckErrorBots cuenta los que no
+	// pudieron ni confirmar ni descartarlo (token del bot, límite de
+	// solicitudes, Epic caído, fallo de red). Antes ambos casos sumaban al
+	// mismo contador, así que si todos los bots activos fallaban por un
+	// problema temporal (nunca llegaban a consultar la amistad de verdad),
+	// se concluía igual "no es amigo de ningún bot" y se cancelaba el pedido
+	// pidiéndole al cliente que agregue al bot — sin haber podido verificar
+	// nada.
 	activeBots := 0
 	notFriendBots := 0
+	friendCheckErrorBots := 0
 	anyGiftLimit := false
 	insufficientFundsBots := 0
 
@@ -796,10 +831,17 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		}
 		activeBots++
 
-		// Verificar amistad con este bot
+		// Verificar amistad con este bot — err != nil significa que no se
+		// pudo verificar (nunca que se confirmó que no son amigos).
 		isFriend, friendSince, err := fortnite.CheckFriendship(database, *bot, receiverAccountID)
-		if err != nil || !isFriend {
-			slog.Info("Worker: usuario no es amigo del bot, probando siguiente",
+		if err != nil {
+			slog.Warn("Worker: no se pudo verificar la amistad con este bot, probando el siguiente",
+				"bot", bot.DisplayName, "user", order.EpicUsername, "error", err)
+			friendCheckErrorBots++
+			continue // probar siguiente bot
+		}
+		if !isFriend {
+			slog.Info("Worker: usuario confirmado que no es amigo del bot, probando siguiente",
 				"bot", bot.DisplayName, "user", order.EpicUsername)
 			notFriendBots++
 			continue // probar siguiente bot
@@ -1028,38 +1070,49 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		return
 	}
 
-	// Todos los bots probados sin éxito — determinar resultado final
-	if anyGiftLimit {
+	// Todos los bots probados sin éxito — determinar resultado final. La
+	// decisión en sí (decideFinalOrderOutcome) es una función pura para
+	// poder cubrirla con pruebas de tabla simples: es justo la parte que
+	// decide si se cancela el pedido o se reintenta, y un error ahí (como el
+	// que motivó este arreglo) tiene consecuencias reales para el cliente.
+	switch decideFinalOrderOutcome(anyGiftLimit, activeBots, notFriendBots, friendCheckErrorBots, insufficientFundsBots, time.Since(order.CreatedAt)) {
+	case outcomeGiftLimitPending:
 		// Algún bot alcanzó el límite diario → mantener pending (se resetea al día siguiente)
 		noSlotsMsg := "Todas las cuentas bot han agotado sus envíos del día. Los gifts se resetean diariamente."
 		slog.Warn("Worker: todos los bots agotaron límite de gifts", "orderID", order.ID)
 		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noSlotsMsg)
-	} else if activeBots > 0 && notFriendBots == activeBots {
-		// El receptor no es amigo de ningún bot. El flujo pensado es
-		// "agrega al bot, después compra" — pero nada impide comprar
-		// primero, y este mismo chequeo (sin distinción) también se
-		// cumple para un cliente que compró hace 10 segundos y todavía
-		// no tuvo tiempo de agregar al bot en Epic Games, o cuyo pedido
-		// de amistad ya está mandado pero el aceptador automático
-		// (corre cada 5 min, ver StartFriendRequestAcceptor en main.go)
-		// todavía no pasó por él. Antes esto se reembolsaba de inmediato
-		// (el worker corre cada 30s) sin darle a un cliente legítimo
-		// ninguna chance real de agregar al bot a tiempo. Ahora se da un
-		// margen de gracia: recién se reembolsa si el pedido lleva más
-		// de friendGracePeriod sin encontrar amistad con ningún bot —
-		// tiempo de sobra para que pase al menos un ciclo del aceptador
-		// automático, incluso si el cliente todavía no había agregado a
-		// nadie en el momento de comprar.
-		if time.Since(order.CreatedAt) < friendGracePeriod {
-			pendingMsg := "Esperando a que agregues alguno de nuestros bots como amigo en Fortnite."
-			slog.Info("Worker: usuario aún no es amigo de ningún bot, dentro del margen de gracia", "orderID", order.ID, "edad", time.Since(order.CreatedAt))
-			db.UpdateOrderStatus(database, order.ID, "pending", nil, &pendingMsg)
-			return
-		}
+
+	case outcomeFriendshipUnverifiedPending:
+		// Al menos un bot activo no pudo verificar la amistad (y ninguno la
+		// confirmó) — nunca se concluye "no es amigo de ningún bot" ni se le
+		// pide al cliente que agregue al bot por algo que no se pudo
+		// comprobar. Se deja pending, sin margen de gracia especial: el
+		// próximo ciclo del worker (cada 30s) vuelve a intentar la
+		// verificación real.
+		pendingMsg := "No pudimos verificar tu amistad con nuestros bots por un problema temporal, reintentando automáticamente."
+		slog.Warn("Worker: no se pudo verificar la amistad con ningún bot activo (fallos temporales), se reintenta",
+			"orderID", order.ID, "bots_sin_verificar", friendCheckErrorBots, "bots_no_amigos_confirmados", notFriendBots)
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, &pendingMsg)
+
+	case outcomeNotFriendGracePeriod:
+		// El receptor no es amigo de ningún bot, pero el pedido todavía está
+		// dentro del margen de gracia (ver friendGracePeriod) — tiempo de
+		// sobra para que pase al menos un ciclo del aceptador automático de
+		// solicitudes de amistad, incluso si el cliente todavía no había
+		// agregado a nadie en el momento de comprar.
+		pendingMsg := "Esperando a que agregues alguno de nuestros bots como amigo en Fortnite."
+		slog.Info("Worker: usuario aún no es amigo de ningún bot, dentro del margen de gracia", "orderID", order.ID, "edad", time.Since(order.CreatedAt))
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, &pendingMsg)
+
+	case outcomeNotFriendCancel:
+		// El receptor no es amigo de ningún bot, CONFIRMADO por Epic para
+		// cada uno (sin errores de verificación) y ya fuera del margen de
+		// gracia — recién acá se cancela y reembolsa.
 		errMsg := fmt.Sprintf("el usuario '%s' no está en la lista de amigos de ningún bot disponible", order.EpicUsername)
 		slog.Error("Worker: usuario no es amigo de ningún bot tras el margen de gracia", "orderID", order.ID)
 		failOrderAndRefund(database, order, errMsg, "Tu cuenta de Epic Games no es amiga de ninguno de nuestros bots todavía. Agrega alguno desde la página de Bots y vuelve a intentar tu compra.")
-	} else if activeBots == 0 && insufficientFundsBots > 0 {
+
+	case outcomeNoFundsPending:
 		// Ningún bot con slots tenía V-Bucks suficientes para este pedido en
 		// particular — no es que no haya bots, es que ninguno tiene fondos
 		// para ESTE monto. Se avisa (con el mismo cooldown que "sin bots
@@ -1069,9 +1122,48 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 		slog.Warn("Worker: ningún bot con fondos suficientes", "orderID", order.ID, "necesita", order.PriceVBucks)
 		discordbot.AlertNoActiveBots(1)
 		db.UpdateOrderStatus(database, order.ID, "pending", nil, &noFundsMsg)
-	} else {
-		// Otro motivo (ej: amistad reciente en todos los bots) → mantener pending
+
+	default: // outcomeGenericPending (ej: amistad reciente en todos los bots)
 		slog.Warn("Worker: ningún bot pudo enviar el regalo en este ciclo, reintentando", "orderID", order.ID)
 		db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
+	}
+}
+
+// orderFinalOutcome resume qué hacer con un pedido cuando ningún bot pudo
+// enviar el regalo en este ciclo.
+type orderFinalOutcome int
+
+const (
+	outcomeGiftLimitPending orderFinalOutcome = iota
+	outcomeFriendshipUnverifiedPending
+	outcomeNotFriendGracePeriod
+	outcomeNotFriendCancel
+	outcomeNoFundsPending
+	outcomeGenericPending
+)
+
+// decideFinalOrderOutcome es la parte pura (sin red ni base de datos) de la
+// decisión de processOrder cuando todos los bots fallaron — separada
+// justamente para poder probar con una tabla simple el punto 3 del pedido
+// de correcciones: friendCheckErrorBots (bots cuya amistad NO se pudo
+// verificar) nunca debe poder producir outcomeNotFriendCancel, ni siquiera
+// mezclado con bots que sí confirmaron que no son amigos. Solo cuando TODOS
+// los bots activos confirmaron (sin ningún error) que el receptor no es su
+// amigo se considera esa vía.
+func decideFinalOrderOutcome(anyGiftLimit bool, activeBots, notFriendBots, friendCheckErrorBots, insufficientFundsBots int, orderAge time.Duration) orderFinalOutcome {
+	switch {
+	case anyGiftLimit:
+		return outcomeGiftLimitPending
+	case activeBots > 0 && friendCheckErrorBots > 0 && notFriendBots+friendCheckErrorBots == activeBots:
+		return outcomeFriendshipUnverifiedPending
+	case activeBots > 0 && notFriendBots == activeBots:
+		if orderAge < friendGracePeriod {
+			return outcomeNotFriendGracePeriod
+		}
+		return outcomeNotFriendCancel
+	case activeBots == 0 && insufficientFundsBots > 0:
+		return outcomeNoFundsPending
+	default:
+		return outcomeGenericPending
 	}
 }

@@ -170,3 +170,94 @@ func TestSendGift_ConexionRechazadaEsIncierta(t *testing.T) {
 		t.Errorf("un fallo de conexión (nadie responde) debe tratarse como resultado incierto, obtuve: %v", err)
 	}
 }
+
+// Pruebas de regresión para GetReceiverAccountID — cubren el punto 3 del
+// pedido de correcciones: un 404 real de Epic es la ÚNICA señal válida de
+// que el usuario no existe. Antes, CUALQUIER fallo (token del bot
+// rechazado, límite de solicitudes, el servicio de Epic caído, o un fallo
+// de red) se reportaba exactamente igual que un 404, y el worker cancelaba
+// el pedido diciéndole al cliente que su usuario podía estar mal escrito
+// por un problema que en realidad era nuestro o de Epic.
+
+func withMockEpicAccount(t *testing.T, handler http.HandlerFunc) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	prev := epicAccountBaseURL
+	epicAccountBaseURL = server.URL
+	t.Cleanup(func() { epicAccountBaseURL = prev })
+}
+
+func TestGetReceiverAccountID_404EsConfirmado(t *testing.T) {
+	withMockEpicAccount(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"errorCode":"errors.com.epicgames.account.account_not_found"}`))
+	})
+
+	_, err := GetReceiverAccountID(nil, newTestAccount(), "usuario_inexistente")
+	if !errors.Is(err, ErrEpicUserNotFound) {
+		t.Errorf("un 404 real de Epic debe mapear a ErrEpicUserNotFound, obtuve: %v", err)
+	}
+}
+
+func TestGetReceiverAccountID_200Encuentra(t *testing.T) {
+	withMockEpicAccount(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"abc123","displayName":"alguien"}`))
+	})
+
+	id, err := GetReceiverAccountID(nil, newTestAccount(), "alguien")
+	if err != nil {
+		t.Fatalf("una respuesta 200 no debería producir error, obtuve: %v", err)
+	}
+	if id != "abc123" {
+		t.Errorf("GetReceiverAccountID = %q, want %q", id, "abc123")
+	}
+}
+
+// Nota: un 401/403 del bot dispara, dentro de executeWithRefresh, el flujo
+// normal de auto-refresco de token (ya cubierto por sus propias pruebas) —
+// acá se prueban códigos que NO disparan ese flujo, para aislar
+// específicamente la clasificación de GetReceiverAccountID.
+
+func TestGetReceiverAccountID_429NuncaEsNotFound(t *testing.T) {
+	withMockEpicAccount(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+
+	_, err := GetReceiverAccountID(nil, newTestAccount(), "alguien")
+	if err == nil {
+		t.Fatal("se esperaba un error")
+	}
+	if errors.Is(err, ErrEpicUserNotFound) {
+		t.Error("un 429 (límite de solicitudes) NUNCA debe reportarse como 'usuario no encontrado'")
+	}
+}
+
+func TestGetReceiverAccountID_503NuncaEsNotFound(t *testing.T) {
+	withMockEpicAccount(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+
+	_, err := GetReceiverAccountID(nil, newTestAccount(), "alguien")
+	if err == nil {
+		t.Fatal("se esperaba un error")
+	}
+	if errors.Is(err, ErrEpicUserNotFound) {
+		t.Error("un 503 (servicio de Epic caído) NUNCA debe reportarse como 'usuario no encontrado'")
+	}
+}
+
+func TestGetReceiverAccountID_FalloDeConexionNuncaEsNotFound(t *testing.T) {
+	prev := epicAccountBaseURL
+	epicAccountBaseURL = "http://127.0.0.1:1" // puerto reservado, nadie escucha ahí
+	defer func() { epicAccountBaseURL = prev }()
+
+	_, err := GetReceiverAccountID(nil, newTestAccount(), "alguien")
+	if err == nil {
+		t.Fatal("se esperaba un error")
+	}
+	if errors.Is(err, ErrEpicUserNotFound) {
+		t.Error("un fallo de conexión NUNCA debe reportarse como 'usuario no encontrado'")
+	}
+}

@@ -47,6 +47,19 @@ var ErrAlreadyOwned = errors.New("el cliente ya tiene este item")
 // asumiendo que no hubo entrega.
 var ErrRequestUncertain = errors.New("epic: fallo de transporte, resultado del request incierto")
 
+// ErrEpicUserNotFound se devuelve ÚNICAMENTE cuando Epic Games responde con
+// un 404 explícito a la búsqueda de un displayName — la única señal real de
+// que la cuenta no existe. Antes GetReceiverAccountID trataba CUALQUIER
+// fallo (token del bot vencido/rechazado con 401/403, límite de solicitudes
+// con 429, el servicio de Epic caído con 5xx, o un fallo de transporte) de
+// la misma forma que un 404 genuino, y processOrder cancelaba el pedido
+// diciéndole al cliente que su usuario podía estar mal escrito — un
+// problema nuestro o de Epic terminaba culpando al cliente por algo que ni
+// siquiera se llegó a verificar. Los llamadores deben distinguir este error
+// (con errors.Is) de cualquier otro antes de concluir que el usuario no
+// existe.
+var ErrEpicUserNotFound = errors.New("epic: cuenta no encontrada")
+
 // ==================== CONSTANTS ====================
 
 var epicClient string
@@ -58,6 +71,12 @@ var encryptionKey string
 // redirigirlo a un httptest.Server que simule respuestas ambiguas (504,
 // conexión cortada a mitad de la respuesta) sin llamar a Epic de verdad.
 var mcpGiftCatalogBaseURL = "https://fngw-mcp-gc-livefn.ol.epicgames.com"
+
+// epicAccountBaseURL apunta al servicio real de cuentas de Epic — variable
+// por el mismo motivo que mcpGiftCatalogBaseURL: permite que las pruebas de
+// GetReceiverAccountID simulen un 404 real, un 401/429/5xx, o un fallo de
+// transporte, sin llamar a Epic de verdad.
+var epicAccountBaseURL = "https://account-public-service-prod.ol.epicgames.com"
 
 func Init(client, secret, encKey string) {
 	epicClient = client
@@ -587,7 +606,7 @@ func GetReceiverAccountID(database *sql.DB, account types.GameAccount, displayNa
 	// dejaría req en nil y tumbaría el proceso más abajo) como que termine
 	// apuntando a otra ruta de la API de Epic por accidente.
 	req, err := http.NewRequest("GET",
-		"https://account-public-service-prod.ol.epicgames.com/account/api/public/account/displayName/"+url.PathEscape(displayName),
+		epicAccountBaseURL+"/account/api/public/account/displayName/"+url.PathEscape(displayName),
 		nil)
 	if err != nil {
 		return "", fmt.Errorf("usuario Epic inválido: %w", err)
@@ -595,12 +614,22 @@ func GetReceiverAccountID(database *sql.DB, account types.GameAccount, displayNa
 
 	resp, _, err := executeWithRefresh(database, account, req)
 	if err != nil {
-		return "", fmt.Errorf("error buscando usuario Epic: %w", err)
+		// Fallo de transporte o de refresco de token del bot — no hay ninguna
+		// respuesta de Epic que confirme ni descarte la existencia del usuario.
+		return "", fmt.Errorf("error buscando usuario Epic con el bot %s: %w", account.DisplayName, err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == 404 {
+		// El único caso en que Epic confirma, de forma explícita, que el
+		// displayName no corresponde a ninguna cuenta.
+		return "", fmt.Errorf("%w: '%s'", ErrEpicUserNotFound, displayName)
+	}
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("usuario Epic '%s' no encontrado", displayName)
+		// 401/403 (token de ESTE bot inválido o rechazado), 429 (límite de
+		// solicitudes) o 5xx (servicio de Epic caído) — ninguno de estos
+		// confirma que el usuario no exista, así que nunca se reporta como tal.
+		return "", fmt.Errorf("epic: error consultando usuario con el bot %s (status %d)", account.DisplayName, resp.StatusCode)
 	}
 
 	var result types.EpicPublicAccount
