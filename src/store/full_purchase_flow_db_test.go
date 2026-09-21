@@ -149,6 +149,44 @@ func kcBalance(t *testing.T, conn *sql.DB, custID uuid.UUID) int {
 	return balance
 }
 
+// insertBotAccount persiste el bot en game_accounts (no solo en memoria) —
+// necesario porque db.DecrementRemainingGifts / db.DeductBotVbucks (llamadas
+// por processOrder en su rama de éxito) son UPDATEs directos contra esa
+// tabla por id: sin esta fila, esos UPDATE afectan cero filas y el
+// descuento real nunca ocurre, aunque el struct en memoria que se le pasa a
+// processOrder sí muestre RemainingGifts/VBucks actualizados (ver el
+// bot.RemainingGifts-- y bot.VBucks-= en shop.go, que son aparte de la
+// escritura en base). access_token/refresh_token van en texto plano (no por
+// crypto.Encrypt, a diferencia de db.UpsertGameAccount) porque esta prueba
+// nunca los relee desde la base — GetReceiverAccountID/CheckFriendship/
+// SendGift reciben el *types.GameAccount ya armado en memoria por el test,
+// con su AccessToken en claro, y lo mandan tal cual al servidor Epic
+// simulado.
+func insertBotAccount(t *testing.T, conn *sql.DB, bot types.GameAccount) {
+	t.Helper()
+	if _, err := conn.Exec(`
+		INSERT INTO game_accounts (id, display_name, remaining_gifts, vbucks,
+			access_token, access_token_exp_date, refresh_token, refresh_token_exp_date,
+			is_active, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,'refresh-test',$6,true,NOW(),NOW())`,
+		bot.ID, bot.DisplayName, bot.RemainingGifts, bot.VBucks, bot.AccessToken, bot.AccessTokenExpDate); err != nil {
+		t.Fatalf("insert game_accounts: %v", err)
+	}
+	t.Cleanup(func() { conn.Exec(`DELETE FROM game_accounts WHERE id=$1`, bot.ID) })
+}
+
+// botAccountState lee remaining_gifts/vbucks directo de game_accounts — la
+// misma fuente de verdad que db.DecrementRemainingGifts/db.DeductBotVbucks
+// escriben, nunca el struct en memoria (que solo refleja lo que el propio
+// processOrder ASUME que escribió, no lo que realmente quedó grabado).
+func botAccountState(t *testing.T, conn *sql.DB, botID uuid.UUID) (remainingGifts, vbucks int) {
+	t.Helper()
+	if err := conn.QueryRow(`SELECT remaining_gifts, vbucks FROM game_accounts WHERE id=$1`, botID).Scan(&remainingGifts, &vbucks); err != nil {
+		t.Fatalf("no se pudo leer el estado del bot: %v", err)
+	}
+	return
+}
+
 // TestFullPurchaseFlow_EntregaExitosa cubre el recorrido feliz completo:
 // pago aprobado (800 KC) → compra de un ítem (500 KC) → el worker reclama
 // el pedido → un bot amigo (con fondos, cupos y más de 48h de amistad)
@@ -182,6 +220,7 @@ func TestFullPurchaseFlow_EntregaExitosa(t *testing.T) {
 		RemainingGifts: 5, VBucks: 999999,
 		AccessToken: "tok", AccessTokenExpDate: time.Now().Add(24 * time.Hour),
 	}
+	insertBotAccount(t, conn, bot)
 	botIDClean := strings.ReplaceAll(bot.ID.String(), "-", "")
 
 	server := epicMockServer(t, receiverAccountID, botIDClean, func(w http.ResponseWriter, r *http.Request) {
@@ -205,6 +244,41 @@ func TestFullPurchaseFlow_EntregaExitosa(t *testing.T) {
 	}
 	if got := kcBalance(t, conn, custID); got != 300 {
 		t.Errorf("una entrega exitosa no debe tocar el balance (sigue en 300), obtuve %d", got)
+	}
+
+	// El bot arrancó con 5 cupos y 999999 V-Bucks; esta entrega (item de
+	// 500 V-Bucks) debe descontar EXACTAMENTE 1 cupo y 500 V-Bucks en la
+	// fila real de game_accounts — no en el struct en memoria (ver
+	// botAccountState).
+	gifts, vbucks := botAccountState(t, conn, bot.ID)
+	if gifts != 4 {
+		t.Errorf("tras una entrega exitosa el bot debería tener 4 cupos restantes (5-1), obtuve %d", gifts)
+	}
+	if vbucks != 999999-500 {
+		t.Errorf("tras una entrega exitosa el bot debería tener %d V-Bucks (999999-500), obtuve %d", 999999-500, vbucks)
+	}
+
+	// ── Sin descuentos duplicados al reintentar ──
+	// El pedido ya quedó 'sent' (arriba). El mismo mecanismo real que evita
+	// un reenvío — la cláusula WHERE de db.ClaimPendingOrders, que solo
+	// reclama pedidos 'pending' o 'processing' atascados hace más de 15
+	// minutos — debe negarse a reclamarlo de nuevo aunque se llame otra vez
+	// (por ejemplo, tras reiniciar el worker). Sin ese reclamo no hay
+	// segunda llamada a processOrder, así que el bot no puede perder un
+	// segundo cupo/V-Bucks por el mismo pedido ya entregado.
+	reclaimed, err := db.ClaimPendingOrders(conn)
+	if err != nil {
+		t.Fatalf("ClaimPendingOrders (reintento): %v", err)
+	}
+	for _, o := range reclaimed {
+		if o.ID == order.ID {
+			t.Fatalf("un pedido ya 'sent' no debería poder reclamarse de nuevo (reintento)")
+		}
+	}
+	giftsAfterRetry, vbucksAfterRetry := botAccountState(t, conn, bot.ID)
+	if giftsAfterRetry != gifts || vbucksAfterRetry != vbucks {
+		t.Errorf("un reintento sobre un pedido ya entregado no debe volver a descontar cupos/V-Bucks: antes=(%d,%d) después=(%d,%d)",
+			gifts, vbucks, giftsAfterRetry, vbucksAfterRetry)
 	}
 }
 
