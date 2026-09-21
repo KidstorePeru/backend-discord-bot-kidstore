@@ -66,17 +66,17 @@ var epicClient string
 var epicSecret string
 var encryptionKey string
 
-// mcpGiftCatalogBaseURL apunta al servicio real de Epic — variable (en vez
+// McpGiftCatalogBaseURL apunta al servicio real de Epic — variable (en vez
 // de un literal embebido en la URL) para que las pruebas puedan
 // redirigirlo a un httptest.Server que simule respuestas ambiguas (504,
 // conexión cortada a mitad de la respuesta) sin llamar a Epic de verdad.
-var mcpGiftCatalogBaseURL = "https://fngw-mcp-gc-livefn.ol.epicgames.com"
+var McpGiftCatalogBaseURL = "https://fngw-mcp-gc-livefn.ol.epicgames.com"
 
 // EpicAccountBaseURL apunta al servicio real de cuentas de Epic — variable
-// por el mismo motivo que mcpGiftCatalogBaseURL: permite que las pruebas de
+// por el mismo motivo que McpGiftCatalogBaseURL: permite que las pruebas de
 // GetReceiverAccountID simulen un 404 real, un 401/429/5xx, o un fallo de
 // transporte, sin llamar a Epic de verdad. Exportada (a diferencia de
-// mcpGiftCatalogBaseURL) para que las pruebas de integración de
+// McpGiftCatalogBaseURL) para que las pruebas de integración de
 // processOrder en el paquete "store" —que ejercitan el recorrido real de
 // selección de bots, no solo la función de decisión final— también puedan
 // redirigirla a su propio servidor simulado.
@@ -784,7 +784,7 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 	}
 
 	req, _ := http.NewRequest("POST",
-		fmt.Sprintf("%s/fortnite/api/game/v2/profile/%s/client/GiftCatalogEntry?profileId=common_core", mcpGiftCatalogBaseURL, botIDClean),
+		fmt.Sprintf("%s/fortnite/api/game/v2/profile/%s/client/GiftCatalogEntry?profileId=common_core", McpGiftCatalogBaseURL, botIDClean),
 		bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
 

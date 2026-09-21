@@ -2,7 +2,7 @@ package fortnite
 
 // Pruebas de regresión para SendGift contra un servidor simulado
 // (httptest.Server) — nunca contra la API real de Epic Games, y sin tocar
-// ninguna base de datos (mcpGiftCatalogBaseURL se redirige al servidor de
+// ninguna base de datos (McpGiftCatalogBaseURL se redirige al servidor de
 // prueba, y ninguno de los escenarios cubiertos aquí llega a las ramas que
 // necesitan *sql.DB, así que se pasa nil a propósito). Cubren el punto 2
 // del pedido de correcciones: distinguir una entrega confirmada, un
@@ -39,9 +39,9 @@ func withMockEpic(t *testing.T, handler http.HandlerFunc) {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	prev := mcpGiftCatalogBaseURL
-	mcpGiftCatalogBaseURL = server.URL
-	t.Cleanup(func() { mcpGiftCatalogBaseURL = prev })
+	prev := McpGiftCatalogBaseURL
+	McpGiftCatalogBaseURL = server.URL
+	t.Cleanup(func() { McpGiftCatalogBaseURL = prev })
 }
 
 func TestSendGift_EntregaConfirmada(t *testing.T) {
@@ -161,9 +161,9 @@ func TestSendGift_RespuestaPerdidaEsIncierta(t *testing.T) {
 // clásico (nada responde del todo) — apunta a un puerto donde no hay
 // ningún servidor escuchando.
 func TestSendGift_ConexionRechazadaEsIncierta(t *testing.T) {
-	prev := mcpGiftCatalogBaseURL
-	mcpGiftCatalogBaseURL = "http://127.0.0.1:1" // puerto reservado, nadie escucha ahí
-	defer func() { mcpGiftCatalogBaseURL = prev }()
+	prev := McpGiftCatalogBaseURL
+	McpGiftCatalogBaseURL = "http://127.0.0.1:1" // puerto reservado, nadie escucha ahí
+	defer func() { McpGiftCatalogBaseURL = prev }()
 
 	_, err := SendGift(nil, newTestAccount(), uuid.New().String(), "offer-1", 500, "Item", "hola")
 	if !errors.Is(err, ErrRequestUncertain) {
