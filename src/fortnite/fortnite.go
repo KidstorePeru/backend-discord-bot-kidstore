@@ -72,11 +72,19 @@ var encryptionKey string
 // conexión cortada a mitad de la respuesta) sin llamar a Epic de verdad.
 var mcpGiftCatalogBaseURL = "https://fngw-mcp-gc-livefn.ol.epicgames.com"
 
-// epicAccountBaseURL apunta al servicio real de cuentas de Epic — variable
+// EpicAccountBaseURL apunta al servicio real de cuentas de Epic — variable
 // por el mismo motivo que mcpGiftCatalogBaseURL: permite que las pruebas de
 // GetReceiverAccountID simulen un 404 real, un 401/429/5xx, o un fallo de
-// transporte, sin llamar a Epic de verdad.
-var epicAccountBaseURL = "https://account-public-service-prod.ol.epicgames.com"
+// transporte, sin llamar a Epic de verdad. Exportada (a diferencia de
+// mcpGiftCatalogBaseURL) para que las pruebas de integración de
+// processOrder en el paquete "store" —que ejercitan el recorrido real de
+// selección de bots, no solo la función de decisión final— también puedan
+// redirigirla a su propio servidor simulado.
+var EpicAccountBaseURL = "https://account-public-service-prod.ol.epicgames.com"
+
+// EpicFriendsBaseURL apunta al servicio real de amistades de Epic — mismo
+// motivo y mismo alcance (exportada) que EpicAccountBaseURL.
+var EpicFriendsBaseURL = "https://friends-public-service-prod.ol.epicgames.com"
 
 func Init(client, secret, encKey string) {
 	epicClient = client
@@ -606,7 +614,7 @@ func GetReceiverAccountID(database *sql.DB, account types.GameAccount, displayNa
 	// dejaría req en nil y tumbaría el proceso más abajo) como que termine
 	// apuntando a otra ruta de la API de Epic por accidente.
 	req, err := http.NewRequest("GET",
-		epicAccountBaseURL+"/account/api/public/account/displayName/"+url.PathEscape(displayName),
+		EpicAccountBaseURL+"/account/api/public/account/displayName/"+url.PathEscape(displayName),
 		nil)
 	if err != nil {
 		return "", fmt.Errorf("usuario Epic inválido: %w", err)
@@ -644,7 +652,7 @@ func GetReceiverAccountID(database *sql.DB, account types.GameAccount, displayNa
 func CheckFriendship(database *sql.DB, account types.GameAccount, receiverAccountID string) (bool, time.Time, error) {
 	botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
 	req, err := http.NewRequest("GET",
-		fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/friends/%s",
+		fmt.Sprintf(EpicFriendsBaseURL+"/friends/api/v1/%s/friends/%s",
 			botIDClean, url.PathEscape(strings.ReplaceAll(receiverAccountID, "-", ""))),
 		nil)
 	if err != nil {
@@ -692,7 +700,7 @@ func CheckFriendship(database *sql.DB, account types.GameAccount, receiverAccoun
 func ListFriends(database *sql.DB, account types.GameAccount) ([]types.EpicFriendEntry, error) {
 	botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
 	req, _ := http.NewRequest("GET",
-		fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/friends", botIDClean),
+		fmt.Sprintf(EpicFriendsBaseURL+"/friends/api/v1/%s/friends", botIDClean),
 		nil)
 
 	resp, _, err := executeWithRefresh(database, account, req)
@@ -954,7 +962,7 @@ func acceptPendingFriendRequests(database *sql.DB) {
 
 			botIDClean := strings.ReplaceAll(account.ID.String(), "-", "")
 			req, err := http.NewRequest("GET",
-				fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/incoming", botIDClean),
+				fmt.Sprintf(EpicFriendsBaseURL+"/friends/api/v1/%s/incoming", botIDClean),
 				nil)
 			if err != nil {
 				slog.Error("Bots: error construyendo request de solicitudes", "bot", account.DisplayName, "error", err)
@@ -976,7 +984,7 @@ func acceptPendingFriendRequests(database *sql.DB) {
 				// NewRequest por las dudas — nunca hay que asumir que
 				// construir una URL no puede fallar.
 				acceptReq, err := http.NewRequest("POST",
-					fmt.Sprintf("https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/%s/friends/%s",
+					fmt.Sprintf(EpicFriendsBaseURL+"/friends/api/v1/%s/friends/%s",
 						botIDClean, url.PathEscape(friend.AccountId)),
 					nil)
 				if err != nil {

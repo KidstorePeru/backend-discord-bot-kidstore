@@ -639,11 +639,16 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 		sigHeader := c.GetHeader("x-nowpayments-sig")
 		if !verifyNOWPaymentsSignature(body, sigHeader) {
 			slog.Warn("NOWPayments webhook: firma inválida, se rechaza sin crear un trabajo de recuperación")
-			if eventID, err := db.LogWebhookEvent(database, "nowpayments", string(body)); err == nil {
-				// outcome que NO empieza con "error:" — GetUnresolvedWebhookEvents
-				// filtra exactamente por eso, así que esto queda marcado como
-				// resuelto para siempre y RetryFailedWebhookEvents nunca lo toma.
-				db.MarkWebhookEventProcessed(database, eventID, "rejected: invalid signature")
+			// Una sola escritura atómica (ya resuelta desde el INSERT) — nunca
+			// LogWebhookEvent + MarkWebhookEventProcessed por separado. Con dos
+			// escrituras, una caída del proceso entre medio (o que la segunda
+			// falle) deja el evento con processed_at NULL, que es justo la
+			// condición que GetUnresolvedWebhookEvents usa para decidir qué
+			// reintentar — RetryFailedWebhookEvents reprocesaría entonces un
+			// evento con firma inválida como si fuera legítimo. Ver
+			// LogRejectedWebhookEvent (db.go).
+			if err := db.LogRejectedWebhookEvent(database, "nowpayments", string(body), "rejected: invalid signature"); err != nil {
+				slog.Error("NOWPayments webhook: no se pudo registrar el rechazo por firma inválida", "error", err)
 			}
 			// 401, no 200: si esto fuera una notificación real de NOWPayments
 			// que falló por un secreto mal configurado de nuestro lado, su

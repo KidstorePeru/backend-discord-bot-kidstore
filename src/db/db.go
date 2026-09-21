@@ -2040,6 +2040,32 @@ func MarkWebhookEventProcessed(db *sql.DB, id uuid.UUID, outcome string) {
 	}
 }
 
+// LogRejectedWebhookEvent registra, en UNA sola escritura atómica, un
+// webhook que se rechazó sin procesar (ej. firma inválida) — nunca via
+// LogWebhookEvent + MarkWebhookEventProcessed por separado. Esas dos
+// escrituras dejan una ventana real entre "insertar" (processed_at NULL) y
+// "marcar resuelto": si el proceso se cae justo en el medio, o la segunda
+// escritura falla por cualquier motivo (antes ni siquiera se propagaba ese
+// error al llamador), el evento queda con processed_at NULL — exactamente
+// la condición que GetUnresolvedWebhookEvents usa para decidir qué
+// reintentar. RetryFailedWebhookEvents reprocesa TODO evento sin resolver
+// de una pasarela SIN volver a exigir firma, así que un rechazo que
+// quedara a medias terminaría, tarde o temprano, tratándose como si fuera
+// una notificación legítima. Con una única sentencia INSERT que ya trae
+// processed_at/outcome, no existe ningún estado intermedio: o el evento
+// queda registrado YA resuelto, o (si la escritura falla) no queda
+// registrado en absoluto — nunca "a medio resolver". outcome NUNCA debe
+// empezar con "error:" (ver el filtro de GetUnresolvedWebhookEvents), o el
+// rechazo pasaría a ser candidato a reintento.
+func LogRejectedWebhookEvent(db *sql.DB, gateway, rawBody, outcome string) error {
+	_, err := db.Exec(`INSERT INTO webhook_events (id, gateway, raw_body, received_at, processed_at, outcome) VALUES ($1,$2,$3,NOW(),NOW(),$4)`,
+		uuid.New(), gateway, rawBody, outcome)
+	if err != nil {
+		slog.Error("no se pudo registrar el rechazo de webhook_event", "gateway", gateway, "error", err)
+	}
+	return err
+}
+
 // GetUnresolvedWebhookEvents lista, para una pasarela dada, los eventos
 // registrados con LogWebhookEvent que NUNCA se terminaron de procesar con
 // éxito: o bien el proceso se cayó a mitad de camino (processed_at sigue

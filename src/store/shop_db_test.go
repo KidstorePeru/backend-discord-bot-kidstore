@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"KidStoreStore/src/db"
+	"KidStoreStore/src/fortnite"
 	"KidStoreStore/src/types"
 
 	"github.com/gin-gonic/gin"
@@ -778,5 +779,124 @@ func TestReconcilePendingPayments_AcreditacionFallidaRotaYPermiteProcesarUnPagoP
 	conn.QueryRow(`SELECT status FROM payment_transactions WHERE id=$1`, newTxID).Scan(&newPaymentStatus)
 	if newPaymentStatus != "approved" {
 		t.Errorf("el pago posterior debería quedar 'approved' tras acreditarse, obtuve %q", newPaymentStatus)
+	}
+}
+
+// ==================== SELECCIÓN DE BOTS — AMIGO SIN CUPOS (punto 1) ====================
+
+// TestProcessOrder_BotAmigoSinCuposNuncaCancelaPedido ejercita el recorrido
+// REAL de selección de bots de processOrder (no solo decideFinalOrderOutcome
+// con contadores escritos a mano): bot A es amigo confirmado del cliente
+// pero ya agotó sus envíos de hoy (RemainingGifts=0), bot B tiene cupos y
+// fondos de sobra pero NO es amigo. Antes, el bot sin cupos se descartaba
+// con un "continue" ANTES de siquiera consultar su amistad, así que nunca
+// sumaba a "es amigo" — con el pedido ya fuera del margen de gracia de 10
+// minutos, el resultado era cancelar diciéndole al cliente que agregue a
+// alguno de los bots, aunque en realidad SÍ había agregado al bot A (que
+// simplemente se quedó sin cupos por hoy, algo que se resetea solo).
+// Usa un servidor Epic simulado (httptest) que sirve tanto
+// fortnite.EpicAccountBaseURL como fortnite.EpicFriendsBaseURL — nunca la
+// API real de Epic.
+func TestProcessOrder_BotAmigoSinCuposNuncaCancelaPedido(t *testing.T) {
+	conn := setupShopTestDB(t)
+	custID, cleanup := newShopTestCustomer(t, conn, 0)
+	defer cleanup()
+
+	const receiverAccountID = "receiver00000000000000000000000"
+
+	botA := types.GameAccount{ // amigo confirmado, SIN cupos hoy
+		ID: uuid.New(), DisplayName: "bot_amigo_sin_cupos",
+		RemainingGifts: 0, VBucks: 999999,
+		AccessToken: "tok-a", AccessTokenExpDate: time.Now().Add(24 * time.Hour),
+	}
+	botB := types.GameAccount{ // con cupos y fondos, pero NO es amigo
+		ID: uuid.New(), DisplayName: "bot_no_amigo_con_cupos",
+		RemainingGifts: 5, VBucks: 999999,
+		AccessToken: "tok-b", AccessTokenExpDate: time.Now().Add(24 * time.Hour),
+	}
+	botAIDClean := strings.ReplaceAll(botA.ID.String(), "-", "")
+	botBIDClean := strings.ReplaceAll(botB.ID.String(), "-", "")
+
+	sendGiftCalled := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/account/api/public/account/displayName/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"id": receiverAccountID, "displayName": "receiver_test"})
+	})
+	mux.HandleFunc("/friends/api/v1/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, botAIDClean):
+			// Amistad confirmada, bien por encima de las 48h exigidas.
+			json.NewEncoder(w).Encode(map[string]string{
+				"accountId": receiverAccountID,
+				"created":   time.Now().Add(-60 * time.Hour).Format(time.RFC3339),
+			})
+		case strings.Contains(r.URL.Path, botBIDClean):
+			w.WriteHeader(http.StatusNotFound) // no es amigo
+		default:
+			t.Errorf("consulta de amistad inesperada: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Ni bot A (sin cupos) ni bot B (no es amigo) deberían llegar nunca
+		// a intentar un envío real.
+		sendGiftCalled = true
+		t.Errorf("no debería intentarse ningún envío: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	prevAccountURL, prevFriendsURL := fortnite.EpicAccountBaseURL, fortnite.EpicFriendsBaseURL
+	fortnite.EpicAccountBaseURL = server.URL
+	fortnite.EpicFriendsBaseURL = server.URL
+	defer func() {
+		fortnite.EpicAccountBaseURL = prevAccountURL
+		fortnite.EpicFriendsBaseURL = prevFriendsURL
+	}()
+
+	// El pedido tiene que estar por encima de friendGracePeriod (10 min)
+	// para el escenario que de verdad importa acá: es JUSTO cuando antes se
+	// cancelaba incorrectamente.
+	orderID := uuid.New()
+	createdAt := time.Now().Add(-15 * time.Minute)
+	_, err := conn.Exec(`
+		INSERT INTO orders (id, customer_id, epic_username, item_offer_id, item_name, price_kc, price_vbucks, status, created_at, updated_at)
+		VALUES ($1,$2,'receiver_test','offer-test','Item de prueba',500,500,'processing',$3,$3)`,
+		orderID, custID, createdAt)
+	if err != nil {
+		t.Fatalf("insert orders: %v", err)
+	}
+	defer conn.Exec(`DELETE FROM orders WHERE id=$1`, orderID)
+
+	order := types.Order{
+		ID: orderID, CustomerID: custID, EpicUsername: "receiver_test",
+		ItemOfferID: "offer-test", ItemName: "Item de prueba",
+		PriceKC: 500, PriceVBucks: 500, Status: "processing", CreatedAt: createdAt,
+	}
+
+	processOrder(conn, order, []types.GameAccount{botA, botB})
+
+	if sendGiftCalled {
+		t.Fatal("processOrder intentó enviar un regalo — ni bot A (sin cupos) ni bot B (no amigo) debían llegar tan lejos")
+	}
+
+	var status string
+	var errMsg sql.NullString
+	if err := conn.QueryRow(`SELECT status, error_msg FROM orders WHERE id=$1`, orderID).Scan(&status, &errMsg); err != nil {
+		t.Fatalf("no se pudo leer el pedido: %v", err)
+	}
+	if status != "pending" {
+		t.Errorf("el pedido debería seguir 'pending' (el cliente SÍ agregó a un bot, solo que está sin cupos hoy) — obtuve %q, mensaje: %q", status, errMsg.String)
+	}
+	if status == "failed" || (errMsg.Valid && strings.Contains(strings.ToLower(errMsg.String), "no está en la lista de amigos")) {
+		t.Errorf("NUNCA debe decirle al cliente que no agregó ningún bot — sí agregó al bot A, mensaje obtenido: %q", errMsg.String)
+	}
+
+	var balance int
+	conn.QueryRow(`SELECT kc_balance FROM customers WHERE id=$1`, custID).Scan(&balance)
+	if balance != 0 {
+		t.Errorf("no debería haberse reembolsado nada (el pedido no se canceló) — kc_balance esperado 0, obtuve %d", balance)
 	}
 }

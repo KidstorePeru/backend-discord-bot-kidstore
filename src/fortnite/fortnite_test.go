@@ -183,9 +183,9 @@ func withMockEpicAccount(t *testing.T, handler http.HandlerFunc) {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	prev := epicAccountBaseURL
-	epicAccountBaseURL = server.URL
-	t.Cleanup(func() { epicAccountBaseURL = prev })
+	prev := EpicAccountBaseURL
+	EpicAccountBaseURL = server.URL
+	t.Cleanup(func() { EpicAccountBaseURL = prev })
 }
 
 func TestGetReceiverAccountID_404EsConfirmado(t *testing.T) {
@@ -249,9 +249,9 @@ func TestGetReceiverAccountID_503NuncaEsNotFound(t *testing.T) {
 }
 
 func TestGetReceiverAccountID_FalloDeConexionNuncaEsNotFound(t *testing.T) {
-	prev := epicAccountBaseURL
-	epicAccountBaseURL = "http://127.0.0.1:1" // puerto reservado, nadie escucha ahí
-	defer func() { epicAccountBaseURL = prev }()
+	prev := EpicAccountBaseURL
+	EpicAccountBaseURL = "http://127.0.0.1:1" // puerto reservado, nadie escucha ahí
+	defer func() { EpicAccountBaseURL = prev }()
 
 	_, err := GetReceiverAccountID(nil, newTestAccount(), "alguien")
 	if err == nil {
