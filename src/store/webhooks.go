@@ -819,13 +819,15 @@ func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
 
 		if !verifyDLocalGoSignature(body, c.GetHeader("Authorization")) {
 			// Firma inválida: cualquiera pudo mandar este POST, no es una
-			// notificación real de dLocal Go — se deja constancia (best
-			// effort, sin bloquear la respuesta por ello) pero nunca se
-			// reintenta ni se le pide a un tercero no autenticado que
-			// vuelva a mandar nada.
+			// notificación real de dLocal Go. 401, no 200 (mismo criterio que
+			// NOWPayments más arriba): si esto fuera en realidad una
+			// notificación legítima que falló por un secreto mal configurado
+			// de nuestro lado, el propio mecanismo de reintentos de dLocal Go
+			// seguirá intentando la entrega — mejor eso que responder 200 y
+			// perder la notificación silenciosamente.
 			slog.Warn("dLocal Go webhook: firma inválida, ignorando")
 			db.LogWebhookEvent(database, "dlocalgo", string(body))
-			c.JSON(http.StatusOK, gin.H{"received": true})
+			c.JSON(http.StatusUnauthorized, gin.H{"received": false, "error": "firma inválida"})
 			return
 		}
 		eventID, ok := logWebhookEventOrReject(c, database, "dlocalgo", string(body))
