@@ -212,12 +212,15 @@ func AlertUnderpaidCryptoPayment(paymentID int64, orderID string) {
 
 // AlertUnresolvedPayment se llama cuando un pago con sesión real en una
 // pasarela lleva demasiado tiempo (ver reconcileDeadLetterAfter en
-// webhooks.go) sin que la pasarela confirme ni un cobro ni un rechazo — se
-// da por perdido (status 'expired') en vez de quedar "pending" para
-// siempre, pero a diferencia de un rechazo real, esto es poco común y vale
-// la pena que alguien lo revise a mano (podría ser un problema con las
-// credenciales de esa pasarela, no necesariamente un pago legítimamente
-// abandonado).
+// webhooks.go) sin que la pasarela confirme ni un cobro ni un rechazo — en
+// vez de quedar "pending" para siempre (invisible, nadie se entera), pasa a
+// 'review'. Esto NO es un rechazo ni una expiración: 'review' es
+// explícitamente distinto de 'failed'/'expired' (ver el comentario grande
+// en checkGatewayOutcome/webhooks.go) y GetStalePendingPayments lo sigue
+// reconciliando automáticamente en cada pasada por si llega una
+// confirmación tardía de la pasarela. La alerta es solo para que soporte
+// tenga visibilidad manual mientras tanto (podría ser un problema con las
+// credenciales de esa pasarela, no necesariamente un pago abandonado).
 func AlertUnresolvedPayment(txID, gateway string) {
 	key := "unresolved_payment_" + txID
 	if !shouldAlert(key) {
@@ -225,7 +228,7 @@ func AlertUnresolvedPayment(txID, gateway string) {
 	}
 	sendAdminAlert(
 		"🟡 Pago sin resolver tras varias horas",
-		fmt.Sprintf("El pago **%s** (%s) llevó más de 6 horas sin que la pasarela confirmara ni un cobro ni un rechazo. Se marcó como expirado automáticamente. Si el cliente reclama, revísalo a mano en el panel de esa pasarela.", txID, gateway),
+		fmt.Sprintf("El pago **%s** (%s) lleva más de 6 horas sin que la pasarela confirme ni un cobro ni un rechazo. Pasó a revisión ('review') — NO se marcó como expirado ni rechazado, y la reconciliación automática lo sigue reintentando por si llega una confirmación tardía. Si el cliente reclama, revísalo a mano en el panel de esa pasarela.", txID, gateway),
 		colorWarnSoft,
 	)
 }
