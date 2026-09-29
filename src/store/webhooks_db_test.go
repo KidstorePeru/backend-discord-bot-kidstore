@@ -7,7 +7,9 @@ package store
 // producción.
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -65,14 +67,25 @@ func TestHandlerNOWPaymentsWebhook_FirmaInvalidaNuncaSeConvierteEnTrabajoDeRecup
 		t.Errorf("una notificación con firma inválida no debería responder 200 fingiendo que se aceptó, obtuve %d: %s", w.Code, w.Body.String())
 	}
 
+	// El rechazo se audita SOLO con metadatos (tamaño + SHA-256): el cuerpo,
+	// contenido de un tercero sin autenticar, nunca se guarda.
+	sum := sha256.Sum256([]byte(rawBody))
 	var eventID string
-	var outcome, rawBodyStored string
-	err := conn.QueryRow(`SELECT id, outcome, raw_body FROM webhook_events WHERE gateway='nowpayments' AND raw_body=$1 ORDER BY received_at DESC LIMIT 1`, rawBody).
-		Scan(&eventID, &outcome, &rawBodyStored)
+	var outcome string
+	var rawBodyStored sql.NullString
+	var storedSize sql.NullInt64
+	err := conn.QueryRow(`SELECT id, outcome, raw_body, body_size FROM webhook_events WHERE gateway='nowpayments' AND body_sha256=$1 ORDER BY received_at DESC LIMIT 1`, hex.EncodeToString(sum[:])).
+		Scan(&eventID, &outcome, &rawBodyStored, &storedSize)
 	if err != nil {
 		t.Fatalf("el intento debería quedar registrado en webhook_events para auditoría: %v", err)
 	}
 	defer conn.Exec(`DELETE FROM webhook_events WHERE id=$1`, eventID)
+	if rawBodyStored.Valid {
+		t.Errorf("un evento rechazado NO debe guardar su cuerpo (raw_body debe ser NULL), obtuve %q", rawBodyStored.String)
+	}
+	if !storedSize.Valid || int(storedSize.Int64) != len(rawBody) {
+		t.Errorf("body_size debe registrar el tamaño del cuerpo (%d), obtuve %v", len(rawBody), storedSize)
+	}
 
 	if strings.HasPrefix(outcome, "error:") {
 		t.Errorf("el outcome de una firma inválida NUNCA debe empezar con 'error:' — eso es justo lo que GetUnresolvedWebhookEvents usa para decidir qué reintentar, obtuve %q", outcome)
@@ -160,13 +173,15 @@ func TestHandlerNOWPaymentsWebhook_FirmaInvalidaConFalloDeEscritura_NuncaConsult
 	// Con la conexión REAL de pruebas: no debe haber quedado ninguna fila
 	// para este evento — la escritura atómica falló entera, así que no hay
 	// ni una fila a medio resolver ni una resuelta.
+	sum := sha256.Sum256([]byte(rawBody))
+	sumHex := hex.EncodeToString(sum[:])
 	var count int
-	if err := conn.QueryRow(`SELECT COUNT(*) FROM webhook_events WHERE gateway='nowpayments' AND raw_body=$1`, rawBody).Scan(&count); err != nil {
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM webhook_events WHERE gateway='nowpayments' AND body_sha256=$1`, sumHex).Scan(&count); err != nil {
 		t.Fatalf("no se pudo verificar webhook_events: %v", err)
 	}
 	if count != 0 {
 		t.Errorf("no debería haber quedado ninguna fila para este evento tras el fallo de escritura, encontré %d", count)
-		conn.Exec(`DELETE FROM webhook_events WHERE gateway='nowpayments' AND raw_body=$1`, rawBody)
+		conn.Exec(`DELETE FROM webhook_events WHERE gateway='nowpayments' AND body_sha256=$1`, sumHex)
 	}
 
 	// Por las dudas: un barrido de recuperación posterior tampoco debe

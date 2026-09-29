@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -141,7 +142,16 @@ func ParseCustomerToken(tokenStr string, secretKey string) (*types.CustomerClaim
 // CustomerAuthMiddleware valida el JWT de clientes.
 // Rechaza tokens admin aunque sean válidos.
 // Si el token expiró devuelve 401 con mensaje claro para que el frontend redirija al login.
-func CustomerAuthMiddleware(secretKey string) gin.HandlerFunc {
+//
+// Además de la firma y la expiración, en cada request vuelve a consultar
+// que la cuenta SIGA ACTIVA (db.IsCustomerActive). Un JWT de acceso vive
+// hasta 1h y no se puede revocar por sí solo — DeactivateCustomerByAdmin y
+// DeleteOwnAccount borraban los refresh tokens, pero un JWT ya emitido
+// seguía dando acceso a pedidos, estadísticas, recargas y demás rutas de
+// cliente hasta expirar. Si la consulta falla (base de datos caída) se
+// falla CERRADO: nunca se deja pasar una petición cuyo estado de cuenta no
+// se pudo confirmar.
+func CustomerAuthMiddleware(database *sql.DB, secretKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
@@ -184,6 +194,26 @@ func CustomerAuthMiddleware(secretKey string) gin.HandlerFunc {
 		isCustomer, _ := claims["is_customer"].(bool)
 		if !isCustomer {
 			c.JSON(http.StatusForbidden, gin.H{"success": false, "error": "acceso denegado"})
+			c.Abort()
+			return
+		}
+
+		customerIDStr, _ := claims["customer_id"].(string)
+		customerID, parseErr := uuid.Parse(customerIDStr)
+		if parseErr != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "token inválido"})
+			c.Abort()
+			return
+		}
+		active, activeErr := db.IsCustomerActive(database, customerID)
+		if activeErr != nil {
+			slog.Error("CustomerAuthMiddleware: no se pudo verificar el estado de la cuenta, se rechaza (fail-closed)", "customer", customerID, "error", activeErr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "error": "no se pudo verificar la sesión, intenta de nuevo"})
+			c.Abort()
+			return
+		}
+		if !active {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "cuenta desactivada o eliminada", "code": "ACCOUNT_INACTIVE"})
 			c.Abort()
 			return
 		}

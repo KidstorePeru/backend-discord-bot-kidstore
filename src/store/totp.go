@@ -334,7 +334,7 @@ func HandlerLoginVerify2FA(database *sql.DB, secretKey string) gin.HandlerFunc {
 		}
 
 		customer, err := db.GetCustomerByID(database, customerID)
-		if err != nil || !customer.IsAdmin || !customer.TOTPEnabled || customer.TOTPSecretEnc == nil {
+		if err != nil || !customer.IsActive || !customer.IsAdmin || !customer.TOTPEnabled || customer.TOTPSecretEnc == nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "cuenta inválida"})
 			return
 		}

@@ -74,6 +74,10 @@ func main() {
 		// Production: derive backend URL from frontend URL pattern
 		backendURL = "https://backend-discord-bot-kidstore-production.up.railway.app"
 	}
+	allowUnsigned, unsignedErr := store.ResolveUnsignedWebhooks(cfg.AllowUnsignedWebhooks, cfg.AppEnv)
+	if unsignedErr != "" {
+		log.Printf("ERROR: %s", unsignedErr)
+	}
 	store.SetPaymentConfig(store.PaymentConfig{
 		MercadoPagoToken:    cfg.MercadoPagoAccessToken,
 		PayPalClientID:      cfg.PayPalClientID,
@@ -86,7 +90,23 @@ func main() {
 		DLocalGoSandbox:     cfg.DLocalGoSandbox,
 		FrontendURL:         cfg.FrontendURL,
 		BackendURL:          backendURL,
+		MercadoPagoWebhookSecret: cfg.MercadoPagoWebhookSecret,
+		PayPalWebhookID:          cfg.PayPalWebhookID,
+		// Falla cerrado: solo ALLOW_UNSIGNED_WEBHOOKS=true (desarrollo) permite
+		// webhooks sin firma; no depende de FRONTEND_URL.
+		AllowUnsignedWebhooks: allowUnsigned,
+		AppEnv:                cfg.AppEnv,
 	})
+	if allowUnsigned {
+		log.Printf("ADVERTENCIA: ALLOW_UNSIGNED_WEBHOOKS=true — se aceptarán webhooks de Mercado Pago/PayPal sin firma cuando falte su secreto. Solo para desarrollo; NO usar en producción")
+	} else {
+		if cfg.MercadoPagoAccessToken != "" && cfg.MercadoPagoWebhookSecret == "" {
+			log.Printf("ADVERTENCIA: MERCADOPAGO_WEBHOOK_SECRET no está configurada — los webhooks de Mercado Pago se rechazarán hasta que se configure")
+		}
+		if cfg.PayPalClientID != "" && cfg.PayPalWebhookID == "" {
+			log.Printf("ADVERTENCIA: PAYPAL_WEBHOOK_ID no está configurada — los webhooks de PayPal se rechazarán hasta que se configure")
+		}
+	}
 
 	// sslmode=require — la conexión a Postgres viaja por la red pública de
 	// Railway (el host es un proxy público, caboose.proxy.rlwy.net), no por
@@ -262,6 +282,7 @@ func main() {
 		webhookGroup.POST("/paypal-capture",      store.HandlerPayPalCapture(database))
 	}
 	router.GET("/store/shop",            store.HandlerGetShop)
+	router.GET("/store/shop/bestsellers", store.HandlerGetBestSellers(database))
 	router.GET("/store/bots-status",     store.HandlerBotsStatus(database))
 	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
 	router.GET("/store/product-available/:id", admin.HandlerCheckProductAvailable(database))
@@ -277,7 +298,7 @@ func main() {
 
 	// ── Rutas de cliente (JWT requerido) ──
 	customer := router.Group("/store")
-	customer.Use(middleware.CustomerAuthMiddleware(cfg.SecretKey))
+	customer.Use(middleware.CustomerAuthMiddleware(database, cfg.SecretKey))
 	{
 		customer.GET("/me",                store.HandlerMe(database))
 		customer.GET("/payment-info",      store.HandlerGetPaymentInfo())
@@ -321,6 +342,8 @@ func main() {
 		adminGroup.GET("/orders",           admin.HandlerGetAllOrders(database))
 		adminGroup.PUT("/orders/:id/review", admin.HandlerResolveOrderReview(database))
 		adminGroup.GET("/stats",            admin.HandlerGetStats(database))
+		adminGroup.GET("/webhook-events/review",       admin.HandlerListWebhookReview(database))
+		adminGroup.POST("/webhook-events/:id/retry",   admin.HandlerRetryWebhookEvent(database))
 		adminGroup.GET("/payments",         admin.HandlerGetAllPayments(database))
 		adminGroup.GET("/product-availability",  admin.HandlerGetProductAvailability(database))
 		adminGroup.PUT("/product-availability",  admin.HandlerUpdateProductAvailability(database))
@@ -386,6 +409,17 @@ func main() {
 			safe.Run("RetryFailedWebhookEvents", func() {
 				store.RetryFailedWebhookEvents(database)
 			})
+		}
+	}()
+
+	// ── Retención de webhook_events: purga diaria de eventos ya procesados
+	// (nunca los pendientes de reintento) — ver PurgeProcessedWebhookEvents. ──
+	go func() {
+		for {
+			safe.Run("PurgeProcessedWebhookEvents", func() {
+				store.PurgeProcessedWebhookEvents(database)
+			})
+			time.Sleep(24 * time.Hour)
 		}
 	}()
 

@@ -59,7 +59,25 @@ type EnvConfig struct {
 	PayPalClientID         string `envconfig:"PAYPAL_CLIENT_ID"`
 	PayPalClientSecret     string `envconfig:"PAYPAL_CLIENT_SECRET"`
 	PayPalMode             string `envconfig:"PAYPAL_MODE" default:"sandbox"`
-	NOWPaymentsAPIKey      string `envconfig:"NOWPAYMENTS_API_KEY"`
+	// MercadoPagoWebhookSecret autentica los webhooks de Mercado Pago
+	// (header x-signature) — "Clave secreta" en Mercado Pago Developers →
+	// tu aplicación → Webhooks. NO es el Access Token. En producción, sin
+	// esta variable, el webhook de Mercado Pago se rechaza (ver
+	// webhook_auth.go).
+	MercadoPagoWebhookSecret string `envconfig:"MERCADOPAGO_WEBHOOK_SECRET"`
+	// PayPalWebhookID es el ID del webhook registrado en PayPal Developer
+	// Dashboard (apuntando a /store/webhook/paypal), del mismo modo que
+	// PAYPAL_MODE. En producción, sin esta variable, el webhook de PayPal se
+	// rechaza.
+	PayPalWebhookID string `envconfig:"PAYPAL_WEBHOOK_ID"`
+	// AllowUnsignedWebhooks (ALLOW_UNSIGNED_WEBHOOKS) permite aceptar webhooks
+	// de Mercado Pago/PayPal SIN firma cuando falta su secreto. Solo para
+	// desarrollo local; apagado por defecto (falla cerrado). Solo tiene efecto
+	// con APP_ENV=development: en cualquier otro entorno se ignora.
+	AllowUnsignedWebhooks bool `envconfig:"ALLOW_UNSIGNED_WEBHOOKS" default:"false"`
+	// AppEnv (APP_ENV) identifica el entorno. Por defecto "production" (seguro).
+	AppEnv string `envconfig:"APP_ENV" default:"production"`
+	NOWPaymentsAPIKey     string `envconfig:"NOWPAYMENTS_API_KEY"`
 	// NOWPaymentsIPNSecret firma los callbacks IPN de NOWPayments (header
 	// x-nowpayments-sig) — se genera en el dashboard de NOWPayments, en
 	// Payment Settings → Instant Payment Notifications ("IPN Secret Key"),
@@ -488,8 +506,9 @@ type AuthResponse struct {
 // extraer lo necesario (p. ej. el payment_id de NOWPayments) sin depender de
 // que el webhook original se repita.
 type WebhookEvent struct {
-	ID      uuid.UUID
-	RawBody string
+	ID       uuid.UUID
+	RawBody  string
+	Attempts int // intentos de reproceso ya hechos (ver db.RecordWebhookRetryFailure)
 }
 
 type PaymentTransaction struct {

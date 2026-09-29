@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"KidStoreStore/src/crypto"
 	"KidStoreStore/src/safe"
 	"KidStoreStore/src/types"
@@ -159,6 +160,8 @@ func CreateTables(db *sql.DB) error {
 			ON CONFLICT (id) DO NOTHING`,
 		`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id)`,
+		// Ranking de "lo más vendido" (GetBestSellingOfferIDs): filtra por fecha.
+		`CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_kc_recharges_customer ON kc_recharges(customer_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_customer ON audit_logs(customer_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_reset_token ON password_reset_tokens(token)`,
@@ -443,6 +446,23 @@ func CreateTables(db *sql.DB) error {
 			processed_at TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_webhook_events_gateway ON webhook_events(gateway, received_at DESC)`,
+		// Metadatos de auditoría y control de reintentos de webhook_events:
+		//   body_size/body_sha256: de un evento RECHAZADO (firma inválida) solo se
+		//     conservan estos dos datos — nunca el cuerpo (contenido de un
+		//     tercero sin autenticar, potencialmente con datos personales).
+		//   attempts/next_attempt_at/last_error: backoff de RetryFailedWebhookEvents.
+		//   review_at: bandeja de revisión manual — un evento que agotó sus
+		//     reintentos (o falló de forma no recuperable) se CONSERVA acá, con
+		//     su payment_id, hasta que un admin lo reencole o lo resuelva; ni la
+		//     purga ni el reintento automático lo tocan.
+		`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS body_size INTEGER`,
+		`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS body_sha256 VARCHAR(64)`,
+		`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMP`,
+		`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS last_error TEXT`,
+		`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS review_at TIMESTAMP`,
+		// claimed_until: lease de procesamiento entre trabajadores/réplicas (ver ClaimWebhookEvent).
+		`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMP`,
 		// Código efímero de un solo uso para el intercambio final del login
 		// OAuth (Google/Discord) — antes, HandlerGoogleCallback/HandlerDiscordCallback
 		// redirigían al frontend con el token de acceso Y el refresh token de
@@ -841,7 +861,7 @@ func GetCustomerByEmail(db *sql.DB, email string) (types.Customer, error) {
 	return c, err
 }
 
-func GetCustomerByID(db *sql.DB, id uuid.UUID) (types.Customer, error) {
+func GetCustomerByID(db sqlExecutor, id uuid.UUID) (types.Customer, error) {
 	var c types.Customer
 	err := db.QueryRow(`
 		SELECT id, epic_username, email, password_hash, kc_balance,
@@ -852,6 +872,25 @@ func GetCustomerByID(db *sql.DB, id uuid.UUID) (types.Customer, error) {
 			&c.GoogleID, &c.DiscordID, &c.DiscordUsername, &c.AvatarURL, &c.Phone, &c.HasPassword, &c.EmailChangedAt,
 			&c.IsActive, &c.IsVerified, &c.IsAdmin, &c.TOTPSecretEnc, &c.TOTPEnabled, &c.TOTPPendingSecretEnc, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
+}
+
+// IsCustomerActive dice si la cuenta existe y sigue activa (is_active=true).
+// Es la consulta mínima que usa CustomerAuthMiddleware en cada request para
+// que desactivar o autoeliminar una cuenta invalide de inmediato los JWT de
+// acceso ya emitidos (sin cargar la fila completa, con sus campos
+// sensibles). Una cuenta inexistente devuelve (false, nil); solo un fallo
+// real de base de datos devuelve error — el llamador debe tratarlo como
+// "no autorizado" (fallar cerrado), nunca como "activa".
+func IsCustomerActive(db *sql.DB, id uuid.UUID) (bool, error) {
+	var active bool
+	err := db.QueryRow(`SELECT is_active FROM customers WHERE id = $1`, id).Scan(&active)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return active, nil
 }
 
 func GetCustomerByGoogleID(db *sql.DB, googleID string) (types.Customer, error) {
@@ -1051,6 +1090,15 @@ func UpdateProfile(db *sql.DB, customerID uuid.UUID, epicUsername, passwordHash 
 		if _, err := tx.Exec(`UPDATE customers SET password_hash=$1, has_password=true, updated_at=NOW() WHERE id=$2`, passwordHash, customerID); err != nil {
 			return err
 		}
+		// Cambiar la contraseña revoca TODAS las sesiones EN LA MISMA transacción.
+		// El UPDATE de arriba toma el candado de la fila del cliente; una
+		// renovación concurrente (HandlerRefreshToken, FOR SHARE sobre esa fila)
+		// espera a que esta transacción termine y ya no encuentra su token, o —si
+		// confirmó antes— el token nuevo que emitió se borra acá. Ninguna sesión
+		// anterior sobrevive.
+		if _, err := tx.Exec(`DELETE FROM refresh_tokens WHERE customer_id=$1`, customerID); err != nil {
+			return err
+		}
 	}
 	if phone != nil {
 		if _, err := tx.Exec(`UPDATE customers SET phone=$1, updated_at=NOW() WHERE id=$2`, *phone, customerID); err != nil {
@@ -1109,9 +1157,38 @@ func GetPasswordResetToken(db *sql.DB, token string) (types.PasswordResetToken, 
 	return t, err
 }
 
-func MarkResetTokenUsed(db *sql.DB, token string) error {
-	_, err := db.Exec(`UPDATE password_reset_tokens SET used_at=NOW() WHERE token=$1`, token)
-	return err
+// ErrResetTokenInvalid: el token de restablecimiento no existe, ya se usó o expiró.
+var ErrResetTokenInvalid = errors.New("token de restablecimiento inválido o expirado")
+
+// ResetPasswordWithToken consume el token de restablecimiento, cambia la
+// contraseña y revoca todas las sesiones en UNA transacción. Consumir el token
+// con UPDATE ... WHERE used_at IS NULL RETURNING impide usarlo dos veces en
+// paralelo; el orden de bloqueo (token → cliente → refresh tokens) es
+// compatible con el de la renovación y la desactivación (cliente → tokens).
+// Devuelve el id del cliente; ErrResetTokenInvalid si el token no sirve.
+func ResetPasswordWithToken(db *sql.DB, token, passwordHash string) (uuid.UUID, error) {
+	tx, err := db.Begin()
+	if err != nil { return uuid.Nil, err }
+	defer tx.Rollback()
+
+	var customerID uuid.UUID
+	err = tx.QueryRow(`UPDATE password_reset_tokens SET used_at=NOW()
+		WHERE token=$1 AND used_at IS NULL AND expires_at > NOW()
+		RETURNING customer_id`, token).Scan(&customerID)
+	if err == sql.ErrNoRows { return uuid.Nil, ErrResetTokenInvalid }
+	if err != nil { return uuid.Nil, err }
+
+	res, err := tx.Exec(`UPDATE customers SET password_hash=$1, has_password=true, updated_at=NOW() WHERE id=$2`, passwordHash, customerID)
+	if err != nil { return uuid.Nil, err }
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		if err == nil { err = ErrResetTokenInvalid }
+		return uuid.Nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM refresh_tokens WHERE customer_id=$1`, customerID); err != nil {
+		return uuid.Nil, err
+	}
+	if err := tx.Commit(); err != nil { return uuid.Nil, err }
+	return customerID, nil
 }
 
 // ==================== CAMBIO DE EMAIL (2FA / OTP) ====================
@@ -1869,6 +1946,62 @@ func CreatePaymentTransaction(db *sql.DB, tx PaymentTransactionInput) error {
 	return err
 }
 
+// ── Creación de pagos: registro local ANTES de la sesión externa ──
+//
+// HandlerCreatePayment guarda primero la transacción como 'pending' con
+// external_id vacío, después crea la sesión en la pasarela y recién entonces
+// persiste el ID externo. Estados resultantes:
+//   - pending + external_id '' : creación en curso (o el proceso se cayó a
+//     mitad — ExpireAbandonedPaymentCreations la cierra; el cliente nunca
+//     recibió un checkout, así que no puede haber pagado).
+//   - pending + external_id    : flujo normal (webhooks + conciliación).
+//   - failed + progress "creation_failed: ..." : la pasarela rechazó crear
+//     la sesión — no existe ningún checkout.
+//   - review + external_id + progress "external_id_unsaved: ..." : la sesión
+//     SÍ se creó pero no se pudo persistir el ID con normalidad; se guarda
+//     igual con status 'review' para que la conciliación automática
+//     (GetStalePendingPayments incluye 'review') siga consultándola. Al
+//     cliente nunca se le devuelve ese checkout.
+
+// SetPaymentExternalID persiste el ID de la sesión externa de un pago que
+// sigue 'pending'. Devuelve error si no actualizó exactamente una fila.
+func SetPaymentExternalID(db *sql.DB, id uuid.UUID, externalID string) error {
+	res, err := db.Exec(`UPDATE payment_transactions SET external_id=$1, updated_at=NOW() WHERE id=$2 AND status='pending'`, externalID, id)
+	if err != nil { return err }
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("SetPaymentExternalID: se esperaba actualizar 1 fila y fueron %d", n)
+	}
+	return nil
+}
+
+// MarkPaymentCreationFailed cierra como 'failed' un pago cuya sesión externa
+// no llegó a crearse. Solo aplica si sigue pending y sin external_id.
+func MarkPaymentCreationFailed(db *sql.DB, id uuid.UUID, reason string) error {
+	_, err := db.Exec(`UPDATE payment_transactions SET status='failed', progress=$2, updated_at=NOW()
+		WHERE id=$1 AND status='pending' AND COALESCE(external_id,'')=''`, id, "creation_failed: "+reason)
+	return err
+}
+
+// MarkPaymentExternalIDUnsaved deja el pago en 'review' CON su ID externo
+// (ver el comentario de arriba) cuando SetPaymentExternalID no pudo escribirlo.
+func MarkPaymentExternalIDUnsaved(db *sql.DB, id uuid.UUID, externalID string) error {
+	_, err := db.Exec(`UPDATE payment_transactions SET status='review', external_id=$2, progress='external_id_unsaved', updated_at=NOW()
+		WHERE id=$1 AND status='pending'`, id, externalID)
+	return err
+}
+
+// ExpireAbandonedPaymentCreations cierra como 'failed' los pagos que
+// quedaron 'pending' SIN external_id pasado "olderThan" — el proceso se cayó
+// entre guardar el registro local y crear/persistir la sesión, y el cliente
+// nunca recibió un checkout. Devuelve cuántos cerró.
+func ExpireAbandonedPaymentCreations(db *sql.DB, olderThan time.Duration) (int64, error) {
+	res, err := db.Exec(`UPDATE payment_transactions SET status='failed', progress='creation_failed: abandonado', updated_at=NOW()
+		WHERE status='pending' AND COALESCE(external_id,'')='' AND created_at < NOW() - $1::interval`,
+		fmt.Sprintf("%d seconds", int64(olderThan.Seconds())))
+	if err != nil { return 0, err }
+	return res.RowsAffected()
+}
+
 func GetPaymentTransaction(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, error) {
 	var t types.PaymentTransaction
 	var currencyCode sql.NullString
@@ -2031,11 +2164,51 @@ func LogWebhookEvent(db *sql.DB, gateway, rawBody string) (uuid.UUID, error) {
 	return id, nil
 }
 
+// webhookEventResolvedSQL: el evento ya terminó CON ÉXITO (o se ignoró/rechazó
+// de forma definitiva): tiene processed_at, no está en revisión y su outcome no
+// es un "error:" reintentable.
+const webhookEventResolvedSQL = `(processed_at IS NOT NULL AND review_at IS NULL AND COALESCE(outcome,'') NOT LIKE 'error:%')`
+
+// ClaimWebhookEvent toma un lease de procesamiento (claimed_until) sobre un
+// evento sin resolver, con un UPDATE atómico: entre varios trabajadores o
+// réplicas (el webhook en vivo, el reintento periódico de esta u otra réplica)
+// solo UNO lo obtiene mientras el lease esté vigente. Devuelve false si el
+// evento ya está resuelto, en revisión, o lo tiene otro trabajador. El lease
+// se libera al asentar el resultado; si el proceso se cae, vence solo.
+func ClaimWebhookEvent(db *sql.DB, id uuid.UUID, lease time.Duration) (bool, error) {
+	res, err := db.Exec(`UPDATE webhook_events SET claimed_until = NOW() + $2::interval
+		WHERE id=$1 AND review_at IS NULL
+		  AND (processed_at IS NULL OR outcome LIKE 'error:%')
+		  AND (claimed_until IS NULL OR claimed_until < NOW())`,
+		id, fmt.Sprintf("%d seconds", int64(lease.Seconds())))
+	if err != nil { return false, err }
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // MarkWebhookEventProcessed anota cómo terminó de procesarse un webhook ya
 // registrado con LogWebhookEvent — outcome es un texto corto y legible
 // ("credited", "ignored: not approved", "error: ...", etc.), no un código.
+//
+// Concurrencia (varios trabajadores pueden procesar el mismo evento):
+//   - un resultado FINAL (no "error:") gana siempre sobre un fallo: deja el
+//     evento resuelto, lo saca de revisión y limpia sus campos de reintento
+//     (review_at, next_attempt_at, last_error, lease); conserva "attempts" como
+//     historial. Si ya estaba resuelto, no se sobrescribe (se conserva el
+//     primer resultado).
+//   - un "error:" NUNCA sobrescribe un evento ya resuelto ni uno en revisión:
+//     un fallo atrasado no pisa un éxito.
 func MarkWebhookEventProcessed(db *sql.DB, id uuid.UUID, outcome string) {
-	if _, err := db.Exec(`UPDATE webhook_events SET outcome=$1, processed_at=NOW() WHERE id=$2`, outcome, id); err != nil {
+	var err error
+	if strings.HasPrefix(outcome, "error:") {
+		_, err = db.Exec(`UPDATE webhook_events SET outcome=$1, processed_at=NOW(), claimed_until=NULL
+			WHERE id=$2 AND review_at IS NULL AND (processed_at IS NULL OR outcome LIKE 'error:%')`, outcome, id)
+	} else {
+		_, err = db.Exec(`UPDATE webhook_events
+			SET outcome=$1, processed_at=NOW(), review_at=NULL, next_attempt_at=NULL, last_error=NULL, claimed_until=NULL
+			WHERE id=$2 AND NOT `+webhookEventResolvedSQL, outcome, id)
+	}
+	if err != nil {
 		slog.Error("no se pudo actualizar webhook_event", "id", id, "error", err)
 	}
 }
@@ -2045,21 +2218,25 @@ func MarkWebhookEventProcessed(db *sql.DB, id uuid.UUID, outcome string) {
 // LogWebhookEvent + MarkWebhookEventProcessed por separado. Esas dos
 // escrituras dejan una ventana real entre "insertar" (processed_at NULL) y
 // "marcar resuelto": si el proceso se cae justo en el medio, o la segunda
-// escritura falla por cualquier motivo (antes ni siquiera se propagaba ese
-// error al llamador), el evento queda con processed_at NULL — exactamente
-// la condición que GetUnresolvedWebhookEvents usa para decidir qué
-// reintentar. RetryFailedWebhookEvents reprocesa TODO evento sin resolver
-// de una pasarela SIN volver a exigir firma, así que un rechazo que
-// quedara a medias terminaría, tarde o temprano, tratándose como si fuera
-// una notificación legítima. Con una única sentencia INSERT que ya trae
-// processed_at/outcome, no existe ningún estado intermedio: o el evento
-// queda registrado YA resuelto, o (si la escritura falla) no queda
-// registrado en absoluto — nunca "a medio resolver". outcome NUNCA debe
-// empezar con "error:" (ver el filtro de GetUnresolvedWebhookEvents), o el
-// rechazo pasaría a ser candidato a reintento.
-func LogRejectedWebhookEvent(db *sql.DB, gateway, rawBody, outcome string) error {
-	_, err := db.Exec(`INSERT INTO webhook_events (id, gateway, raw_body, received_at, processed_at, outcome) VALUES ($1,$2,$3,NOW(),NOW(),$4)`,
-		uuid.New(), gateway, rawBody, outcome)
+// escritura falla por cualquier motivo, el evento queda con processed_at
+// NULL — exactamente la condición que GetUnresolvedWebhookEvents usa para
+// decidir qué reintentar. RetryFailedWebhookEvents reprocesa TODO evento sin
+// resolver de una pasarela SIN volver a exigir firma, así que un rechazo que
+// quedara a medias terminaría tratándose como si fuera una notificación
+// legítima. Con una única sentencia INSERT que ya trae processed_at/outcome,
+// no existe ningún estado intermedio: o el evento queda registrado YA
+// resuelto, o (si la escritura falla) no queda registrado en absoluto.
+//
+// PRIVACIDAD: el cuerpo de un evento rechazado es contenido de un tercero
+// sin autenticar, así que NO se guarda (raw_body queda NULL). Solo se deja
+// constancia de la pasarela, la fecha, el motivo, el tamaño y el SHA-256 del
+// cuerpo (sirve para reconocer un mismo intento repetido sin conservar su
+// contenido). El outcome siempre empieza con "rejected:" — NUNCA con
+// "error:" (ver el filtro de GetUnresolvedWebhookEvents).
+func LogRejectedWebhookEvent(db *sql.DB, gateway, reason string, bodySize int, bodySHA256 string) error {
+	_, err := db.Exec(`INSERT INTO webhook_events (id, gateway, raw_body, body_size, body_sha256, received_at, processed_at, outcome)
+		VALUES ($1,$2,NULL,$3,$4,NOW(),NOW(),$5)`,
+		uuid.New(), gateway, bodySize, bodySHA256, "rejected: "+reason)
 	if err != nil {
 		slog.Error("no se pudo registrar el rechazo de webhook_event", "gateway", gateway, "error", err)
 	}
@@ -2100,11 +2277,14 @@ func GetUnresolvedWebhookEvents(db *sql.DB, gateway string, minAge time.Duration
 	// del puesto 50 nunca llegaba a reintentarse mientras esos 50 no se
 	// resolvieran.
 	rows, err := db.Query(`
-		SELECT id, raw_body
+		SELECT id, raw_body, attempts
 		FROM webhook_events
 		WHERE gateway=$1
 		  AND (processed_at IS NULL OR outcome LIKE 'error:%')
+		  AND review_at IS NULL
 		  AND received_at < NOW() - $2::interval
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+		  AND (claimed_until IS NULL OR claimed_until < NOW())
 		ORDER BY processed_at ASC NULLS FIRST LIMIT 50`,
 		gateway, fmt.Sprintf("%d seconds", int(minAge.Seconds())))
 	if err != nil { return nil, err }
@@ -2113,11 +2293,128 @@ func GetUnresolvedWebhookEvents(db *sql.DB, gateway string, minAge time.Duration
 	for rows.Next() {
 		var e types.WebhookEvent
 		var rawBody sql.NullString
-		if err := rows.Scan(&e.ID, &rawBody); err != nil { return nil, err }
+		if err := rows.Scan(&e.ID, &rawBody, &e.Attempts); err != nil { return nil, err }
 		e.RawBody = rawBody.String
 		events = append(events, e)
 	}
 	return events, nil
+}
+
+// PurgeProcessedWebhookEvents borra los webhook_events YA procesados cuyo
+// PROCESAMIENTO terminó hace más de "retention". La antigüedad se mide desde
+// processed_at (no desde received_at): un evento recibido hace mucho pero
+// que recién acaba de resolverse (p. ej. tras varios reintentos) conserva su
+// registro todo el período de retención después de resolverse. Nunca borra:
+//   - eventos sin resolver (processed_at IS NULL) — todavía pueden estar en
+//     curso o pendientes de reintento;
+//   - eventos de NOWPayments cuyo outcome empieza con "error:" —
+//     GetUnresolvedWebhookEvents los sigue reintentando;
+//   - eventos en la bandeja de revisión manual (review_at IS NOT NULL) —
+//     un admin todavía tiene que resolverlos.
+// Devuelve cuántas filas se borraron.
+func PurgeProcessedWebhookEvents(db *sql.DB, retention time.Duration) (int64, error) {
+	res, err := db.Exec(`
+		DELETE FROM webhook_events
+		WHERE processed_at IS NOT NULL
+		  AND processed_at < NOW() - $1::interval
+		  AND review_at IS NULL
+		  AND NOT (gateway = 'nowpayments' AND COALESCE(outcome, '') LIKE 'error:%')`,
+		fmt.Sprintf("%d seconds", int64(retention.Seconds())))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ErrWebhookEventAlreadySettled: el evento ya estaba resuelto o en revisión
+// cuando llegó un fallo atrasado; no se modifica.
+var ErrWebhookEventAlreadySettled = errors.New("webhook_event ya resuelto o en revisión")
+
+// RecordWebhookRetryFailure registra un intento FALLIDO de reprocesar un
+// evento y decide qué sigue, en una sola transacción con lock de fila:
+//   - permanent=true (error que reintentar no arregla) o attempts+1 >=
+//     maxAttempts (se agotó el umbral): el evento pasa a la bandeja de
+//     revisión manual (review_at, outcome "review: ..."). Se CONSERVA con
+//     todos sus datos — nunca se descarta — y sale del reintento automático
+//     hasta que un admin lo reencole (RequeueWebhookEvent).
+//   - si no: sigue reintentable (outcome "error: ...") pero con
+//     next_attempt_at = ahora + backoff(attempts+1), para no repetir el
+//     mismo error en cada pasada.
+// Devuelve si pasó a revisión y el número de intentos acumulado.
+func RecordWebhookRetryFailure(db *sql.DB, id uuid.UUID, outcome string, permanent bool, maxAttempts int, backoff func(attempt int) time.Duration) (movedToReview bool, attempts int, err error) {
+	tx, err := db.Begin()
+	if err != nil { return false, 0, err }
+	defer tx.Rollback()
+
+	var resolved, inReview bool
+	if err := tx.QueryRow(`SELECT attempts, `+webhookEventResolvedSQL+`, review_at IS NOT NULL FROM webhook_events WHERE id=$1 FOR UPDATE`, id).Scan(&attempts, &resolved, &inReview); err != nil {
+		return false, 0, err
+	}
+	// Un fallo ATRASADO (otro trabajador ya resolvió el evento con éxito, o ya
+	// está en revisión) no lo sobrescribe.
+	if resolved || inReview {
+		return false, attempts, ErrWebhookEventAlreadySettled
+	}
+	attempts++
+	if permanent || attempts >= maxAttempts {
+		reviewOutcome := "review: " + strings.TrimPrefix(outcome, "error: ")
+		if _, err = tx.Exec(`UPDATE webhook_events
+			SET attempts=$1, last_error=$2, outcome=$3, processed_at=NOW(), review_at=NOW(), next_attempt_at=NULL, claimed_until=NULL
+			WHERE id=$4`, attempts, outcome, reviewOutcome, id); err != nil {
+			return false, attempts, err
+		}
+		return true, attempts, tx.Commit()
+	}
+	if _, err = tx.Exec(`UPDATE webhook_events
+		SET attempts=$1, last_error=$2, outcome=$2, processed_at=NOW(), next_attempt_at=NOW() + $3::interval, claimed_until=NULL
+		WHERE id=$4`, attempts, outcome, fmt.Sprintf("%d seconds", int64(backoff(attempts).Seconds())), id); err != nil {
+		return false, attempts, err
+	}
+	return false, attempts, tx.Commit()
+}
+
+// WebhookReviewItem es una fila de la bandeja de revisión manual.
+type WebhookReviewItem struct {
+	ID         uuid.UUID `json:"id"`
+	Gateway    string    `json:"gateway"`
+	RawBody    string    `json:"raw_body"`
+	Outcome    string    `json:"outcome"`
+	LastError  string    `json:"last_error"`
+	Attempts   int       `json:"attempts"`
+	ReceivedAt time.Time `json:"received_at"`
+	ReviewAt   time.Time `json:"review_at"`
+}
+
+// ListWebhookEventsInReview lista la bandeja de revisión manual (más
+// recientes primero).
+func ListWebhookEventsInReview(db *sql.DB, limit int) ([]WebhookReviewItem, error) {
+	if limit <= 0 || limit > 200 { limit = 100 }
+	rows, err := db.Query(`
+		SELECT id, gateway, COALESCE(raw_body,''), COALESCE(outcome,''), COALESCE(last_error,''), attempts, received_at, review_at
+		FROM webhook_events WHERE review_at IS NOT NULL ORDER BY review_at DESC LIMIT $1`, limit)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var items []WebhookReviewItem
+	for rows.Next() {
+		var it WebhookReviewItem
+		if err := rows.Scan(&it.ID, &it.Gateway, &it.RawBody, &it.Outcome, &it.LastError, &it.Attempts, &it.ReceivedAt, &it.ReviewAt); err != nil {
+			return nil, err
+		}
+		items = append(items, it)
+	}
+	return items, rows.Err()
+}
+
+// RequeueWebhookEvent devuelve un evento de la bandeja de revisión al
+// reintento automático (reinicia intentos y backoff). Devuelve false si el
+// evento no estaba en revisión.
+func RequeueWebhookEvent(db *sql.DB, id uuid.UUID) (bool, error) {
+	res, err := db.Exec(`UPDATE webhook_events
+		SET review_at=NULL, attempts=0, next_attempt_at=NULL, claimed_until=NULL, outcome='error: reencolado manualmente', processed_at=NOW()
+		WHERE id=$1 AND review_at IS NOT NULL`, id)
+	if err != nil { return false, err }
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // CreateOAuthLoginCode genera un código de un solo uso (32 bytes al azar,
@@ -2209,10 +2506,29 @@ func TouchPaymentReconciled(db *sql.DB, id uuid.UUID) error {
 // de decidir qué hacer con su estado — para que quede disponible de forma
 // duradera para la reconciliación automática aunque el proceso se caiga
 // justo después de recibir el webhook.
+//
+// Solo aplica a pagos de NOWPayments y exige que el UPDATE afecte EXACTAMENTE
+// una fila: si la transacción local no existe (o es de otra pasarela) devuelve
+// ErrPaymentTransactionNotFound en vez de dar el guardado por exitoso, para que
+// el llamador no marque como procesado un evento cuyo pago sigue sin resolver.
 func SetProviderPaymentID(db *sql.DB, id uuid.UUID, providerPaymentID string) error {
-	_, err := db.Exec(`UPDATE payment_transactions SET provider_payment_id=$1, updated_at=NOW() WHERE id=$2`, providerPaymentID, id)
-	return err
+	res, err := db.Exec(`UPDATE payment_transactions SET provider_payment_id=$1, updated_at=NOW() WHERE id=$2 AND gateway='nowpayments'`, providerPaymentID, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrPaymentTransactionNotFound
+	}
+	return nil
 }
+
+// ErrPaymentTransactionNotFound: no hay una transacción local de NOWPayments
+// con ese id.
+var ErrPaymentTransactionNotFound = errors.New("transacción de pago de NOWPayments no encontrada")
 
 // GetAllPaymentTransactions pagina los pagos del panel admin — status
 // (opcional, "all" o vacío = sin filtrar) se aplica en la base de datos
@@ -2329,7 +2645,14 @@ func GetRechargeHistoryByCustomer(db *sql.DB, customerID uuid.UUID, page, limit 
 
 // ==================== REFRESH TOKENS ====================
 
-func CreateRefreshToken(db *sql.DB, customerID uuid.UUID, tokenHash string, expiresAt time.Time) error {
+// sqlExecutor lo cumplen *sql.DB y *sql.Tx: permite que el consumo y la
+// creación de refresh tokens corran igual dentro o fuera de una transacción.
+type sqlExecutor interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+func CreateRefreshToken(db sqlExecutor, customerID uuid.UUID, tokenHash string, expiresAt time.Time) error {
 	_, err := db.Exec(`
 		INSERT INTO refresh_tokens (id, customer_id, token_hash, expires_at, created_at)
 		VALUES ($1, $2, $3, $4, NOW())`,
@@ -2337,14 +2660,75 @@ func CreateRefreshToken(db *sql.DB, customerID uuid.UUID, tokenHash string, expi
 	return err
 }
 
-func GetRefreshToken(db *sql.DB, tokenHash string) (types.RefreshToken, error) {
+// RefreshTokenOwner devuelve el cliente dueño de un refresh token vigente
+// SIN bloquear ni consumir nada (sql.ErrNoRows si no existe o expiró). Sirve
+// para tomar primero el candado de la cuenta (ver LockCustomerActive) y solo
+// después consumir el token, en el mismo orden que la desactivación.
+func RefreshTokenOwner(db sqlExecutor, tokenHash string) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := db.QueryRow(`SELECT customer_id FROM refresh_tokens WHERE token_hash=$1 AND expires_at > NOW()`, tokenHash).Scan(&id)
+	return id, err
+}
+
+// LockCustomerActive toma un candado FOR SHARE sobre la fila del cliente (dentro
+// de tx) y devuelve su is_active. sql.ErrNoRows = la cuenta no existe; cualquier
+// otro error es OPERATIVO y el llamador debe revertir sin consumir nada.
+//
+// Orden de bloqueo: DeactivateCustomerByAdmin y DeleteOwnAccount hacen UPDATE
+// customers (candado de fila) y DESPUÉS DELETE refresh_tokens. El refresh sigue
+// el MISMO orden — cliente y luego tokens —, así que no hay deadlock, y una
+// desactivación concurrente o bien espera a que el refresh confirme (y luego
+// borra también el token nuevo) o bien confirma antes (y el refresh ve la
+// cuenta inactiva). Nunca queda un token emitido tras revocar las sesiones.
+func LockCustomerActive(tx *sql.Tx, id uuid.UUID) (bool, error) {
+	var active bool
+	err := tx.QueryRow(`SELECT is_active FROM customers WHERE id=$1 FOR SHARE`, id).Scan(&active)
+	return active, err
+}
+
+// ConsumeRefreshToken valida Y consume un refresh token en UNA sola
+// sentencia atómica (DELETE ... RETURNING). Antes el refresh hacía
+// un SELECT y luego DeleteRefreshToken por separado: dos
+// solicitudes concurrentes con el MISMO token podían ambas pasar el SELECT
+// antes de que cualquiera lo borrara, y las dos rotaban el token y recibían
+// una sesión nueva (un token robado y el legítimo, usados a la vez, salían
+// los dos con sesión). Con esto, exactamente UNA solicitud borra la fila y
+// recibe sus datos; la otra ve sql.ErrNoRows.
+func ConsumeRefreshToken(db sqlExecutor, tokenHash string) (types.RefreshToken, error) {
 	var t types.RefreshToken
 	err := db.QueryRow(`
-		SELECT id, customer_id, token_hash, expires_at, created_at
-		FROM refresh_tokens
-		WHERE token_hash=$1 AND expires_at > NOW()`, tokenHash).
+		DELETE FROM refresh_tokens
+		WHERE token_hash=$1 AND expires_at > NOW()
+		RETURNING id, customer_id, token_hash, expires_at, created_at`, tokenHash).
 		Scan(&t.ID, &t.CustomerID, &t.TokenHash, &t.ExpiresAt, &t.CreatedAt)
 	return t, err
+}
+
+// HasInactiveOAuthAccount dice si existe una cuenta INACTIVA (desactivada
+// por un admin) vinculada a este proveedor OAuth o con este mismo correo.
+// GetCustomerByGoogleID/DiscordID/Email solo devuelven cuentas activas, así
+// que sin esta comprobación un login OAuth de una cuenta desactivada caía
+// en la rama "cliente nuevo" y arrancaba un registro nuevo en vez de
+// rechazarse. Una cuenta autoeliminada (DeleteOwnAccount) ya no conserva ni
+// google_id/discord_id ni el correo real, así que no coincide — puede volver
+// a registrarse. provider debe ser "google" o "discord".
+func HasInactiveOAuthAccount(db *sql.DB, provider, providerID string, email *string) (bool, error) {
+	column := "google_id"
+	if provider == "discord" {
+		column = "discord_id"
+	} else if provider != "google" {
+		return false, fmt.Errorf("proveedor OAuth desconocido: %q", provider)
+	}
+	emailValue := ""
+	if email != nil { emailValue = strings.ToLower(strings.TrimSpace(*email)) }
+	var exists bool
+	err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM customers
+			WHERE is_active = false
+			  AND (`+column+` = $1 OR ($2 <> '' AND LOWER(email) = $2))
+		)`, providerID, emailValue).Scan(&exists)
+	return exists, err
 }
 
 func DeleteRefreshToken(db *sql.DB, tokenHash string) error {
@@ -2352,17 +2736,32 @@ func DeleteRefreshToken(db *sql.DB, tokenHash string) error {
 	return err
 }
 
-// DeleteAllRefreshTokensForCustomer revoca TODAS las sesiones (refresh
-// tokens) de una cuenta — se usa al cambiar la contraseña, para que un
-// atacante que ya tuviera un refresh token robado (de antes del cambio) no
-// pueda seguir renovando su sesión indefinidamente después de que el dueño
-// real haya "cerrado la puerta" cambiando su contraseña.
-func DeleteAllRefreshTokensForCustomer(db *sql.DB, customerID uuid.UUID) error {
-	_, err := db.Exec(`DELETE FROM refresh_tokens WHERE customer_id=$1`, customerID)
-	return err
-}
-
 // ==================== AUDIT LOG ====================
+
+// GetBestSellingOfferIDs devuelve los offerId de la tienda más vendidos en la
+// ventana indicada (hasta "limit"), de más a menos ventas y, en empate, el de
+// venta más reciente primero. Cuenta pedidos que se cobraron de verdad: excluye
+// los fallidos y los reembolsados. Solo expone ids — nunca cantidades ni datos
+// de clientes.
+func GetBestSellingOfferIDs(db *sql.DB, window time.Duration, limit int) ([]string, error) {
+	rows, err := db.Query(`
+		SELECT item_offer_id
+		FROM orders
+		WHERE created_at > NOW() - $1::interval
+		  AND status NOT IN ('failed', 'refunded')
+		GROUP BY item_offer_id
+		ORDER BY COUNT(*) DESC, MAX(created_at) DESC
+		LIMIT $2`, fmt.Sprintf("%d seconds", int64(window.Seconds())), limit)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil { return nil, err }
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
 
 func AddAuditLog(db *sql.DB, customerID *uuid.UUID, action, details, ip string) {
 	go func() {

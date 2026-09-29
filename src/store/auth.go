@@ -380,6 +380,13 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 		req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
 		customer, err := db.GetCustomerByEmail(database, req.Email)
+		// Una cuenta inactiva se trata igual que una inexistente ("credenciales
+		// inválidas", sin revelar su estado): nunca se emiten JWT ni refresh
+		// tokens para ella. GetCustomerByEmail ya filtra is_active; el chequeo
+		// explícito no depende de ese detalle de la consulta.
+		if err == nil && !customer.IsActive {
+			err = sql.ErrNoRows
+		}
 		if err != nil {
 			// Comparación bcrypt "de mentira" contra un hash fijo — sin esto,
 			// un correo inexistente responde casi instantáneo mientras que uno
@@ -490,6 +497,11 @@ func HandlerLogin(database *sql.DB, secretKey string) gin.HandlerFunc {
 
 // ==================== REFRESH TOKEN ====================
 
+// refreshLockCustomer es la comprobación de actividad con candado de
+// HandlerRefreshToken; variable solo para que las pruebas simulen un error
+// operativo de la base de datos.
+var refreshLockCustomer = db.LockCustomerActive
+
 func HandlerRefreshToken(database *sql.DB, secretKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req types.RefreshTokenRequest
@@ -498,19 +510,76 @@ func HandlerRefreshToken(database *sql.DB, secretKey string) gin.HandlerFunc {
 			return
 		}
 
+		// Validar Y consumir el token en UNA sola operación atómica
+		// (DELETE ... RETURNING): con SELECT + DELETE separados, dos
+		// solicitudes concurrentes con el mismo token podían rotarlo las dos.
+		// Solo la solicitud que efectivamente borra la fila continúa.
+		//
+		// El consumo del token anterior y la inserción del nuevo van en UNA
+		// transacción: si el nuevo no se puede persistir, se revierte también el
+		// consumo y el usuario conserva su sesión renovable (puede reintentar).
+		// Mientras la transacción está abierta, una solicitud concurrente con el
+		// mismo token espera el bloqueo de la fila y después ya no la encuentra.
 		tokenHash := middleware.HashRefreshToken(req.RefreshToken)
-		storedToken, err := db.GetRefreshToken(database, tokenHash)
+		tempErr := func() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "error": "error temporal renovando la sesión, reintenta", "code": "TEMPORARY_ERROR"})
+		}
+		tx, err := database.Begin()
 		if err != nil {
+			slog.Error("refresh: no se pudo abrir la transacción", "error", err)
+			tempErr()
+			return
+		}
+		defer tx.Rollback() // no-op tras Commit
+
+		// Orden de bloqueo (igual que DeactivateCustomerByAdmin/DeleteOwnAccount:
+		// primero la fila del cliente, luego sus tokens): 1) dueño del token sin
+		// bloquear, 2) candado FOR SHARE de la cuenta + is_active, 3) consumir el
+		// token. Así una desactivación concurrente no puede dejar un token nuevo
+		// vivo ni entrar en deadlock con el refresh.
+		ownerID, err := db.RefreshTokenOwner(tx, tokenHash)
+		if err != nil {
+			if err != sql.ErrNoRows {
+				slog.Error("refresh: no se pudo consultar el refresh token", "error", err)
+				tempErr()
+				return
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "refresh token inválido o expirado", "code": "INVALID_REFRESH_TOKEN"})
 			return
 		}
+		active, err := refreshLockCustomer(tx, ownerID)
+		if err != nil && err != sql.ErrNoRows {
+			// Error OPERATIVO: se revierte y NO se consume el refresh token.
+			slog.Error("refresh: no se pudo comprobar la cuenta", "customerID", ownerID, "error", err)
+			tempErr()
+			return
+		}
+		// sql.ErrNoRows (cuenta inexistente) o cuenta inactiva: no recibe tokens
+		// y su refresh token se consume/revoca.
+		accountInactive := err == sql.ErrNoRows || !active
 
-		// Delete the used token (rotation)
-		db.DeleteRefreshToken(database, tokenHash)
-
-		customer, err := db.GetCustomerByID(database, storedToken.CustomerID)
+		storedToken, err := db.ConsumeRefreshToken(tx, tokenHash)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "cliente no encontrado"})
+			if err != sql.ErrNoRows {
+				slog.Error("refresh: no se pudo consumir el refresh token", "error", err)
+				tempErr()
+				return
+			}
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "refresh token inválido o expirado", "code": "INVALID_REFRESH_TOKEN"})
+			return
+		}
+		if accountInactive || storedToken.CustomerID != ownerID {
+			if cerr := tx.Commit(); cerr != nil {
+				slog.Error("refresh: no se pudo confirmar el consumo del token de una cuenta inactiva", "error", cerr)
+			}
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "cuenta desactivada o inexistente", "code": "ACCOUNT_INACTIVE"})
+			return
+		}
+
+		customer, err := db.GetCustomerByID(tx, ownerID)
+		if err != nil {
+			slog.Error("refresh: no se pudo cargar la cuenta", "customerID", ownerID, "error", err)
+			tempErr()
 			return
 		}
 
@@ -526,7 +595,16 @@ func HandlerRefreshToken(database *sql.DB, secretKey string) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error generando refresh token"})
 			return
 		}
-		db.CreateRefreshToken(database, customer.ID, newRefreshHash, time.Now().Add(7*24*time.Hour))
+		if err := db.CreateRefreshToken(tx, customer.ID, newRefreshHash, time.Now().Add(7*24*time.Hour)); err != nil {
+			slog.Error("refresh: no se pudo persistir el nuevo refresh token", "customerID", customer.ID, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error renovando la sesión"})
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			slog.Error("refresh: no se pudo confirmar la rotación del refresh token", "customerID", customer.ID, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error renovando la sesión"})
+			return
+		}
 
 		c.JSON(http.StatusOK, gin.H{
 			"success":       true,
@@ -749,7 +827,7 @@ func HandlerUpdateProfile(database *sql.DB, secretKey string) gin.HandlerFunc {
 			// hasta que su token de acceso (1h) expire, y ahí tendrá que
 			// volver a iniciar sesión con la contraseña nueva — como cualquier
 			// otro.
-			db.DeleteAllRefreshTokensForCustomer(database, customerID)
+			// (Ya se revocaron dentro de la transacción de db.UpdateProfile.)
 
 			// Alerta de seguridad: si no fue el dueño real quien la cambió,
 			// esta es la única forma de que se entere a tiempo.
@@ -1114,17 +1192,23 @@ func HandlerResetPassword(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		if err := db.UpdateProfile(database, resetToken.CustomerID, "", string(hash), nil); err != nil {
+		// Consumir el token, cambiar la contraseña y revocar TODAS las sesiones
+		// ocurre en una sola transacción (mismo motivo que en
+		// HandlerUpdateProfile): sin ventana en la que una renovación concurrente
+		// conserve una sesión anterior, y el token no puede usarse dos veces.
+		if _, err := db.ResetPasswordWithToken(database, req.Token, string(hash)); err != nil {
+			if errors.Is(err, db.ErrResetTokenInvalid) {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "token inválido o expirado"})
+				return
+			}
+			slog.Error("reset password: no se pudo actualizar la contraseña", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando contraseña"})
 			return
 		}
 
-		db.MarkResetTokenUsed(database, req.Token)
 		db.AddAuditLog(database, &resetToken.CustomerID, "PASSWORD_RESET", "contraseña restablecida", c.ClientIP())
 
-		// Mismo motivo que en HandlerUpdateProfile: revocar todas las
-		// sesiones activas y avisar por correo.
-		db.DeleteAllRefreshTokensForCustomer(database, resetToken.CustomerID)
+		// Avisar por correo.
 		if customer, err := db.GetCustomerByID(database, resetToken.CustomerID); err == nil && customer.Email != nil && *customer.Email != "" {
 			lang := c.GetHeader("X-Lang")
 			if lang == "" { lang = "es" }

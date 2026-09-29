@@ -2,6 +2,7 @@ package store
 
 import (
 	"KidStoreStore/src/db"
+	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/middleware"
 	"KidStoreStore/src/safe"
 	"bytes"
@@ -46,9 +47,42 @@ type PaymentConfig struct {
 	DLocalGoSandbox     bool
 	FrontendURL         string
 	BackendURL          string
+	// MercadoPagoWebhookSecret y PayPalWebhookID autentican los webhooks de
+	// esas dos pasarelas (ver webhook_auth.go). Sin el secreto/ID el webhook
+	// se rechaza (falla cerrado) salvo que AllowUnsignedWebhooks sea true Y
+	// AppEnv sea "development" (ver unsignedWebhooksAllowed): opt-in explícito
+	// SOLO para desarrollo, apagado por defecto y sin relación con FRONTEND_URL.
+	MercadoPagoWebhookSecret string
+	PayPalWebhookID          string
+	AllowUnsignedWebhooks    bool
+	AppEnv                   string // APP_ENV; "development" es el único valor que habilita el opt-in
 }
 
 var paymentCfg PaymentConfig
+
+// AppEnvDevelopment es el único APP_ENV en el que ALLOW_UNSIGNED_WEBHOOKS
+// tiene efecto. Cualquier otro valor (incluido vacío) se trata como producción.
+const AppEnvDevelopment = "development"
+
+// unsignedWebhooksAllowed: los webhooks sin firma solo se aceptan con el
+// opt-in explícito Y en un entorno de desarrollo explícito. Con la
+// configuración por defecto (o cualquier entorno de producción) es false.
+func unsignedWebhooksAllowed() bool {
+	return paymentCfg.AllowUnsignedWebhooks && paymentCfg.AppEnv == AppEnvDevelopment
+}
+
+// ResolveUnsignedWebhooks decide el valor efectivo de AllowUnsignedWebhooks al
+// arrancar. Si se pidió fuera de desarrollo, lo IGNORA (false) y devuelve un
+// mensaje de error claro para registrar.
+func ResolveUnsignedWebhooks(requested bool, appEnv string) (allowed bool, errMsg string) {
+	if !requested {
+		return false, ""
+	}
+	if appEnv != AppEnvDevelopment {
+		return false, "ALLOW_UNSIGNED_WEBHOOKS=true se IGNORA: solo tiene efecto con APP_ENV=development (APP_ENV actual: \"" + appEnv + "\"). Los webhooks sin firma seguirán rechazándose"
+	}
+	return true, ""
+}
 
 // nowPaymentsBaseURL apunta a la API real de NOWPayments — variable (en
 // vez de un literal embebido) para que las pruebas puedan redirigirlo a un
@@ -191,10 +225,39 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			KCAmount:    kcAmount,
 		}
 
-		// Create checkout URL based on gateway
+		// dLocal Go cobra en la divisa real del cliente: la conversión se
+		// resuelve ANTES de guardar nada (no hay sesión ni registro que
+		// deshacer si la divisa no se puede convertir).
+		if req.Gateway == "dlocalgo" {
+			currencyCode := req.Currency
+			if currencyCode == "" {
+				currencyCode = "USD"
+			}
+			amountLocal, convErr := convertPENToCurrency(pricePEN, currencyCode)
+			if convErr != nil {
+				slog.Error("Payment currency conversion error", "gateway", req.Gateway, "error", convErr)
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error creando pago: " + convErr.Error()})
+				return
+			}
+			tx.CurrencyCode = currencyCode
+			tx.AmountLocal = amountLocal
+		}
+
+		// 1) Registro local DURABLE primero (pending, sin external_id): nunca se
+		// crea una sesión de cobro en una pasarela sin tener antes un pago
+		// local que la respalde. Antes el orden era el inverso — si guardar
+		// fallaba después de crear la sesión, existía un checkout real, pagable,
+		// que ningún registro nuestro rastreaba. Ver el comentario de estados
+		// en db.SetPaymentExternalID.
+		if err := db.CreatePaymentTransaction(database, tx); err != nil {
+			slog.Error("Payment: no se pudo guardar la transacción local, no se crea ninguna sesión externa", "txID", txID, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error guardando transaccion"})
+			return
+		}
+
+		// 2) Sesión externa en la pasarela.
 		var checkoutURL string
 		var externalID string
-
 		switch req.Gateway {
 		case "mercadopago":
 			checkoutURL, externalID, err = createMercadoPagoPreference(tx)
@@ -203,30 +266,38 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		case "nowpayments":
 			checkoutURL, externalID, err = createNOWPaymentsInvoice(tx)
 		case "dlocalgo":
-			currencyCode := req.Currency
-			if currencyCode == "" {
-				currencyCode = "USD"
-			}
-			var amountLocal float64
-			amountLocal, err = convertPENToCurrency(pricePEN, currencyCode)
-			if err == nil {
-				tx.CurrencyCode = currencyCode
-				tx.AmountLocal = amountLocal
-				checkoutURL, externalID, err = createDLocalGoPayment(tx)
-			}
+			checkoutURL, externalID, err = createDLocalGoPayment(tx)
 		}
-
+		if err == nil && (checkoutURL == "" || externalID == "") {
+			err = fmt.Errorf("respuesta incompleta de la pasarela (sin checkout o sin ID)")
+		}
 		if err != nil {
-			slog.Error("Payment gateway error", "gateway", req.Gateway, "error", err)
+			slog.Error("Payment gateway error", "gateway", req.Gateway, "txID", txID, "error", err)
+			// La sesión no existe (o no es utilizable y nunca se le mostrará al
+			// cliente): el pago local se cierra como 'failed', no queda
+			// "pendiente" indefinidamente.
+			if merr := db.MarkPaymentCreationFailed(database, txID, req.Gateway+": "+truncateForNote(err.Error(), 200)); merr != nil {
+				slog.Error("Payment: no se pudo marcar la creación como fallida (lo cerrará ExpireAbandonedPaymentCreations)", "txID", txID, "error", merr)
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error creando pago: " + err.Error()})
 			return
 		}
 
-		tx.ExternalID = externalID
-		if err := db.CreatePaymentTransaction(database, tx); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error guardando transaccion"})
+		// 3) Persistir el ID externo. Si no se logra, el cliente NUNCA recibe el
+		// checkout (sería una sesión pagable sin rastro): el pago queda en
+		// 'review' CON el ID externo (para que la conciliación lo siga
+		// consultando) y se avisa a un admin.
+		if perr := persistExternalIDWithRetry(database, txID, externalID); perr != nil {
+			slog.Error("Payment: la sesión externa se creó pero no se pudo guardar su ID — no se entrega el checkout al cliente",
+				"txID", txID, "gateway", req.Gateway, "externalID", externalID, "error", perr)
+			if merr := db.MarkPaymentExternalIDUnsaved(database, txID, externalID); merr != nil {
+				slog.Error("Payment: tampoco se pudo dejar el pago en revisión con su ID externo", "txID", txID, "externalID", externalID, "error", merr)
+			}
+			discordbot.AlertPaymentSessionUntracked(txID.String(), req.Gateway, externalID)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "no se pudo iniciar el pago, intenta de nuevo"})
 			return
 		}
+		tx.ExternalID = externalID
 
 		db.AddAuditLog(database, &customerID, "PAYMENT_CREATED",
 			fmt.Sprintf("pago %s via %s: %s (S/%.2f)", txID, req.Gateway, productName, pricePEN), c.ClientIP())
@@ -238,6 +309,32 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			"external_id":  externalID,
 		})
 	}
+}
+
+// persistExternalIDBackoff: esperas entre los intentos de guardar el ID
+// externo (variable para que las pruebas no esperen de verdad).
+var persistExternalIDBackoff = []time.Duration{100 * time.Millisecond, 400 * time.Millisecond}
+
+// persistExternalIDWithRetry guarda el ID de la sesión externa con unos pocos
+// reintentos cortos (un fallo transitorio de base de datos no debería tirar
+// un checkout ya creado).
+func persistExternalIDWithRetry(database *sql.DB, txID uuid.UUID, externalID string) error {
+	err := db.SetPaymentExternalID(database, txID, externalID)
+	for _, wait := range persistExternalIDBackoff {
+		if err == nil {
+			return nil
+		}
+		time.Sleep(wait)
+		err = db.SetPaymentExternalID(database, txID, externalID)
+	}
+	return err
+}
+
+func truncateForNote(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
 
 // ==================== PAYMENT STATUS ====================
@@ -706,10 +803,7 @@ func getPayPalAccessToken() (string, error) {
 		return "", fmt.Errorf("PayPal not configured")
 	}
 
-	baseURL := "https://api-m.sandbox.paypal.com"
-	if paymentCfg.PayPalMode == "live" {
-		baseURL = "https://api-m.paypal.com"
-	}
+	baseURL := payPalBaseURL()
 
 	req, _ := http.NewRequest("POST", baseURL+"/v1/oauth2/token", bytes.NewBufferString("grant_type=client_credentials"))
 	req.SetBasicAuth(paymentCfg.PayPalClientID, paymentCfg.PayPalClientSecret)

@@ -15,6 +15,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -154,44 +156,160 @@ var (
 	shopCache   = map[string]*shopCacheEntry{}
 	shopTTL     = 5 * time.Minute
 	shopClient  = &http.Client{Timeout: 10 * time.Second}
+
+	// shopFailBackoff: tras un fallo del proveedor, durante este tiempo se sirve
+	// directamente la copia _stale sin volver a intentarlo. Sin esto, mientras
+	// fortnite-api.com siguiera caído CADA visita esperaría dos intentos
+	// fallidos (hasta 10 s si el proveedor no responde) antes de recibir la
+	// copia de respaldo.
+	shopFailBackoff = 60 * time.Second
+	shopLastFailure = map[string]time.Time{} // protegido por shopCacheMu
 )
+
+// shopDiskCacheDir guarda la última respuesta BUENA de cada idioma en un
+// archivo temporal — sobrevive a un reinicio del proceso, a diferencia de la
+// caché en memoria de arriba. Nunca se lee como fuente primaria (siempre se
+// prefiere una respuesta fresca del proveedor); solo respalda la caché en
+// memoria cuando el proceso acaba de arrancar y fortnite-api.com falla antes
+// de que haya podido rellenarla.
+var shopDiskCacheDir = filepath.Join(os.TempDir(), "kidstore-shop-cache")
+
+func shopDiskCachePath(lang string) string {
+	// lang ya está restringido a "es-419"/"en" por el llamador — sin
+	// caracteres que puedan escapar el directorio.
+	return filepath.Join(shopDiskCacheDir, "shop-"+lang+".json")
+}
+
+func loadShopDiskCache(lang string) ([]byte, bool) {
+	body, err := os.ReadFile(shopDiskCachePath(lang))
+	if err != nil || len(body) == 0 {
+		return nil, false
+	}
+	return body, true
+}
+
+func saveShopDiskCache(lang string, body []byte) {
+	if err := os.MkdirAll(shopDiskCacheDir, 0o755); err != nil {
+		slog.Warn("no se pudo crear el directorio de caché de la tienda", "error", err)
+		return
+	}
+	if err := os.WriteFile(shopDiskCachePath(lang), body, 0o644); err != nil {
+		slog.Warn("no se pudo escribir la caché en disco de la tienda", "error", err)
+	}
+}
+
+// markStale marca el JSON de la tienda como `_stale: true` — el frontend lo
+// usa para avisar que estos datos no son la respuesta en vivo del proveedor
+// (ver services/getShop en el frontend). Si el cuerpo no es un objeto JSON
+// válido, se devuelve tal cual (no debería pasar: solo se guarda en caché lo
+// que ya se parseó una vez como JSON válido).
+func markStale(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	m["_stale"] = json.RawMessage("true")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// shopAPIURL apunta a la tienda real de fortnite-api.com — variable (no un
+// literal embebido) para que las pruebas puedan redirigirla a un
+// httptest.Server, igual que nowPaymentsBaseURL.
+var shopAPIURL = "https://fortnite-api.com/v2/shop"
+
+// staleShopBody devuelve la última tienda buena marcada _stale: la de memoria
+// (aunque esté vencida) o, si el proceso acaba de arrancar, la del archivo en
+// disco de la vez anterior.
+func staleShopBody(lang string, entry *shopCacheEntry, inMemory bool) ([]byte, bool) {
+	if inMemory {
+		return markStale(entry.body), true
+	}
+	if diskBody, hit := loadShopDiskCache(lang); hit {
+		return markStale(diskBody), true
+	}
+	return nil, false
+}
+
+// requestShopOnce hace UN intento de pedirle la tienda a fortnite-api.com —
+// sin caché ni reintento, eso lo maneja fetchShopBody.
+func requestShopOnce(ctx context.Context, lang string) ([]byte, error) {
+	url := fmt.Sprintf("%s?language=%s", shopAPIURL, lang)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error preparando request: %w", err)
+	}
+	// cache: "no-store" del lado del cliente — este proceso es la única
+	// caché real (memoria + disco, con su propio TTL); no hace falta (ni
+	// conviene) que nada intermedio guarde también su copia.
+	req.Header.Set("Cache-Control", "no-cache")
+
+	resp, err := shopClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error obteniendo tienda: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fortnite-api.com respondió %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error leyendo respuesta: %w", err)
+	}
+	return body, nil
+}
 
 // fetchShopBody devuelve el JSON crudo de la tienda actual de Fortnite (desde
 // caché si sigue fresco, o pidiéndolo a fortnite-api.com si no) — lo usan
 // tanto el endpoint público /store/shop como la verificación de precios al
 // crear un pedido, para que ambos vean siempre los mismos datos.
+//
+// Si fortnite-api.com falla: reintenta UNA vez antes de rendirse, y si sigue
+// fallando devuelve la última respuesta buena que haya (memoria, o si el
+// proceso acaba de arrancar, el archivo temporal de la vez anterior) marcada
+// `_stale`, en vez de un error — el catálogo sigue mostrándose, aunque
+// desactualizado. Solo devuelve error si el proveedor falla Y nunca hubo
+// ninguna respuesta buena.
 func fetchShopBody(ctx context.Context, lang string) ([]byte, error) {
 	shopCacheMu.RLock()
 	entry, ok := shopCache[lang]
+	lastFail, failed := shopLastFailure[lang]
 	shopCacheMu.RUnlock()
 	if ok && time.Since(entry.fetchedAt) < shopTTL {
 		return entry.body, nil
 	}
+	if failed && time.Since(lastFail) < shopFailBackoff {
+		if stale, hit := staleShopBody(lang, entry, ok); hit {
+			return stale, nil
+		}
+	}
 
-	url := fmt.Sprintf("https://fortnite-api.com/v2/shop?language=%s", lang)
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	body, err := requestShopOnce(reqCtx, lang)
 	if err != nil {
-		return nil, fmt.Errorf("error preparando request: %w", err)
+		slog.Warn("HandlerGetShop: primer intento falló, reintentando una vez", "lang", lang, "error", err)
+		body, err = requestShopOnce(reqCtx, lang)
 	}
-
-	resp, err := shopClient.Do(req)
 	if err != nil {
-		if ok { return entry.body, nil } // stale cache es mejor que nada
+		shopCacheMu.Lock()
+		shopLastFailure[lang] = time.Now()
+		shopCacheMu.Unlock()
+		if stale, hit := staleShopBody(lang, entry, ok); hit {
+			return stale, nil
+		}
 		return nil, fmt.Errorf("error obteniendo tienda: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error leyendo respuesta: %w", err)
 	}
 
 	shopCacheMu.Lock()
 	shopCache[lang] = &shopCacheEntry{body: body, fetchedAt: time.Now()}
+	delete(shopLastFailure, lang)
 	shopCacheMu.Unlock()
+	saveShopDiskCache(lang, body)
 
 	return body, nil
 }
@@ -209,7 +327,125 @@ func HandlerGetShop(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "no se pudo obtener la tienda, intenta de nuevo"})
 		return
 	}
+	// El cliente ya guarda su propia caché de 10 min (ver useShopData en el
+	// frontend) y "Actualizar" la salta con cache:"no-store" — estas
+	// cabeceras son para cualquier intermediario (CDN/navegador) entre medio:
+	// puede servir esta respuesta hasta 10 min, y mientras revalida en
+	// segundo plano puede seguir sirviendo la vieja hasta 30 min más.
+	c.Header("Cache-Control", "public, s-maxage=600, stale-while-revalidate=1800")
 	c.Data(http.StatusOK, "application/json", body)
+}
+
+// ==================== LO MÁS VENDIDO DE HOY ====================
+
+// La tienda oficial tiene una sección "LO MÁS VENDIDO DE HOY" que fortnite-api
+// no trae. Acá se arma con NUESTRAS ventas reales: los objetos que más se
+// pidieron, limitados a los que siguen en la tienda de hoy (algo que ya rotó no
+// se puede comprar). Si en 24 h no hay suficientes, se amplía la ventana a 7 y
+// luego a 30 días; si ni así se llega al mínimo, no se muestra la sección (una
+// fila casi vacía se ve peor que no tenerla).
+var (
+	bestSellerWindows = []time.Duration{24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour}
+	bestSellersMin    = 4
+	bestSellersMax    = 8
+	bestSellersTTL    = 5 * time.Minute
+
+	bestSellersMu    sync.Mutex
+	bestSellersCache []string
+	bestSellersAt    time.Time
+	bestSellersShop  string // fecha de la tienda con la que se calculó (cambia al rotar)
+)
+
+// currentShopOfferIDs: offerIds que la tienda de hoy MUESTRA (con layout) y la
+// fecha de la rotación.
+func currentShopOfferIDs(ctx context.Context) (map[string]bool, string, error) {
+	body, err := fetchShopBody(ctx, "es-419")
+	if err != nil {
+		return nil, "", err
+	}
+	var parsed struct {
+		Data struct {
+			Date    string `json:"date"`
+			Entries []struct {
+				OfferID string          `json:"offerId"`
+				Layout  json.RawMessage `json:"layout"`
+			} `json:"entries"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, "", err
+	}
+	ids := make(map[string]bool, len(parsed.Data.Entries))
+	for _, e := range parsed.Data.Entries {
+		if len(e.Layout) > 0 && string(e.Layout) != "null" {
+			ids[e.OfferID] = true
+		}
+	}
+	return ids, parsed.Data.Date, nil
+}
+
+// bestSellers calcula el ranking. rank(window) devuelve los más vendidos de esa
+// ventana — inyectable para las pruebas.
+func bestSellers(inShop map[string]bool, rank func(time.Duration) ([]string, error)) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, w := range bestSellerWindows {
+		ids, err := rank(w)
+		if err != nil {
+			return nil, err
+		}
+		// Se agregan en orden: primero lo vendido en 24 h, y solo si hace falta,
+		// lo de ventanas más amplias detrás.
+		for _, id := range ids {
+			if len(out) >= bestSellersMax {
+				break
+			}
+			if inShop[id] && !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+		if len(out) >= bestSellersMin {
+			break
+		}
+	}
+	if len(out) < bestSellersMin {
+		return []string{}, nil
+	}
+	return out, nil
+}
+
+// HandlerGetBestSellers — GET /store/shop/bestsellers → {"offer_ids": [...]}.
+// Público: solo devuelve ids en orden, nunca cuántas unidades se vendieron.
+func HandlerGetBestSellers(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		inShop, shopDate, err := currentShopOfferIDs(c.Request.Context())
+		if err != nil {
+			slog.Error("HandlerGetBestSellers: no se pudo leer la tienda", "error", err)
+			c.JSON(http.StatusOK, gin.H{"offer_ids": []string{}})
+			return
+		}
+
+		bestSellersMu.Lock()
+		defer bestSellersMu.Unlock()
+		if bestSellersCache != nil && bestSellersShop == shopDate && time.Since(bestSellersAt) < bestSellersTTL {
+			c.JSON(http.StatusOK, gin.H{"offer_ids": bestSellersCache})
+			return
+		}
+		ids, err := bestSellers(inShop, func(w time.Duration) ([]string, error) {
+			// Se piden más de los que se muestran: parte puede haber rotado fuera.
+			return db.GetBestSellingOfferIDs(database, w, 60)
+		})
+		if err != nil {
+			// Sin ranking no se rompe la tienda: simplemente no aparece la sección.
+			slog.Error("HandlerGetBestSellers: error consultando ventas", "error", err)
+			c.JSON(http.StatusOK, gin.H{"offer_ids": []string{}})
+			return
+		}
+		bestSellersCache, bestSellersAt, bestSellersShop = ids, time.Now(), shopDate
+		c.Header("Cache-Control", "public, max-age=300")
+		c.JSON(http.StatusOK, gin.H{"offer_ids": ids})
+	}
 }
 
 // shopItem — lo que realmente sabemos de un item de la tienda, sacado de la

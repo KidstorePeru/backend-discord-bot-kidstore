@@ -233,6 +233,41 @@ func AlertUnresolvedPayment(txID, gateway string) {
 	)
 }
 
+// AlertPaymentSessionUntracked avisa que se creó una sesión de cobro en una
+// pasarela pero NO se pudo guardar su ID externo. Al cliente no se le
+// entregó el checkout, así que no debería poder pagarla; el pago quedó en
+// 'review' con el ID (si esa escritura funcionó) para que la conciliación lo
+// siga consultando. Si esa segunda escritura también falló, el ID solo está
+// en los logs del servidor (txID + externalID).
+func AlertPaymentSessionUntracked(txID, gateway, externalID string) {
+	key := "payment_untracked_" + txID
+	if !shouldAlert(key) {
+		return
+	}
+	sendAdminAlert(
+		"🟠 Sesión de pago sin rastro local",
+		fmt.Sprintf("Se creó una sesión en **%s** para el pago **%s** (ID externo: %s) pero no se pudo guardar ese ID. No se le entregó el checkout al cliente. Revisa el pago en el panel (estado 'review') y, si hace falta, la sesión en la pasarela.", gateway, txID, externalID),
+		colorWarnSoft,
+	)
+}
+
+// AlertWebhookNeedsReview avisa que un webhook agotó sus reintentos
+// automáticos (o falló de forma no recuperable) y quedó en la bandeja de
+// revisión manual de webhook_events. El evento se CONSERVA (con su
+// payment_id) hasta que un admin lo reencole — el pago podría todavía
+// cobrarse o necesitar conciliación. Una sola alerta por evento.
+func AlertWebhookNeedsReview(gateway, eventID, detail string) {
+	key := "webhook_review_" + eventID
+	if !shouldAlert(key) {
+		return
+	}
+	sendAdminAlert(
+		"🟠 Webhook en revisión manual",
+		fmt.Sprintf("Un webhook de **%s** (evento %s) no se pudo procesar automáticamente: %s. Quedó guardado en la bandeja de revisión (GET /admin/webhook-events/review); cuando se resuelva la causa, reencólalo con POST /admin/webhook-events/%s/retry.", gateway, eventID, detail, eventID),
+		colorWarnSoft,
+	)
+}
+
 // AlertNoActiveBots es la más urgente de todas: el worker de pedidos no
 // encontró NINGÚN bot disponible para procesar la cola. Los pedidos quedan
 // pendientes hasta que se resuelva. Tiene cooldown propio en vez de

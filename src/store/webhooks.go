@@ -7,12 +7,15 @@ import (
 	"KidStoreStore/src/types"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -66,6 +69,11 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 	return nil
 }
 
+// abandonedPaymentCreationAfter: margen antes de dar por abandonada la
+// creación de un pago sin external_id (muy por encima de los timeouts de
+// las pasarelas, 15 s).
+const abandonedPaymentCreationAfter = 15 * time.Minute
+
 // ReconcilePendingPayments es la red de seguridad para cuando un webhook
 // nunca llega o se pierde en el camino — todos los webhooks de esta misma
 // familia responden "received: true" de inmediato y procesan en una
@@ -77,6 +85,17 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 // HandlerPaymentStatus), y solo mientras el cliente seguía mirando la
 // página. Se llama periódicamente desde main.go.
 func ReconcilePendingPayments(database *sql.DB) {
+	// Pagos que quedaron 'pending' SIN external_id (el proceso se cayó entre
+	// guardar el registro local y crear/persistir la sesión — ver
+	// HandlerCreatePayment): el cliente nunca recibió un checkout, así que se
+	// cierran como 'failed'. GetStalePendingPayments los ignora a propósito
+	// (exige external_id), por eso este barrido va aparte.
+	if n, err := db.ExpireAbandonedPaymentCreations(database, abandonedPaymentCreationAfter); err != nil {
+		slog.Error("reconciliación de pagos: error cerrando creaciones abandonadas", "error", err)
+	} else if n > 0 {
+		slog.Warn("reconciliación de pagos: creaciones abandonadas cerradas", "count", n)
+	}
+
 	stale, err := db.GetStalePendingPayments(database)
 	if err != nil {
 		slog.Error("reconciliación de pagos: error listando pendientes", "error", err)
@@ -339,39 +358,199 @@ func logWebhookEventOrReject(c *gin.Context, database *sql.DB, gateway, body str
 	return eventID, true
 }
 
+// ==================== LÍMITES Y NORMALIZACIÓN DE WEBHOOKS ====================
+
+// maxWebhookBodyBytes acota cuánto se lee de un webhook. Las notificaciones
+// reales de las pasarelas pesan unos cientos de bytes; el límite global de
+// 4 MB de main.go es demasiado para un endpoint público (y, en dos de ellos,
+// sin firma): cada cuerpo se leía completo a memoria, se escribía al log del
+// proceso y se guardaba entero en webhook_events.
+const maxWebhookBodyBytes = 64 << 10 // 64 KiB
+
+// webhookRefPattern es el formato que aceptamos para los identificadores
+// externos (payment_id, order_id) que viajan en un webhook. Los reales son
+// alfanuméricos cortos; cualquier otra cosa (espacios, controles, cientos de
+// caracteres) no es un identificador de pasarela.
+var webhookRefPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,64}$`)
+
+// readWebhookBody lee el cuerpo del request con un tope duro y comprueba el
+// error de lectura (antes MercadoPago/PayPal hacían "body, _ := io.ReadAll",
+// así que un cuerpo truncado o cortado a mitad se procesaba como si fuera
+// el evento completo). Si algo sale mal, ya responde al request y devuelve
+// ok=false: 413 si excede el tope, 400 para cualquier otro fallo de lectura.
+func readWebhookBody(c *gin.Context, gateway string) (body []byte, ok bool) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxWebhookBodyBytes)
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			slog.Warn("webhook: cuerpo demasiado grande, se rechaza", "gateway", gateway, "limit", maxWebhookBodyBytes)
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"received": false, "error": "cuerpo demasiado grande"})
+			return nil, false
+		}
+		slog.Error("webhook: no se pudo leer el cuerpo completo, se rechaza para que reintente", "gateway", gateway, "error", err)
+		c.JSON(http.StatusBadRequest, gin.H{"received": false, "error": "no se pudo leer el cuerpo del request"})
+		return nil, false
+	}
+	return body, true
+}
+
+type webhookVerdict int
+
+const (
+	webhookAccept  webhookVerdict = iota // válido y relevante: se persiste (normalizado) y se procesa
+	webhookIgnore                        // válido pero irrelevante: 200, no se persiste
+	webhookInvalid                       // malformado: 400, no se persiste
+)
+
+// normalizeMercadoPagoEvent valida el cuerpo de un webhook de MercadoPago y
+// devuelve solo lo necesario para procesarlo/reintentarlo: el tipo y el ID
+// del pago. El cuerpo completo (que MercadoPago puede llenar con datos del
+// comprador) nunca se guarda ni se loguea.
+func normalizeMercadoPagoEvent(body []byte) (paymentID string, canonical []byte, verdict webhookVerdict) {
+	var n struct {
+		Type string `json:"type"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &n); err != nil {
+		return "", nil, webhookInvalid
+	}
+	if n.Type != "payment" {
+		return "", nil, webhookIgnore
+	}
+	if !webhookRefPattern.MatchString(n.Data.ID) {
+		return "", nil, webhookInvalid
+	}
+	canonical, err := json.Marshal(n)
+	if err != nil {
+		return "", nil, webhookInvalid
+	}
+	return n.Data.ID, canonical, webhookAccept
+}
+
+// paypalWebhookEvent es la forma normalizada de un webhook de PayPal: solo
+// el tipo de evento y los dos identificadores que el handler usa.
+type paypalWebhookEvent struct {
+	EventType string `json:"event_type"`
+	Resource  struct {
+		ID                string `json:"id"`
+		SupplementaryData struct {
+			RelatedIDs struct {
+				OrderID string `json:"order_id,omitempty"`
+			} `json:"related_ids"`
+		} `json:"supplementary_data"`
+	} `json:"resource"`
+}
+
+// normalizePayPalEvent valida un webhook de PayPal y lo reduce a los campos
+// necesarios (tipo, resource.id y, para PAYMENT.CAPTURE.COMPLETED, el
+// order_id relacionado). Los demás tipos de evento se ignoran sin persistir.
+func normalizePayPalEvent(body []byte) (event paypalWebhookEvent, canonical []byte, verdict webhookVerdict) {
+	var raw paypalWebhookEvent
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return event, nil, webhookInvalid
+	}
+	switch raw.EventType {
+	case "CHECKOUT.ORDER.APPROVED":
+		if !webhookRefPattern.MatchString(raw.Resource.ID) {
+			return event, nil, webhookInvalid
+		}
+		event.EventType = raw.EventType
+		event.Resource.ID = raw.Resource.ID
+	case "PAYMENT.CAPTURE.COMPLETED":
+		orderID := raw.Resource.SupplementaryData.RelatedIDs.OrderID
+		if !webhookRefPattern.MatchString(raw.Resource.ID) || !webhookRefPattern.MatchString(orderID) {
+			return event, nil, webhookInvalid
+		}
+		event.EventType = raw.EventType
+		event.Resource.ID = raw.Resource.ID
+		event.Resource.SupplementaryData.RelatedIDs.OrderID = orderID
+	default:
+		return event, nil, webhookIgnore
+	}
+	canonical, err := json.Marshal(event)
+	if err != nil {
+		return event, nil, webhookInvalid
+	}
+	return event, canonical, webhookAccept
+}
+
+// respondToUnacceptedWebhook contesta a los veredictos que no se persisten:
+// malformado → 400 (la pasarela verá el error), irrelevante → 200. Devuelve
+// true si ya respondió (el handler debe cortar).
+func respondToUnacceptedWebhook(c *gin.Context, gateway string, v webhookVerdict) bool {
+	switch v {
+	case webhookInvalid:
+		slog.Warn("webhook: cuerpo inválido, se rechaza sin guardarlo", "gateway", gateway)
+		c.JSON(http.StatusBadRequest, gin.H{"received": false, "error": "evento inválido"})
+		return true
+	case webhookIgnore:
+		c.JSON(http.StatusOK, gin.H{"received": true})
+		return true
+	}
+	return false
+}
+
+// normalizedPaymentIDEvent arma el registro mínimo {"payment_id":...} de un
+// webhook YA autenticado por firma (NOWPayments, dLocal Go): es lo único que
+// RetryFailedWebhookEvents necesita para reprocesarlo.
+func normalizedPaymentIDEvent(paymentID any) []byte {
+	b, _ := json.Marshal(map[string]any{"payment_id": paymentID})
+	return b
+}
+
+// PurgeProcessedWebhookEvents borra de webhook_events los eventos ya
+// procesados que pasaron el período de retención. Nunca toca un evento sin
+// resolver (processed_at NULL) ni uno de NOWPayments cuyo resultado empieza
+// con "error:" — esos los sigue reintentando RetryFailedWebhookEvents. Se
+// llama periódicamente desde main.go.
+func PurgeProcessedWebhookEvents(database *sql.DB) {
+	n, err := db.PurgeProcessedWebhookEvents(database, webhookEventRetention)
+	if err != nil {
+		slog.Error("PurgeProcessedWebhookEvents: no se pudo purgar webhook_events", "error", err)
+		return
+	}
+	if n > 0 {
+		slog.Info("PurgeProcessedWebhookEvents: eventos procesados purgados", "count", n)
+	}
+}
+
+// webhookEventRetention es cuánto se conserva un webhook_event ya resuelto
+// (útil para diagnosticar y para auditoría reciente) antes de purgarse.
+const webhookEventRetention = 30 * 24 * time.Hour
+
 // ==================== MERCADOPAGO WEBHOOK ====================
 
 func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		body, _ := io.ReadAll(c.Request.Body)
-		slog.Info("MercadoPago webhook received", "body", string(body))
+		body, ok := readWebhookBody(c, "mercadopago")
+		if !ok { return }
+		// 1) AUTENTICAR primero (x-signature, HMAC-SHA256): nada se guarda,
+		// loguea ni procesa antes de saber que el evento viene de Mercado Pago.
+		if verr := verifyMercadoPagoWebhook(c.Request); verr != nil {
+			rejectUnauthenticatedWebhook(c, database, "mercadopago", body, verr)
+			return
+		}
+		// 2) Validar y normalizar ANTES de guardar o loguear: nunca se escribe
+		// el cuerpo crudo (solo el tipo y el ID del pago).
+		paymentID, canonical, verdict := normalizeMercadoPagoEvent(body)
+		if respondToUnacceptedWebhook(c, "mercadopago", verdict) { return }
+		// El data.id de la URL es el que se firmó: tiene que coincidir con el
+		// del cuerpo, o una firma legítima podría reutilizarse con otro pago.
+		if q := c.Query("data.id"); q != "" && !strings.EqualFold(q, paymentID) {
+			respondToUnacceptedWebhook(c, "mercadopago", webhookInvalid)
+			return
+		}
+		slog.Info("MercadoPago webhook received", "paymentID", paymentID)
 		// Registro duradero ANTES de intentar procesar nada — si el proceso
 		// se cae a mitad de camino, queda constancia de que la notificación
 		// sí llegó (ver ReconcilePendingPayments para la recuperación real).
-		eventID, ok := logWebhookEventOrReject(c, database, "mercadopago", string(body))
+		eventID, ok := logWebhookEventOrReject(c, database, "mercadopago", string(canonical))
 		if !ok { return }
 
-		var notification struct {
-			Type string `json:"type"`
-			Data struct {
-				ID string `json:"id"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(body, &notification); err != nil {
-			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON")
-			c.JSON(http.StatusOK, gin.H{"received": true})
-			return
-		}
-
-		// Only process payment notifications
-		if notification.Type != "payment" {
-			db.MarkWebhookEventProcessed(database, eventID, "ignored: type="+notification.Type)
-			c.JSON(http.StatusOK, gin.H{"received": true})
-			return
-		}
-
 		// Query MercadoPago API for payment details
-		paymentID := notification.Data.ID
 		go safe.Run("HandlerMercadoPagoWebhook", func() {
 			outcome := "ignored: not approved"
 			defer func() { db.MarkWebhookEventProcessed(database, eventID, outcome) }()
@@ -433,33 +612,22 @@ func HandlerMercadoPagoWebhook(database *sql.DB) gin.HandlerFunc {
 
 func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		body, _ := io.ReadAll(c.Request.Body)
-		slog.Info("PayPal webhook received", "body", string(body))
-		eventID, ok := logWebhookEventOrReject(c, database, "paypal", string(body))
+		body, ok := readWebhookBody(c, "paypal")
 		if !ok { return }
-
-		var event struct {
-			EventType string `json:"event_type"`
-			Resource  struct {
-				ID                string `json:"id"`
-				SupplementaryData struct {
-					RelatedIDs struct {
-						OrderID string `json:"order_id"`
-					} `json:"related_ids"`
-				} `json:"supplementary_data"`
-			} `json:"resource"`
-		}
-		if err := json.Unmarshal(body, &event); err != nil {
-			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON")
-			c.JSON(http.StatusOK, gin.H{"received": true})
+		// Autenticar primero con la verificación oficial de PayPal
+		// (verify-webhook-signature): nada se guarda ni procesa antes.
+		if verr := verifyPayPalWebhook(c.Request.Header, body); verr != nil {
+			rejectUnauthenticatedWebhook(c, database, "paypal", body, verr)
 			return
 		}
-
-		if event.EventType != "CHECKOUT.ORDER.APPROVED" && event.EventType != "PAYMENT.CAPTURE.COMPLETED" {
-			db.MarkWebhookEventProcessed(database, eventID, "ignored: event_type="+event.EventType)
-			c.JSON(http.StatusOK, gin.H{"received": true})
-			return
-		}
+		// Validar y normalizar ANTES de guardar o loguear: solo se conservan
+		// el tipo de evento y los IDs necesarios, nunca el cuerpo crudo (que
+		// PayPal llena con datos del pagador).
+		event, canonical, verdict := normalizePayPalEvent(body)
+		if respondToUnacceptedWebhook(c, "paypal", verdict) { return }
+		slog.Info("PayPal webhook received", "eventType", event.EventType, "resourceID", event.Resource.ID)
+		eventID, ok := logWebhookEventOrReject(c, database, "paypal", string(canonical))
+		if !ok { return }
 
 		go safe.Run("HandlerPayPalWebhook", func() {
 			outcome := "ignored: not completed"
@@ -618,13 +786,9 @@ func HandlerPayPalCapture(database *sql.DB) gin.HandlerFunc {
 
 func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		body, readErr := io.ReadAll(c.Request.Body)
-		if readErr != nil {
-			slog.Error("NOWPayments webhook: no se pudo leer el cuerpo completo, se rechaza para que reintente", "error", readErr)
-			c.JSON(http.StatusBadRequest, gin.H{"received": false, "error": "no se pudo leer el cuerpo del request"})
-			return
-		}
-		slog.Info("NOWPayments webhook received", "body", string(body))
+		body, ok := readWebhookBody(c, "nowpayments")
+		if !ok { return }
+		slog.Info("NOWPayments webhook received", "bytes", len(body))
 
 		// La firma (x-nowpayments-sig, HMAC-SHA512 sobre el cuerpo con sus
 		// claves ordenadas — ver verifyNOWPaymentsSignature) se valida ANTES
@@ -647,7 +811,7 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 			// reintentar — RetryFailedWebhookEvents reprocesaría entonces un
 			// evento con firma inválida como si fuera legítimo. Ver
 			// LogRejectedWebhookEvent (db.go).
-			if err := db.LogRejectedWebhookEvent(database, "nowpayments", string(body), "rejected: invalid signature"); err != nil {
+			if err := logRejectedWebhook(database, "nowpayments", "invalid signature", body); err != nil {
 				slog.Error("NOWPayments webhook: no se pudo registrar el rechazo por firma inválida", "error", err)
 			}
 			// 401, no 200: si esto fuera una notificación real de NOWPayments
@@ -660,19 +824,26 @@ func HandlerNOWPaymentsWebhook(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		eventID, logged := logWebhookEventOrReject(c, database, "nowpayments", string(body))
-		if !logged { return }
-
-		paymentID, ok := parseNOWPaymentsPaymentID(body)
-		if !ok {
-			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON or no payment_id")
+		// Firma válida, pero se comprueba que el cuerpo traiga un payment_id
+		// ANTES de persistir nada — y lo único que se guarda es ese
+		// payment_id (lo único que RetryFailedWebhookEvents necesita), no el
+		// IPN completo con datos de la transacción.
+		paymentID, valid := parseNOWPaymentsPaymentID(body)
+		if !valid {
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
+		eventID, logged := logWebhookEventOrReject(c, database, "nowpayments", string(normalizedPaymentIDEvent(paymentID)))
+		if !logged { return }
 
 		go safe.Run("HandlerNOWPaymentsWebhook", func() {
+			if claimed, err := db.ClaimWebhookEvent(database, eventID, webhookProcessingLease); err != nil || !claimed {
+				// Otro trabajador lo tiene, o no se pudo reclamar: el reintento
+				// periódico lo recogerá si sigue sin resolver.
+				return
+			}
 			outcome := processNOWPaymentsPaymentID(database, paymentID)
-			db.MarkWebhookEventProcessed(database, eventID, outcome)
+			settleNOWPaymentsEvent(database, eventID, paymentID, outcome)
 		})
 
 		c.JSON(http.StatusOK, gin.H{"received": true})
@@ -732,6 +903,13 @@ func processNOWPaymentsPaymentID(database *sql.DB, paymentID int64) string {
 	// outcome que empieza con "error:", RetryFailedWebhookEvents sí vuelve
 	// a intentar esta misma función completa más tarde.
 	if serr := db.SetProviderPaymentID(database, txID, fmt.Sprintf("%d", paymentID)); serr != nil {
+		if errors.Is(serr, db.ErrPaymentTransactionNotFound) {
+			// No hay transacción local de NOWPayments con ese order_id: no es un
+			// fallo transitorio ni algo que se pueda dar por procesado. El evento
+			// se conserva y pasa a revisión manual (permanente, sin reintentos).
+			slog.Error("NOWPayments: order_id sin transacción local de NOWPayments", "txID", txID, "paymentID", paymentID)
+			return "error: transaction not found"
+		}
 		slog.Error("NOWPayments: no se pudo guardar el payment_id real, se reintentará", "txID", txID, "error", serr)
 		return "error: no se pudo guardar el payment_id, pendiente de reintento"
 	}
@@ -782,6 +960,16 @@ const nowPaymentsRetryMinAge = 3 * time.Minute
 // registro en un mecanismo de recuperación de verdad: nada se pierde solo
 // porque un intento falló o el servidor se reinició. Se llama
 // periódicamente desde main.go, igual que ReconcilePendingPayments.
+//
+// Reintentos con backoff y bandeja de revisión: un error que se repite ya no
+// se reintenta cada 3 minutos para siempre. Cada fallo se clasifica (ver
+// isPermanentNOWPaymentsOutcome), se cuenta el intento y se agenda el
+// siguiente con backoff exponencial (3 min, 6, 12, … tope 6 h). Al agotar
+// nowPaymentsMaxRetryAttempts — o de inmediato ante un error no recuperable —
+// el evento pasa a la bandeja de revisión manual (webhook_events.review_at):
+// se CONSERVA con su payment_id, se avisa a un admin por Discord, y
+// permanece hasta que se reencole (db.RequeueWebhookEvent). Nunca se
+// descarta un pago que todavía podría cobrarse o necesitar conciliación.
 func RetryFailedWebhookEvents(database *sql.DB) {
 	events, err := db.GetUnresolvedWebhookEvents(database, "nowpayments", nowPaymentsRetryMinAge)
 	if err != nil {
@@ -791,13 +979,22 @@ func RetryFailedWebhookEvents(database *sql.DB) {
 	for _, ev := range events {
 		ev := ev
 		safe.Run("RetryFailedWebhookEvents.nowpayments", func() {
+			// Coordinación entre trabajadores/réplicas: solo quien obtiene el lease
+			// procesa el evento (ver db.ClaimWebhookEvent).
+			if claimed, err := db.ClaimWebhookEvent(database, ev.ID, webhookProcessingLease); err != nil || !claimed {
+				if err != nil {
+					slog.Error("RetryFailedWebhookEvents: no se pudo reclamar el evento", "eventID", ev.ID, "error", err)
+				}
+				return
+			}
 			paymentID, ok := parseNOWPaymentsPaymentID([]byte(ev.RawBody))
 			if !ok {
 				db.MarkWebhookEventProcessed(database, ev.ID, "ignored: invalid JSON or no payment_id")
 				return
 			}
+			slog.Info("RetryFailedWebhookEvents: reintentando", "eventID", ev.ID, "paymentID", paymentID, "attempt", ev.Attempts+1)
 			outcome := processNOWPaymentsPaymentID(database, paymentID)
-			db.MarkWebhookEventProcessed(database, ev.ID, outcome)
+			settleNOWPaymentsEvent(database, ev.ID, paymentID, outcome)
 			if outcome == "processed" {
 				slog.Info("RetryFailedWebhookEvents: evento de NOWPayments recuperado", "eventID", ev.ID, "paymentID", paymentID)
 			}
@@ -805,17 +1002,76 @@ func RetryFailedWebhookEvents(database *sql.DB) {
 	}
 }
 
+// webhookProcessingLease: cuánto dura el lease de procesamiento de un evento.
+// Debe superar el tiempo normal de un intento (consulta a la pasarela +
+// acreditación); si el proceso se cae, el lease vence y otro trabajador lo toma.
+// La acreditación sigue protegida por CreditPaymentOnce aunque dos trabajadores
+// coincidieran tras un vencimiento.
+const webhookProcessingLease = 5 * time.Minute
+
+const (
+	// nowPaymentsMaxRetryAttempts: intentos totales (el del webhook en vivo
+	// cuenta como el primero) antes de mandar el evento a revisión manual.
+	// Con el backoff de abajo son ~6 h de reintentos automáticos.
+	nowPaymentsMaxRetryAttempts = 8
+	nowPaymentsBackoffBase      = 3 * time.Minute
+	nowPaymentsBackoffMax       = 6 * time.Hour
+)
+
+// nowPaymentsRetryBackoff: 3 min tras el 1er fallo, luego 6, 12, 24 … con tope.
+func nowPaymentsRetryBackoff(attempt int) time.Duration {
+	d := nowPaymentsBackoffBase
+	for i := 1; i < attempt && d < nowPaymentsBackoffMax; i++ {
+		d *= 2
+	}
+	if d > nowPaymentsBackoffMax {
+		d = nowPaymentsBackoffMax
+	}
+	return d
+}
+
+// isPermanentNOWPaymentsOutcome: errores que reintentar no arregla (el
+// order_id que devuelve la pasarela no es un UUID nuestro: no hay a qué pago
+// asociarlo, hace falta una persona). Van directo a revisión manual.
+// Recuperables (transitorios): la consulta a la pasarela falló, no se pudo
+// guardar el payment_id, o falló la acreditación (base de datos, etc.).
+func isPermanentNOWPaymentsOutcome(outcome string) bool {
+	return strings.HasPrefix(outcome, "error: invalid order_id") || strings.HasPrefix(outcome, "error: transaction not found")
+}
+
+// settleNOWPaymentsEvent aplica el resultado de un intento (en vivo o de
+// reintento) a su fila de webhook_events: éxito/ignorado/pendiente se marcan
+// como procesados; un "error:" cuenta un intento y agenda backoff o, si
+// corresponde, pasa a revisión manual y avisa a un admin.
+func settleNOWPaymentsEvent(database *sql.DB, eventID uuid.UUID, paymentID int64, outcome string) {
+	if !strings.HasPrefix(outcome, "error:") {
+		db.MarkWebhookEventProcessed(database, eventID, outcome)
+		return
+	}
+	permanent := isPermanentNOWPaymentsOutcome(outcome)
+	moved, attempts, err := db.RecordWebhookRetryFailure(database, eventID, outcome, permanent, nowPaymentsMaxRetryAttempts, nowPaymentsRetryBackoff)
+	if errors.Is(err, db.ErrWebhookEventAlreadySettled) {
+		slog.Info("NOWPayments: fallo atrasado ignorado, el evento ya estaba resuelto o en revisión", "eventID", eventID, "paymentID", paymentID, "outcome", outcome)
+		return
+	}
+	if err != nil {
+		slog.Error("NOWPayments: no se pudo registrar el intento fallido, se deja el resultado tal cual", "eventID", eventID, "error", err)
+		db.MarkWebhookEventProcessed(database, eventID, outcome)
+		return
+	}
+	slog.Warn("NOWPayments: intento de procesamiento fallido", "eventID", eventID, "paymentID", paymentID, "attempt", attempts, "permanent", permanent, "review", moved, "outcome", outcome)
+	if moved {
+		discordbot.AlertWebhookNeedsReview("nowpayments", eventID.String(), fmt.Sprintf("payment_id %d — %s (intentos: %d)", paymentID, outcome, attempts))
+	}
+}
+
 // ==================== DLOCAL GO WEBHOOK ====================
 
 func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		body, readErr := io.ReadAll(c.Request.Body)
-		if readErr != nil {
-			slog.Error("dLocal Go webhook: no se pudo leer el cuerpo completo, se rechaza para que reintente", "error", readErr)
-			c.JSON(http.StatusBadRequest, gin.H{"received": false, "error": "no se pudo leer el cuerpo del request"})
-			return
-		}
-		slog.Info("dLocal Go webhook received", "body", string(body))
+		body, ok := readWebhookBody(c, "dlocalgo")
+		if !ok { return }
+		slog.Info("dLocal Go webhook received", "bytes", len(body))
 
 		if !verifyDLocalGoSignature(body, c.GetHeader("Authorization")) {
 			// Firma inválida: cualquiera pudo mandar este POST, no es una
@@ -826,21 +1082,28 @@ func HandlerDLocalGoWebhook(database *sql.DB) gin.HandlerFunc {
 			// seguirá intentando la entrega — mejor eso que responder 200 y
 			// perder la notificación silenciosamente.
 			slog.Warn("dLocal Go webhook: firma inválida, ignorando")
-			db.LogWebhookEvent(database, "dlocalgo", string(body))
+			// Escritura atómica ya resuelta (antes LogWebhookEvent la dejaba
+			// con processed_at NULL para siempre: nunca se reintenta ni se
+			// purgaba) y con el cuerpo acotado — es contenido de un tercero
+			// no autenticado.
+			if err := logRejectedWebhook(database, "dlocalgo", "invalid signature", body); err != nil {
+				slog.Error("dLocal Go webhook: no se pudo registrar el rechazo por firma inválida", "error", err)
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{"received": false, "error": "firma inválida"})
 			return
 		}
-		eventID, ok := logWebhookEventOrReject(c, database, "dlocalgo", string(body))
-		if !ok { return }
 
+		// Firma válida: se comprueba el payment_id ANTES de persistir y solo
+		// se guarda ese dato, no el cuerpo completo.
 		var notification struct {
 			PaymentID string `json:"payment_id"`
 		}
-		if err := json.Unmarshal(body, &notification); err != nil || notification.PaymentID == "" {
-			db.MarkWebhookEventProcessed(database, eventID, "ignored: invalid JSON or no payment_id")
+		if err := json.Unmarshal(body, &notification); err != nil || !webhookRefPattern.MatchString(notification.PaymentID) {
 			c.JSON(http.StatusOK, gin.H{"received": true})
 			return
 		}
+		eventID, ok := logWebhookEventOrReject(c, database, "dlocalgo", string(normalizedPaymentIDEvent(notification.PaymentID)))
+		if !ok { return }
 
 		go safe.Run("HandlerDLocalGoWebhook", func() {
 			outcome := "ignored: not paid"

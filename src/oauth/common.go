@@ -40,6 +40,20 @@ func finishOAuthLogin(c *gin.Context, database *sql.DB, cfg Config, provider, pr
 		return
 	}
 
+	// Las consultas de arriba y de abajo solo ven cuentas ACTIVAS: sin esta
+	// comprobación, alguien con una cuenta desactivada caía en la rama
+	// "cliente nuevo" y arrancaba un registro en vez de ser rechazado. Se
+	// rechaza ANTES de emitir cualquier token o código de login.
+	if inactive, ierr := db.HasInactiveOAuthAccount(database, provider, providerID, email); ierr != nil {
+		slog.Error("OAuth: no se pudo comprobar si la cuenta está inactiva, se rechaza (fail-closed)", "provider", provider, "error", ierr)
+		redirectError(c, cfg.FrontendURL, "internal_error")
+		return
+	} else if inactive {
+		slog.Warn("OAuth: intento de login de una cuenta desactivada", "provider", provider)
+		redirectError(c, cfg.FrontendURL, "account_inactive")
+		return
+	}
+
 	if email != nil {
 		if byEmail, err2 := db.GetCustomerByEmail(database, *email); err2 == nil {
 			if provider == "google" {
@@ -126,6 +140,14 @@ func redirectLinkError(c *gin.Context, frontendURL, provider, reason string) {
 const oauthCodeTTL = 2 * time.Minute
 
 func issueLoginRedirect(c *gin.Context, database *sql.DB, cfg Config, customer types.Customer) {
+	// Defensa en profundidad: nunca se emite ningún token (ni siquiera el
+	// temporal de 2FA) para una cuenta inactiva, sin importar cómo se la
+	// haya resuelto antes.
+	if !customer.IsActive {
+		redirectError(c, cfg.FrontendURL, "account_inactive")
+		return
+	}
+
 	// Cuenta admin con 2FA activado → el login por OAuth NO puede saltarse
 	// el segundo factor (si pudiera, el 2FA de la contraseña sería
 	// decorativo). Se redirige con un token temporal en vez del real, y el

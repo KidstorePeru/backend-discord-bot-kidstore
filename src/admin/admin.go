@@ -41,6 +41,47 @@ func adminActor(c *gin.Context, database *sql.DB) string {
 	return "clave de API compartida"
 }
 
+// HandlerListWebhookReview lista la bandeja de revisión manual de webhooks:
+// eventos que agotaron sus reintentos automáticos (o fallaron de forma no
+// recuperable) y se CONSERVAN con su payment_id hasta que se resuelvan.
+func HandlerListWebhookReview(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+		items, err := db.ListWebhookEventsInReview(database, limit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error listando la bandeja de revisión"})
+			return
+		}
+		if items == nil { items = []db.WebhookReviewItem{} }
+		c.JSON(http.StatusOK, gin.H{"success": true, "events": items})
+	}
+}
+
+// HandlerRetryWebhookEvent reencola un evento de la bandeja de revisión para
+// que RetryFailedWebhookEvents lo vuelva a intentar (intentos y backoff
+// reiniciados). Se usa una vez resuelta la causa del fallo.
+func HandlerRetryWebhookEvent(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		requeued, err := db.RequeueWebhookEvent(database, id)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error reencolando el evento"})
+			return
+		}
+		if !requeued {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "el evento no está en la bandeja de revisión"})
+			return
+		}
+		db.AddAuditLog(database, nil, "ADMIN_WEBHOOK_REQUEUED",
+			fmt.Sprintf("evento %s reencolado desde la bandeja de revisión por %s", id, adminActor(c, database)), c.ClientIP())
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "evento reencolado, se reintentará en el próximo ciclo"})
+	}
+}
+
 func HandlerGetAllCustomers(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
