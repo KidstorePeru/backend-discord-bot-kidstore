@@ -190,6 +190,23 @@ func AlertOrderNeedsReview(orderID, epicUsername, itemName string) {
 	)
 }
 
+// AlertDeliveryNotPersisted se llama cuando Epic Games CONFIRMÓ la entrega de
+// un regalo pero no se pudo guardar en la base (pedido 'sent' + evidencia). El
+// worker reintenta guardarlo sin volver a enviar el regalo; si el proceso se
+// reinicia antes, el pedido termina en revisión manual. La evidencia completa
+// queda en los logs ("entrega sin persistir") para resolverlo.
+func AlertDeliveryNotPersisted(orderID, epicUsername, itemName string) {
+	key := "order_delivery_unpersisted_" + orderID
+	if !shouldAlert(key) {
+		return
+	}
+	sendAdminAlert(
+		"🔴 Entrega realizada sin registrar",
+		fmt.Sprintf("El pedido **%s** (%s → %s) SE ENTREGÓ en Epic Games, pero no se pudo guardar en la base de datos. El worker reintenta guardarlo sin reenviar el regalo. No lo reembolses: si queda en revisión, la evidencia de Epic está en los logs del backend (busca \"entrega sin persistir\" y el ID del pedido).", orderID, itemName, epicUsername),
+		colorAlert,
+	)
+}
+
 // AlertUnderpaidCryptoPayment se llama cuando NOWPayments reporta un pago
 // como "partially_paid" — el cliente mandó menos cripto de lo esperado
 // (comisión de red, o el precio de la cripto se movió justo en el momento

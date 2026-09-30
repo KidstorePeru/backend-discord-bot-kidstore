@@ -27,6 +27,7 @@ const fakeShopBody = `{"status":200,"data":{"date":"2026-09-29T00:00:00Z","entri
 type fakeFortniteAPI struct {
 	calls   int32
 	failing atomic.Bool
+	body    atomic.Value // string: si no está vacío, responde 200 con este cuerpo (catálogo roto)
 }
 
 // withFakeShop redirige el proxy a un servidor falso, con caché en memoria y
@@ -38,6 +39,10 @@ func withFakeShop(t *testing.T) *fakeFortniteAPI {
 		atomic.AddInt32(&f.calls, 1)
 		if f.failing.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if custom, _ := f.body.Load().(string); custom != "" {
+			fmt.Fprint(w, custom)
 			return
 		}
 		fmt.Fprint(w, fakeShopBody)
@@ -231,5 +236,170 @@ func TestHandlerGetShop_CabecerasYErrorGenerico(t *testing.T) {
 	}
 	if body := w.Body.String(); body != `{"error":"no se pudo obtener la tienda, intenta de nuevo","success":false}` {
 		t.Errorf("el error debe ser genérico, obtuve %s", body)
+	}
+}
+
+// Un 200 con un catálogo roto (null, sin data, sin entradas, HTML, JSON truncado)
+// NUNCA reemplaza la última tienda buena: ni en memoria ni en el respaldo en disco.
+func TestFetchShopBody_CatalogoInvalidoNoReemplazaElUltimoBueno(t *testing.T) {
+	for name, bad := range map[string]string{
+		"null":            `null`,
+		"data nula":       `{"status":200,"data":null}`,
+		"sin entradas":    `{"status":200,"data":{"date":"x","entries":[]}}`,
+		"status de error": `{"status":404,"error":"not found"}`,
+		"html":            `<html><body>Bad gateway</body></html>`,
+		"truncado":        `{"status":200,"data":{"entries":[{"offerId":"a"`,
+		"arreglo":         `[1,2,3]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := withFakeShop(t)
+			if _, err := fetchShopBody(context.Background(), "es-419"); err != nil {
+				t.Fatal(err)
+			}
+			expireShopCache()
+			f.body.Store(bad)
+
+			body, err := fetchShopBody(context.Background(), "es-419")
+			if err != nil {
+				t.Fatalf("con un catálogo bueno previo no debe fallar: %v", err)
+			}
+			if !isStale(t, body) {
+				t.Error("debe servirse la última tienda buena marcada _stale")
+			}
+			if validateShopBody(body) != nil {
+				t.Error("lo servido debe ser un catálogo válido")
+			}
+			// El respaldo en disco sigue siendo el bueno.
+			disk, ok := loadShopDiskCache("es-419")
+			if !ok || string(disk) != fakeShopBody {
+				t.Errorf("el respaldo en disco no debe reemplazarse por un catálogo roto")
+			}
+			shopCacheMu.RLock()
+			mem := string(shopCache["es-419"].body)
+			shopCacheMu.RUnlock()
+			if mem != fakeShopBody {
+				t.Error("la caché en memoria no debe reemplazarse por un catálogo roto")
+			}
+		})
+	}
+}
+
+// Sin ninguna respuesta buena previa, un catálogo roto es un error (no se sirve
+// ni se guarda nada).
+func TestFetchShopBody_CatalogoInvalidoSinRespaldo_DevuelveError(t *testing.T) {
+	f := withFakeShop(t)
+	f.body.Store(`{"status":200,"data":null}`)
+	if _, err := fetchShopBody(context.Background(), "es-419"); err == nil {
+		t.Fatal("un catálogo inválido sin respaldo debe devolver error")
+	}
+	if _, ok := loadShopDiskCache("es-419"); ok {
+		t.Error("no debe haberse guardado nada en disco")
+	}
+}
+
+// Un respaldo en disco dañado se ignora (no se sirve una tienda rota).
+func TestLoadShopDiskCache_IgnoraRespaldoDanado(t *testing.T) {
+	f := withFakeShop(t)
+	if err := os.WriteFile(shopDiskCachePath("en"), []byte(`{"status":200,"data":{"entries":[`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loadShopDiskCache("en"); ok {
+		t.Error("un respaldo truncado debe ignorarse")
+	}
+	f.failing.Store(true)
+	if _, err := fetchShopBody(context.Background(), "en"); err == nil {
+		t.Error("con el proveedor caído y el respaldo dañado debe devolver error, no la tienda rota")
+	}
+}
+
+// markStale nunca entra en pánico ni marca algo que no sea un objeto JSON.
+func TestMarkStale_NoEntraEnPanicoConCuerposRaros(t *testing.T) {
+	for _, body := range []string{`null`, `[]`, `"texto"`, `42`, ``, `{`} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("markStale(%q) entró en pánico: %v", body, r)
+				}
+			}()
+			if _, ok := markStale([]byte(body)); ok {
+				t.Errorf("markStale(%q) no debe dar ok", body)
+			}
+		}()
+	}
+	out, ok := markStale([]byte(fakeShopBody))
+	if !ok || !isStale(t, out) {
+		t.Error("un catálogo válido debe marcarse _stale")
+	}
+}
+
+// El respaldo se escribe de forma atómica: no quedan archivos temporales y el
+// contenido es exactamente el último catálogo bueno.
+func TestSaveShopDiskCache_EscrituraAtomica(t *testing.T) {
+	withFakeShop(t)
+	if _, err := fetchShopBody(context.Background(), "es-419"); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(shopDiskCacheDir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".tmp" {
+			t.Errorf("quedó un temporal: %s", e.Name())
+		}
+	}
+	if disk, ok := loadShopDiskCache("es-419"); !ok || string(disk) != fakeShopBody {
+		t.Error("el respaldo debe ser el último catálogo bueno")
+	}
+}
+
+
+// Regresión: solo se validaba la forma general del catálogo. Una respuesta con
+// alguna entrada rota (sin offerId, precio basura, contenido que no es una
+// lista de objetos…) se guardaba igual y reemplazaba el último respaldo bueno.
+func TestFetchShopBody_EntradaMalformadaConservaElUltimoRespaldo(t *testing.T) {
+	good := `{"offerId":"v2:/ok","finalPrice":500,"regularPrice":800,"brItems":[{"name":"Bien"}]}`
+	for name, bad := range map[string]string{
+		"no es objeto":        `"texto"`,
+		"entrada null":        `null`,
+		"sin offerId":         `{"finalPrice":500,"brItems":[{"name":"X"}]}`,
+		"offerId vacío":       `{"offerId":" ","finalPrice":500,"brItems":[{"name":"X"}]}`,
+		"precio texto":        `{"offerId":"a","finalPrice":"gratis","brItems":[{"name":"X"}]}`,
+		"precio negativo":     `{"offerId":"a","finalPrice":-1,"brItems":[{"name":"X"}]}`,
+		"precio decimal":      `{"offerId":"a","finalPrice":1.5,"brItems":[{"name":"X"}]}`,
+		"regular inválido":    `{"offerId":"a","finalPrice":500,"regularPrice":null,"brItems":[{"name":"X"}]}`,
+		"sin contenido":       `{"offerId":"a","finalPrice":500}`,
+		"brItems no es lista": `{"offerId":"a","finalPrice":500,"brItems":{"name":"X"}}`,
+		"brItems con null":    `{"offerId":"a","finalPrice":500,"brItems":[null]}`,
+		"layout no es objeto": `{"offerId":"a","finalPrice":500,"layout":"x","brItems":[{"name":"X"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := `{"status":200,"data":{"date":"x","entries":[` + good + `,` + bad + `]}}`
+			if validateShopBody([]byte(body)) == nil {
+				t.Fatal("un catálogo con una entrada malformada debe rechazarse")
+			}
+			f := withFakeShop(t)
+			if _, err := fetchShopBody(context.Background(), "es-419"); err != nil {
+				t.Fatal(err)
+			}
+			expireShopCache()
+			f.body.Store(body)
+			served, err := fetchShopBody(context.Background(), "es-419")
+			if err != nil || !isStale(t, served) {
+				t.Fatalf("debe servirse el último catálogo bueno marcado _stale: err=%v", err)
+			}
+			if disk, ok := loadShopDiskCache("es-419"); !ok || string(disk) != fakeShopBody {
+				t.Error("el respaldo en disco no debe reemplazarse")
+			}
+		})
+	}
+}
+
+func TestValidateShopBody_AceptaEntradasValidasVariadas(t *testing.T) {
+	body := `{"status":200,"data":{"date":"x","entries":[
+		{"offerId":"a","finalPrice":0,"brItems":[{"name":"X"}]},
+		{"offerId":"b","finalPrice":500,"regularPrice":800,"tracks":[{"title":"T"}],"layout":{"id":"l"}},
+		{"offerId":"c","finalPrice":1200,"bundle":{"name":"Lote"},"brItems":[]},
+		{"offerId":"d","finalPrice":300,"cars":[{"name":"C"}],"layout":null}
+	]}}`
+	if err := validateShopBody([]byte(body)); err != nil {
+		t.Fatalf("entradas válidas no deben rechazarse: %v", err)
 	}
 }

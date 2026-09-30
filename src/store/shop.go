@@ -180,40 +180,162 @@ func shopDiskCachePath(lang string) string {
 	return filepath.Join(shopDiskCacheDir, "shop-"+lang+".json")
 }
 
+// validateShopBody comprueba que una respuesta de la tienda sea un catálogo
+// usable ANTES de guardarla o servirla: un objeto JSON con status 200, "data"
+// no nulo y al menos una entrada. fortnite-api.com a veces responde 200 con
+// {"status":200,"data":null}, una página HTML de error o un cuerpo truncado;
+// sin esta comprobación eso reemplazaba el último catálogo bueno (en memoria y
+// en disco) y la tienda quedaba vacía hasta la siguiente respuesta correcta.
+func validateShopBody(body []byte) error {
+	var parsed struct {
+		Status *int `json:"status"`
+		Data   *struct {
+			Entries []json.RawMessage `json:"entries"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return fmt.Errorf("catálogo con JSON inválido: %w", err)
+	}
+	if parsed.Status != nil && *parsed.Status != http.StatusOK {
+		return fmt.Errorf("catálogo con status %d", *parsed.Status)
+	}
+	if parsed.Data == nil {
+		return errors.New("catálogo sin data")
+	}
+	if len(parsed.Data.Entries) == 0 {
+		return errors.New("catálogo sin entradas")
+	}
+	// Cada entrada se valida por separado: una respuesta con entradas rotas
+	// (truncada, con otro esquema o con precios basura) indica que algo falló
+	// del lado del proveedor, así que el catálogo COMPLETO se descarta y se
+	// sigue sirviendo el último respaldo válido — nunca se guarda a medias.
+	for i, raw := range parsed.Data.Entries {
+		if err := validateShopEntry(raw); err != nil {
+			return fmt.Errorf("catálogo con la entrada %d inválida: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// shopEntryContentKeys: listas de contenido de una oferta (al menos una no vacía).
+var shopEntryContentKeys = []string{"brItems", "tracks", "instruments", "cars", "legoKits"}
+
+// validateShopEntry comprueba lo mínimo que la tienda necesita de una oferta:
+// un objeto con offerId, precios enteros no negativos y algún contenido
+// (objetos, o un bundle). Los campos opcionales, si vienen, deben tener el tipo
+// correcto (layout y bundle objetos).
+func validateShopEntry(raw json.RawMessage) error {
+	var entry map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &entry); err != nil || entry == nil {
+		return errors.New("no es un objeto")
+	}
+	var offerID string
+	if err := json.Unmarshal(entry["offerId"], &offerID); err != nil || strings.TrimSpace(offerID) == "" {
+		return errors.New("sin offerId")
+	}
+	for _, key := range []string{"finalPrice", "regularPrice"} {
+		v, ok := entry[key]
+		if !ok && key == "regularPrice" {
+			continue // opcional: si falta, la tienda usa finalPrice
+		}
+		var price float64
+		if err := json.Unmarshal(v, &price); err != nil || string(v) == "null" || price < 0 || price != float64(int64(price)) {
+			return fmt.Errorf("%s inválido", key)
+		}
+	}
+	for _, key := range []string{"layout", "bundle"} {
+		if v, ok := entry[key]; ok && string(v) != "null" {
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(v, &obj); err != nil {
+				return fmt.Errorf("%s no es un objeto", key)
+			}
+		}
+	}
+	hasContent := false
+	for _, key := range shopEntryContentKeys {
+		v, ok := entry[key]
+		if !ok || string(v) == "null" {
+			continue
+		}
+		var items []map[string]json.RawMessage
+		if err := json.Unmarshal(v, &items); err != nil {
+			return fmt.Errorf("%s no es una lista de objetos", key)
+		}
+		for _, it := range items {
+			if it == nil {
+				return fmt.Errorf("%s contiene un elemento vacío", key)
+			}
+		}
+		if len(items) > 0 {
+			hasContent = true
+		}
+	}
+	if !hasContent {
+		if v, ok := entry["bundle"]; !ok || string(v) == "null" {
+			return errors.New("sin contenido")
+		}
+	}
+	return nil
+}
+
+// loadShopDiskCache lee el respaldo en disco y lo descarta si está dañado
+// (archivo truncado, editado a mano o de un formato viejo): un respaldo
+// inválido es peor que ninguno.
 func loadShopDiskCache(lang string) ([]byte, bool) {
 	body, err := os.ReadFile(shopDiskCachePath(lang))
 	if err != nil || len(body) == 0 {
 		return nil, false
 	}
+	if err := validateShopBody(body); err != nil {
+		slog.Warn("respaldo en disco de la tienda inválido, se ignora", "lang", lang, "error", err)
+		return nil, false
+	}
 	return body, true
 }
 
+// saveShopDiskCache escribe el respaldo de forma atómica: primero a un archivo
+// temporal y después se renombra encima del anterior. Si el proceso se cae a
+// mitad de la escritura, el respaldo anterior queda intacto en vez de truncado.
 func saveShopDiskCache(lang string, body []byte) {
 	if err := os.MkdirAll(shopDiskCacheDir, 0o755); err != nil {
 		slog.Warn("no se pudo crear el directorio de caché de la tienda", "error", err)
 		return
 	}
-	if err := os.WriteFile(shopDiskCachePath(lang), body, 0o644); err != nil {
+	tmp, err := os.CreateTemp(shopDiskCacheDir, "shop-"+lang+"-*.tmp")
+	if err != nil {
 		slog.Warn("no se pudo escribir la caché en disco de la tienda", "error", err)
+		return
+	}
+	_, werr := tmp.Write(body)
+	cerr := tmp.Close()
+	if werr != nil || cerr != nil {
+		os.Remove(tmp.Name())
+		slog.Warn("no se pudo escribir la caché en disco de la tienda", "error", errors.Join(werr, cerr))
+		return
+	}
+	if err := os.Rename(tmp.Name(), shopDiskCachePath(lang)); err != nil {
+		os.Remove(tmp.Name())
+		slog.Warn("no se pudo reemplazar la caché en disco de la tienda", "error", err)
 	}
 }
 
 // markStale marca el JSON de la tienda como `_stale: true` — el frontend lo
 // usa para avisar que estos datos no son la respuesta en vivo del proveedor
-// (ver services/getShop en el frontend). Si el cuerpo no es un objeto JSON
-// válido, se devuelve tal cual (no debería pasar: solo se guarda en caché lo
-// que ya se parseó una vez como JSON válido).
-func markStale(body []byte) []byte {
+// (ver useShopData en el frontend). Devuelve ok=false si el cuerpo no es un
+// objeto JSON: nunca se sirve como respaldo algo que no se pudo marcar (se
+// vería como una tienda "en vivo"). Antes, un cuerpo "null" dejaba el mapa en
+// nil sin error y la asignación de abajo tumbaba el proceso (panic).
+func markStale(body []byte) ([]byte, bool) {
 	var m map[string]json.RawMessage
-	if err := json.Unmarshal(body, &m); err != nil {
-		return body
+	if err := json.Unmarshal(body, &m); err != nil || m == nil {
+		return nil, false
 	}
 	m["_stale"] = json.RawMessage("true")
 	out, err := json.Marshal(m)
 	if err != nil {
-		return body
+		return nil, false
 	}
-	return out
+	return out, true
 }
 
 // shopAPIURL apunta a la tienda real de fortnite-api.com — variable (no un
@@ -226,10 +348,12 @@ var shopAPIURL = "https://fortnite-api.com/v2/shop"
 // disco de la vez anterior.
 func staleShopBody(lang string, entry *shopCacheEntry, inMemory bool) ([]byte, bool) {
 	if inMemory {
-		return markStale(entry.body), true
+		if stale, ok := markStale(entry.body); ok {
+			return stale, true
+		}
 	}
 	if diskBody, hit := loadShopDiskCache(lang); hit {
-		return markStale(diskBody), true
+		return markStale(diskBody)
 	}
 	return nil, false
 }
@@ -258,6 +382,11 @@ func requestShopOnce(ctx context.Context, lang string) ([]byte, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error leyendo respuesta: %w", err)
+	}
+	// Un 200 con un catálogo inválido cuenta como fallo: se reintenta y, si
+	// sigue mal, se sirve la última tienda buena — nunca reemplaza la caché.
+	if err := validateShopBody(body); err != nil {
+		return nil, err
 	}
 	return body, nil
 }
@@ -814,12 +943,21 @@ func StartOrderWorker(ctx context.Context, database *sql.DB) {
 }
 
 func processOrders(database *sql.DB) {
+	// Antes que nada: entregas REALES cuya evidencia no se pudo guardar en un
+	// ciclo anterior (ver persistDelivery) — se guardan sin volver a enviar nada.
+	recoverUnpersistedDeliveries(database)
+
 	// ClaimPendingOrders (no GetPendingOrders) — reclama los pedidos de forma
 	// atómica (FOR UPDATE SKIP LOCKED) para que, si local y producción llegan
 	// a correr al mismo tiempo contra la misma base compartida, nunca puedan
 	// tomar y enviar el mismo pedido dos veces.
 	orders, err := db.ClaimPendingOrders(database)
 	if err != nil || len(orders) == 0 { return }
+	// Un pedido reclamado que YA se entregó (su evidencia sigue esperando a
+	// guardarse) no vuelve a pasar por el envío ni, sobre todo, por el
+	// reembolso de "sin bots activos" de abajo.
+	orders = withoutUnpersistedDeliveries(database, orders)
+	if len(orders) == 0 { return }
 
 	accounts, err := db.GetActiveGameAccounts(database, encryptionKey)
 	if err != nil || len(accounts) == 0 {
@@ -884,6 +1022,12 @@ func processOrders(database *sql.DB) {
 func failOrderAndRefund(database *sql.DB, order types.Order, internalReason, customerReason string) {
 	reviewNote := fmt.Sprintf("%s — pero había un intento de envío sin resolver; no se puede confirmar si se entregó, así que no se reembolsó automáticamente", internalReason)
 	wasAttempting, resolveErr := db.ResolveOrderReview(database, order.ID, reviewNote)
+	if errors.Is(resolveErr, db.ErrOrderHasDeliveryEvidence) {
+		// Otro trabajador (o una recuperación) ya registró la entrega: un fallo
+		// atrasado no la revierte ni la reembolsa.
+		slog.Warn("failOrderAndRefund: el pedido ya tiene evidencia de entrega, no se reembolsa", "orderID", order.ID)
+		return
+	}
 	if resolveErr != nil {
 		slog.Error("failOrderAndRefund: no se pudo resolver el intento de envío, se reintenta en el próximo ciclo", "orderID", order.ID, "error", resolveErr)
 		return
@@ -966,10 +1110,263 @@ func notifyOrderFailed(database *sql.DB, order types.Order, reason string, refun
 	}
 }
 
+// ── Entregas confirmadas por Epic cuya escritura en la base falló ──
+//
+// Antes, si MarkOrderDelivered fallaba (base caída un instante, conexión
+// cortada), el worker marcaba el pedido 'sent' con UpdateOrderStatus: sin
+// evidencia de entrega (nada que mostrar en una disputa de pago) y con
+// send_attempted todavía en true. Y si esa segunda escritura también fallaba,
+// el pedido quedaba 'processing' sin rastro de que el regalo SÍ se entregó.
+//
+// Ahora: se reintenta unas veces; si sigue fallando, la evidencia se guarda en
+// memoria (y en los logs, completa) y el pedido NO se marca 'sent' sin ella.
+// Cada ciclo del worker reintenta guardarla (recoverUnpersistedDeliveries) y un
+// pedido reclamado con evidencia pendiente nunca se reenvía ni se reembolsa
+// (withoutUnpersistedDeliveries). Si el proceso se reinicia antes de lograrlo,
+// send_attempted sigue en true: al reclamarlo, Epic responde "ya lo tiene" y el
+// pedido pasa a revisión manual — nunca se reembolsa a ciegas. Los cupos y
+// V-Bucks del bot se descuentan una sola vez, en el envío real.
+
+type unpersistedDelivery struct {
+	OrderID      uuid.UUID `json:"order_id"`
+	CustomerID   uuid.UUID `json:"customer_id"`
+	EpicUsername string    `json:"epic_username"`
+	ItemName     string    `json:"item_name"`
+	BotID        uuid.UUID `json:"bot_id"`
+	Evidence     string    `json:"evidence"`
+	CapturedAt   time.Time `json:"captured_at"`
+}
+
+func (d unpersistedDelivery) order() types.Order {
+	return types.Order{ID: d.OrderID, CustomerID: d.CustomerID, EpicUsername: d.EpicUsername, ItemName: d.ItemName}
+}
+
+var (
+	unpersistedDeliveriesMu sync.Mutex
+	unpersistedDeliveries   = map[uuid.UUID]unpersistedDelivery{}
+	// Esperas entre reintentos inmediatos de MarkOrderDelivered (variable para las pruebas).
+	deliveryPersistRetryDelays = []time.Duration{0, 500 * time.Millisecond, 2 * time.Second}
+	// Diario en disco de entregas confirmadas por Epic que no se pudieron guardar
+	// en la base: sobrevive a un reinicio del proceso y lo comparten los procesos
+	// de la misma máquina. DELIVERY_JOURNAL_DIR permite apuntarlo a un volumen
+	// persistente (en Railway el disco del contenedor se pierde al redesplegar;
+	// ahí el respaldo final es la revisión manual + la evidencia en los logs).
+	deliveryJournalDir = defaultDeliveryJournalDir()
+)
+
+func defaultDeliveryJournalDir() string {
+	if dir := strings.TrimSpace(os.Getenv("DELIVERY_JOURNAL_DIR")); dir != "" {
+		return dir
+	}
+	return filepath.Join(os.TempDir(), "kidstore-delivery-journal")
+}
+
+func deliveryJournalPath(id uuid.UUID) string {
+	return filepath.Join(deliveryJournalDir, id.String()+".json")
+}
+
+// writeDeliveryJournal guarda la entrega pendiente de forma atómica (archivo
+// temporal + fsync + rename): nunca queda un archivo a medias.
+func writeDeliveryJournal(d unpersistedDelivery) error {
+	if err := os.MkdirAll(deliveryJournalDir, 0o700); err != nil {
+		return err
+	}
+	body, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(deliveryJournalDir, d.OrderID.String()+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	_, werr := tmp.Write(body)
+	serr := tmp.Sync()
+	cerr := tmp.Close()
+	if err := errors.Join(werr, serr, cerr); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), deliveryJournalPath(d.OrderID)); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
+}
+
+func removeDeliveryJournal(id uuid.UUID) {
+	if err := os.Remove(deliveryJournalPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("Worker: no se pudo borrar la entrada del diario de entregas", "orderID", id, "error", err)
+	}
+}
+
+// loadDeliveryJournal incorpora las entregas pendientes del diario (de antes
+// de un reinicio, o de otro proceso de la misma máquina). Una entrada ilegible
+// se aparta como .bad para revisión manual en vez de reintentarse para siempre.
+func loadDeliveryJournal() {
+	files, err := filepath.Glob(filepath.Join(deliveryJournalDir, "*.json"))
+	if err != nil {
+		return
+	}
+	for _, f := range files {
+		body, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		var d unpersistedDelivery
+		if json.Unmarshal(body, &d) != nil || d.OrderID == uuid.Nil || !db.ValidDeliveryEvidence(d.Evidence) {
+			slog.Error("Worker: entrada del diario de entregas ilegible, se aparta para revisión manual", "file", f)
+			os.Rename(f, f+".bad")
+			continue
+		}
+		unpersistedDeliveriesMu.Lock()
+		if _, known := unpersistedDeliveries[d.OrderID]; !known {
+			unpersistedDeliveries[d.OrderID] = d
+		}
+		unpersistedDeliveriesMu.Unlock()
+	}
+}
+
+func forgetUnpersistedDelivery(id uuid.UUID) {
+	unpersistedDeliveriesMu.Lock()
+	delete(unpersistedDeliveries, id)
+	unpersistedDeliveriesMu.Unlock()
+	removeDeliveryJournal(id)
+}
+
+// sendInconclusive deja el pedido en revisión manual cuando no se puede saber
+// si el regalo llegó (Epic no respondió de forma concluyente, o un intento
+// anterior quedó interrumpido): NUNCA se reenvía el regalo a ciegas (podría
+// duplicarse) ni se reembolsa a ciegas (podría haberse entregado). La escritura
+// no aplica si otro trabajador ya registró la entrega.
+func sendInconclusive(database *sql.DB, order types.Order, note string) {
+	if err := db.SetOrderReviewOrClear(database, order.ID, true, note); err != nil {
+		slog.Error("Worker: no se pudo pasar el pedido a revisión, se reintenta en el próximo ciclo", "orderID", order.ID, "error", err)
+		return
+	}
+	discordbot.AlertOrderNeedsReview(order.ID.String(), order.EpicUsername, order.ItemName)
+	db.AddAuditLog(database, &order.CustomerID, "ORDER_NEEDS_REVIEW", note, "worker")
+	slog.Warn("Worker: pedido en revisión manual — resultado de envío no concluyente", "orderID", order.ID)
+}
+
+// persistDelivery guarda la entrega (estado 'sent' + evidencia) con reintentos.
+// Devuelve false si no se pudo: la entrega queda pendiente (memoria + diario en
+// disco) y nunca se marca 'sent' sin evidencia.
+func persistDelivery(database *sql.DB, order types.Order, botID uuid.UUID, evidence string) bool {
+	var err error
+	for _, delay := range deliveryPersistRetryDelays {
+		if delay > 0 { time.Sleep(delay) }
+		if err = db.MarkOrderDelivered(database, order.ID, botID, evidence); err == nil {
+			return true
+		}
+		if errors.Is(err, db.ErrOrderAlreadyRefunded) {
+			reportDeliveredButRefunded(database, order, evidence)
+			return false
+		}
+		if errors.Is(err, db.ErrInvalidDeliveryEvidence) {
+			// No debería pasar (SendGift ya valida la respuesta de Epic), pero si
+			// pasa no se registra una entrega sin prueba: revisión manual.
+			sendInconclusive(database, order, fmt.Sprintf("Epic respondió al envío con una evidencia vacía o inválida — no se registra como entregado ni se reembolsa; confirmar en Epic si el ítem llegó. bot=%s", botID))
+			return false
+		}
+	}
+	d := unpersistedDelivery{
+		OrderID: order.ID, CustomerID: order.CustomerID, EpicUsername: order.EpicUsername, ItemName: order.ItemName,
+		BotID: botID, Evidence: evidence, CapturedAt: time.Now().UTC(),
+	}
+	unpersistedDeliveriesMu.Lock()
+	unpersistedDeliveries[order.ID] = d
+	unpersistedDeliveriesMu.Unlock()
+	journalErr := writeDeliveryJournal(d)
+	// La evidencia completa va al log: es el último respaldo si se pierden la
+	// memoria y el diario (redespliegue) — el pedido termina en revisión manual.
+	slog.Error("Worker: entrega sin persistir — Epic CONFIRMÓ el regalo pero no se pudo guardar; se reintenta sin reenviar",
+		"orderID", order.ID, "bot", botID, "recipient", order.EpicUsername, "item", order.ItemName,
+		"evidence", evidence, "error", err, "journalError", journalErr)
+	discordbot.AlertDeliveryNotPersisted(order.ID.String(), order.EpicUsername, order.ItemName)
+	db.AddAuditLog(database, &order.CustomerID, "ORDER_DELIVERY_UNPERSISTED",
+		fmt.Sprintf("pedido %s entregado por el bot %s pero no se pudo guardar la entrega (%v); se reintenta sin reenviar", order.ID, botID, err), "worker")
+	return false
+}
+
+// retryUnpersistedDelivery vuelve a intentar guardar una entrega pendiente.
+// Devuelve true si el pedido tenía una entrega pendiente (guardada o no ahora).
+// Es segura entre procesos: MarkOrderDelivered es idempotente y nunca pisa un
+// pedido reembolsado, y el diario se borra solo cuando la entrega quedó resuelta.
+func retryUnpersistedDelivery(database *sql.DB, orderID uuid.UUID) bool {
+	unpersistedDeliveriesMu.Lock()
+	pending, ok := unpersistedDeliveries[orderID]
+	unpersistedDeliveriesMu.Unlock()
+	if !ok {
+		return false
+	}
+	err := db.MarkOrderDelivered(database, orderID, pending.BotID, pending.Evidence)
+	switch {
+	case err == nil:
+		slog.Info("Worker: entrega pendiente guardada (sin reenviar el regalo)", "orderID", orderID)
+		db.AddAuditLog(database, &pending.CustomerID, "ORDER_DELIVERY_RECOVERED",
+			fmt.Sprintf("pedido %s: se guardó la evidencia de una entrega que había fallado al persistir", orderID), "worker")
+	case errors.Is(err, db.ErrOrderAlreadyRefunded):
+		reportDeliveredButRefunded(database, pending.order(), pending.Evidence)
+	case errors.Is(err, db.ErrInvalidDeliveryEvidence):
+		sendInconclusive(database, pending.order(), "la evidencia pendiente de guardar resultó inválida — confirmar en Epic si el ítem llegó")
+	default:
+		slog.Warn("Worker: la entrega pendiente sigue sin poder guardarse, se reintenta en el próximo ciclo", "orderID", orderID, "error", err)
+		return true
+	}
+	forgetUnpersistedDelivery(orderID)
+	return true
+}
+
+func recoverUnpersistedDeliveries(database *sql.DB) {
+	loadDeliveryJournal()
+	unpersistedDeliveriesMu.Lock()
+	ids := make([]uuid.UUID, 0, len(unpersistedDeliveries))
+	for id := range unpersistedDeliveries {
+		ids = append(ids, id)
+	}
+	unpersistedDeliveriesMu.Unlock()
+	for _, id := range ids {
+		retryUnpersistedDelivery(database, id)
+	}
+}
+
+func withoutUnpersistedDeliveries(database *sql.DB, orders []types.Order) []types.Order {
+	kept := orders[:0]
+	for _, o := range orders {
+		if retryUnpersistedDelivery(database, o.ID) {
+			continue
+		}
+		kept = append(kept, o)
+	}
+	return kept
+}
+
+// reportDeliveredButRefunded: Epic entregó el regalo pero el pedido ya estaba
+// reembolsado — no se toca el pedido (no se "des-reembolsa" solo); se avisa.
+func reportDeliveredButRefunded(database *sql.DB, order types.Order, evidence string) {
+	slog.Error("Worker: el regalo se entregó pero el pedido ya estaba reembolsado — requiere revisión",
+		"orderID", order.ID, "recipient", order.EpicUsername, "evidence", evidence)
+	discordbot.AlertOrderNeedsReview(order.ID.String(), order.EpicUsername, order.ItemName)
+	db.AddAuditLog(database, &order.CustomerID, "ORDER_DELIVERED_AFTER_REFUND",
+		fmt.Sprintf("pedido %s: Epic confirmó la entrega pero el pedido ya estaba reembolsado", order.ID), "worker")
+}
+
 // processOrder intenta enviar un pedido probando cada bot disponible en orden.
 // Si un bot falla por gift_limit_reached o token inválido, pasa al siguiente bot
 // en el mismo ciclo sin esperar 30 segundos.
 func processOrder(database *sql.DB, order types.Order, accounts []types.GameAccount) {
+	// Un intento de envío anterior de ESTE pedido quedó sin resolver (el proceso
+	// se cayó durante la llamada a Epic, o su respuesta se perdió): no se vuelve a
+	// llamar a Epic para "ver qué pasa" — eso sería reenviar a ciegas. Revisión.
+	if attempted, err := db.OrderSendAttempted(database, order.ID); err != nil {
+		slog.Error("Worker: no se pudo leer el estado de envío del pedido, se reintenta en el próximo ciclo", "orderID", order.ID, "error", err)
+		db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
+		return
+	} else if attempted {
+		sendInconclusive(database, order, "un intento de envío anterior de este pedido quedó interrumpido sin respuesta de Epic — no se reenvía ni se reembolsa automáticamente; confirmar en Epic si el ítem llegó")
+		return
+	}
+
 	// Verificar que al menos un bot tiene slots
 	hasSlots := false
 	for i := range accounts {
@@ -1158,8 +1555,10 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			// cual (ya quedó en true al principio de este intento), así que
 			// si un intento posterior recibe ErrAlreadyOwned, se tratará
 			// correctamente como entrega incierta y no como reembolso.
-			slog.Warn("Worker: resultado incierto (fallo de transporte), reintentando en el próximo ciclo", "orderID", order.ID, "bot", bot.DisplayName, "error", err)
-			db.UpdateOrderStatus(database, order.ID, "pending", nil, nil)
+			// Tampoco se reintenta solo: un reintento podría duplicar el regalo
+			// si el primero sí llegó. Revisión manual (ver sendInconclusive).
+			slog.Warn("Worker: resultado incierto (fallo de transporte o respuesta sin confirmación)", "orderID", order.ID, "bot", bot.DisplayName, "error", err)
+			sendInconclusive(database, order, fmt.Sprintf("Epic no dio una respuesta concluyente al envío (%v) — no se reenvía ni se reembolsa automáticamente; confirmar en Epic si el ítem llegó. bot=%s receiver=%s", err, bot.DisplayName, receiverAccountID))
 			return
 		}
 
@@ -1223,10 +1622,9 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 			// atómica que marca 'sent' — no queda ninguna ventana entre
 			// "limpiar la marca" y "persistir la entrega" donde una caída del
 			// proceso pudiera dejar el pedido en un estado contradictorio.
-			if markErr := db.MarkOrderDelivered(database, order.ID, accountID, evidence); markErr != nil {
-				slog.Warn("Worker: error guardando evidencia de entrega", "orderID", order.ID, "error", markErr)
-				db.UpdateOrderStatus(database, order.ID, "sent", &accountID, nil)
-			}
+			// Si no se puede guardar, NUNCA se marca 'sent' sin evidencia: queda
+			// pendiente y se reintenta sin reenviar (ver persistDelivery).
+			persistDelivery(database, order, accountID, evidence)
 			// Resta atómica en SQL, no un SET absoluto calculado en memoria —
 			// evita que dos instancias del worker procesando la misma cuenta
 			// bot casi al mismo tiempo pisen el contador real de regalos

@@ -261,3 +261,36 @@ func TestGetReceiverAccountID_FalloDeConexionNuncaEsNotFound(t *testing.T) {
 		t.Error("un fallo de conexión NUNCA debe reportarse como 'usuario no encontrado'")
 	}
 }
+
+// Regresión: un 2xx sin confirmación verificable (cuerpo vacío, 204, HTML de un
+// intermediario, JSON sin el perfil) dejaba la evidencia vacía y el pedido se
+// registraba como entregado. Ahora es un resultado incierto, sin evidencia.
+func TestSendGift_2xxSinConfirmacionEsIncierto(t *testing.T) {
+	cases := map[string]struct {
+		status int
+		body   string
+	}{
+		"200 vacío":     {http.StatusOK, ""},
+		"204":           {http.StatusNoContent, ""},
+		"200 HTML":      {http.StatusOK, "<html>ok</html>"},
+		"200 truncado":  {http.StatusOK, `{"profileRevision": 4`},
+		"200 {}":        {http.StatusOK, "{}"},
+		"200 null":      {http.StatusOK, "null"},
+		"200 sin id":    {http.StatusOK, `{"profileRevision": 1}`},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			withMockEpic(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(c.status)
+				w.Write([]byte(c.body))
+			})
+			evidence, err := SendGift(nil, newTestAccount(), uuid.New().String(), "offer-1", 500, "Item", "hola")
+			if !errors.Is(err, ErrRequestUncertain) {
+				t.Errorf("esperaba ErrRequestUncertain, obtuve %v", err)
+			}
+			if evidence != "" {
+				t.Errorf("sin confirmación no debe haber evidencia, obtuve %q", evidence)
+			}
+		})
+	}
+}
