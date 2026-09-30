@@ -207,6 +207,60 @@ func AlertDeliveryNotPersisted(orderID, epicUsername, itemName string) {
 	)
 }
 
+// complaintNoun: "un reclamo" / "una queja" (y en mayúscula, "El reclamo" / "La queja").
+func complaintNoun(kind string, definite bool) string {
+	switch {
+	case kind == "queja" && definite:
+		return "La queja"
+	case kind == "queja":
+		return "una queja"
+	case definite:
+		return "El reclamo"
+	default:
+		return "un reclamo"
+	}
+}
+
+// AlertNewComplaint avisa que entró un reclamo o queja en el Libro de
+// Reclamaciones Virtual — hay un plazo legal de 15 días hábiles para
+// responderlo. emailSent=false indica que al consumidor NO le llegó la copia
+// por correo (no hay proveedor de correo configurado).
+func AlertNewComplaint(reference, kind, deadline string, emailSent bool) {
+	if !shouldAlert("complaint_new_" + reference) {
+		return
+	}
+	desc := fmt.Sprintf("Entró %s en el Libro de Reclamaciones: **%s**.\nPlazo legal para responder: **15 días hábiles** — vence el **%s**.\nRespóndelo desde el panel admin → pestaña Reclamos.", complaintNoun(kind, false), reference, deadline)
+	if !emailSent {
+		desc += "\n⚠️ Al consumidor NO le llegó la copia por correo: no hay proveedor de correo configurado (RESEND_API_KEY o SMTP_HOST)."
+	}
+	sendAdminAlert("📋 Nuevo reclamo en el Libro de Reclamaciones", desc, colorWarnSoft)
+}
+
+// AlertComplaintDeadline recuerda responder un reclamo cuyo plazo está por
+// vencer o ya venció. day (AAAA-MM-DD) hace que se avise como mucho una vez por
+// día por reclamo.
+func AlertComplaintDeadline(reference, kind, deadline string, businessDaysLeft int, day string) {
+	if !shouldAlert("complaint_deadline_" + reference + "_" + day) {
+		return
+	}
+	var title, when string
+	color := colorWarnSoft
+	switch {
+	case businessDaysLeft < 0:
+		title = "🔴 Reclamo VENCIDO sin responder"
+		when = fmt.Sprintf("venció el **%s** (hace %d día(s) hábil(es))", deadline, -businessDaysLeft)
+		color = colorAlert
+	case businessDaysLeft == 0:
+		title = "🔴 Reclamo vence HOY"
+		when = fmt.Sprintf("vence **hoy** (%s)", deadline)
+		color = colorAlert
+	default:
+		title = "🟡 Reclamo por vencer"
+		when = fmt.Sprintf("vence el **%s** (quedan %d día(s) hábil(es))", deadline, businessDaysLeft)
+	}
+	sendAdminAlert(title, fmt.Sprintf("%s **%s** sigue sin respuesta y %s. Respóndelo desde el panel admin → pestaña Reclamos.", complaintNoun(kind, true), reference, when), color)
+}
+
 // AlertUnderpaidCryptoPayment se llama cuando NOWPayments reporta un pago
 // como "partially_paid" — el cliente mandó menos cripto de lo esperado
 // (comisión de red, o el precio de la cripto se movió justo en el momento

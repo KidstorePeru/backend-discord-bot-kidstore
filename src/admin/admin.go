@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -802,8 +803,26 @@ func HandlerGetAllComplaints(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo reclamos"})
 			return
 		}
-		if complaints == nil { complaints = []types.ConsumerComplaint{} }
-		c.JSON(http.StatusOK, gin.H{"success": true, "complaints": complaints, "total": total, "page": page, "limit": limit})
+		// Cada reclamo va con su vencimiento legal (15 días hábiles) y los días
+		// hábiles que le quedan, para que el panel los muestre y resalte.
+		type complaintWithDeadline struct {
+			types.ConsumerComplaint
+			Deadline         string `json:"deadline"`           // AAAA-MM-DD, hora de Perú
+			DeadlineLabel    string `json:"deadline_label"`     // ej. "lun 20/10/2026"
+			BusinessDaysLeft int    `json:"business_days_left"` // 0 = vence hoy; negativo = vencido
+		}
+		now := time.Now()
+		out := make([]complaintWithDeadline, 0, len(complaints))
+		for _, cp := range complaints {
+			deadline := store.ComplaintDeadline(cp.CreatedAt)
+			out = append(out, complaintWithDeadline{
+				ConsumerComplaint: cp,
+				Deadline:          deadline.Format("2006-01-02"),
+				DeadlineLabel:     store.FormatComplaintDeadline(deadline),
+				BusinessDaysLeft:  store.BusinessDaysLeft(deadline, now),
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "complaints": out, "total": total, "page": page, "limit": limit})
 	}
 }
 
@@ -835,7 +854,8 @@ func HandlerRespondComplaint(database *sql.DB, cfg types.EnvConfig) gin.HandlerF
 			return
 		}
 		db.AddAuditLog(database, nil, "COMPLAINT_RESPONDED", "reclamo "+complaint.Reference+" respondido", c.ClientIP())
-		go store.SendComplaintRespondedEmail(cfg, complaint.Email, complaint.FullName, complaint.Reference, req.Response, "es")
+		// En el idioma en que el consumidor presentó el reclamo.
+		go store.SendComplaintRespondedEmail(cfg, complaint.Email, complaint.FullName, complaint.Reference, req.Response, complaint.Lang)
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "respuesta enviada"})
 	}
 }

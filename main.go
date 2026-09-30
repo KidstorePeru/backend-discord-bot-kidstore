@@ -412,6 +412,18 @@ func main() {
 		}
 	}()
 
+	// ── Libro de Reclamaciones: recordatorio por Discord de los reclamos sin
+	// responder a los que les quedan 3 días hábiles o menos del plazo legal
+	// (o ya vencidos) — como mucho una vez por día por reclamo. ──
+	go func() {
+		for {
+			safe.Run("RemindComplaintDeadlines", func() {
+				store.RemindComplaintDeadlines(database)
+			})
+			time.Sleep(time.Hour)
+		}
+	}()
+
 	// ── Retención de webhook_events: purga diaria de eventos ya procesados
 	// (nunca los pendientes de reintento) — ver PurgeProcessedWebhookEvents. ──
 	go func() {

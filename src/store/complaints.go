@@ -2,6 +2,7 @@ package store
 
 import (
 	"KidStoreStore/src/db"
+	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/types"
 	"database/sql"
 	"log/slog"
@@ -36,7 +37,16 @@ func HandlerCreateComplaint(database *sql.DB, cfg types.EnvConfig) gin.HandlerFu
 			return
 		}
 
+		// El idioma no se autentica (formulario público) — se toma del header
+		// que ya usa el resto del sitio para el selector ES/EN. Se guarda para
+		// responderle al consumidor en su idioma.
+		lang := c.GetHeader("X-Lang")
+		if lang != "en" {
+			lang = "es"
+		}
+
 		complaint := types.ConsumerComplaint{
+			Lang:               lang,
 			Kind:               req.Kind,
 			FullName:           strings.TrimSpace(req.FullName),
 			DocumentType:       req.DocumentType,
@@ -75,13 +85,14 @@ func HandlerCreateComplaint(database *sql.DB, cfg types.EnvConfig) gin.HandlerFu
 
 		db.AddAuditLog(database, nil, "COMPLAINT_CREATED", "reclamo "+saved.Reference+" ("+saved.Kind+")", c.ClientIP())
 
-		// El idioma no se autentica (formulario público) — se toma del header
-		// que ya usa el resto del sitio para el selector ES/EN.
-		lang := c.GetHeader("X-Lang")
-		if lang != "en" {
-			lang = "es"
-		}
 		go SendComplaintReceivedEmail(cfg, saved.Email, saved.FullName, saved.Reference, saved.Kind, saved.ProductDescription, saved.Detail, lang)
+
+		// Aviso al admin: hay un plazo legal de 15 días hábiles para responder.
+		emailSent := hasEmailProvider(cfg)
+		if !emailSent {
+			slog.Warn("Libro de Reclamaciones: no hay proveedor de correo, el consumidor no recibe la copia del reclamo", "reference", saved.Reference)
+		}
+		go discordbot.AlertNewComplaint(saved.Reference, saved.Kind, FormatComplaintDeadline(ComplaintDeadline(saved.CreatedAt)), emailSent)
 
 		c.JSON(http.StatusCreated, gin.H{
 			"success": true,

@@ -284,6 +284,9 @@ type ConsumerComplaint struct {
 	AdminResponse       *string    `json:"admin_response,omitempty"`
 	RespondedAt         *time.Time `json:"responded_at,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`
+	// Idioma en que el consumidor presentó el reclamo ("es" | "en"): la
+	// respuesta por correo se le envía en ese mismo idioma.
+	Lang                string     `json:"lang"`
 }
 
 // CreateComplaintRequest: cuerpo del formulario público del Libro de

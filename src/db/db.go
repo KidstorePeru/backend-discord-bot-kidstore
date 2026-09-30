@@ -486,6 +486,9 @@ func CreateTables(db *sql.DB) error {
 		// entropía) — "KS-YYMMDD-" + 12 caracteres hex ya no entra en el
 		// VARCHAR(20) original.
 		`ALTER TABLE consumer_complaints ALTER COLUMN reference TYPE VARCHAR(30)`,
+		// Idioma del reclamo, para responderle al consumidor en su idioma. Los
+		// reclamos anteriores quedan en 'es' (el formulario era en español por defecto).
+		`ALTER TABLE consumer_complaints ADD COLUMN IF NOT EXISTS lang VARCHAR(5) NOT NULL DEFAULT 'es'`,
 	}
 
 	for _, q := range queries {
@@ -3163,6 +3166,11 @@ func generateComplaintReference() (string, error) {
 // CreateComplaint inserta un nuevo reclamo/queja del Libro de Reclamaciones
 // Virtual y le asigna un código de seguimiento único.
 func CreateComplaint(db *sql.DB, c types.ConsumerComplaint, ip string) (types.ConsumerComplaint, error) {
+	lang := "es"
+	if c.Lang == "en" {
+		lang = "en"
+	}
+	c.Lang = lang
 	for attempt := 0; attempt < 5; attempt++ {
 		ref, err := generateComplaintReference()
 		if err != nil {
@@ -3174,12 +3182,12 @@ func CreateComplaint(db *sql.DB, c types.ConsumerComplaint, ip string) (types.Co
 			INSERT INTO consumer_complaints
 				(id, reference, kind, full_name, document_type, document_number, email, phone, address,
 				 is_minor, guardian_name, order_id, amount_involved, product_description, detail, consumer_request,
-				 status, ip_address, created_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pendiente',$17,NOW())
+				 status, ip_address, created_at, lang)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pendiente',$17,NOW(),$18)
 			RETURNING created_at`,
 			id, ref, c.Kind, c.FullName, c.DocumentType, c.DocumentNumber, c.Email, c.Phone, c.Address,
 			c.IsMinor, c.GuardianName, c.OrderID, c.AmountInvolved, c.ProductDescription, c.Detail, c.ConsumerRequest,
-			ip).Scan(&createdAt)
+			ip, lang).Scan(&createdAt)
 		if err != nil {
 			// Colisión de código único (extremadamente improbable) → reintentar con uno nuevo
 			if strings.Contains(err.Error(), "consumer_complaints_reference_key") {
@@ -3200,13 +3208,33 @@ func scanComplaint(row interface{ Scan(dest ...interface{}) error }) (types.Cons
 	var c types.ConsumerComplaint
 	err := row.Scan(&c.ID, &c.Reference, &c.Kind, &c.FullName, &c.DocumentType, &c.DocumentNumber,
 		&c.Email, &c.Phone, &c.Address, &c.IsMinor, &c.GuardianName, &c.OrderID, &c.AmountInvolved,
-		&c.ProductDescription, &c.Detail, &c.ConsumerRequest, &c.Status, &c.AdminResponse, &c.RespondedAt, &c.CreatedAt)
+		&c.ProductDescription, &c.Detail, &c.ConsumerRequest, &c.Status, &c.AdminResponse, &c.RespondedAt, &c.CreatedAt,
+		&c.Lang)
 	return c, err
 }
 
 const complaintSelectCols = `id, reference, kind, full_name, document_type, document_number,
 	email, phone, address, is_minor, guardian_name, order_id, amount_involved,
-	product_description, detail, consumer_request, status, admin_response, responded_at, created_at`
+	product_description, detail, consumer_request, status, admin_response, responded_at, created_at, lang`
+
+// GetPendingComplaints: reclamos todavía sin responder (para los recordatorios
+// de plazo, ver store.RemindComplaintDeadlines).
+func GetPendingComplaints(db *sql.DB) ([]types.ConsumerComplaint, error) {
+	rows, err := db.Query(`SELECT `+complaintSelectCols+` FROM consumer_complaints WHERE status='pendiente' ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []types.ConsumerComplaint
+	for rows.Next() {
+		c, err := scanComplaint(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
 
 // GetComplaintByReference permite a un consumidor consultar el estado de su
 // reclamo con el código que se le entregó al presentarlo — no requiere cuenta.
