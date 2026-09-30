@@ -225,3 +225,65 @@ func TestWebhookEvent_ExitoYFalloConcurrentesTerminanSiempreResueltos(t *testing
 		}
 	}
 }
+
+// Regresión: ClaimWebhookEvent no comprobaba next_attempt_at. Un trabajador que
+// había listado el evento antes de que otro registrara un fallo podía
+// reclamarlo apenas se liberaba el lease, saltándose el backoff.
+func TestClaimWebhookEvent_RespetaElBackoffEntreTrabajadores(t *testing.T) {
+	conn := setupShopTestDB(t)
+	id := nowPaymentsEvent(t, conn, 890004)
+
+	// El trabajador A reclama, falla de forma temporal y agenda el siguiente intento.
+	if ok, err := db.ClaimWebhookEvent(conn, id, time.Minute); err != nil || !ok {
+		t.Fatalf("primer claim: ok=%v err=%v", ok, err)
+	}
+	if moved, _, err := db.RecordWebhookRetryFailure(conn, id, "error: gateway 503", false, nowPaymentsMaxRetryAttempts, nowPaymentsRetryBackoff); err != nil || moved {
+		t.Fatalf("registrar fallo: moved=%v err=%v", moved, err)
+	}
+	if r := readEvent(t, conn, id); !r.next || r.claimed {
+		t.Fatalf("el fallo debe agendar next_attempt_at y liberar el lease: %+v", r)
+	}
+
+	// Varios trabajadores que tenían el evento en su lista intentan reclamarlo a la vez.
+	const n = 10
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	var wins int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if ok, err := db.ClaimWebhookEvent(conn, id, time.Minute); err != nil {
+				t.Errorf("claim: %v", err)
+			} else if ok {
+				atomic.AddInt32(&wins, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if wins != 0 {
+		t.Fatalf("durante el backoff nadie debe reclamar el evento, lo reclamaron %d", wins)
+	}
+
+	// Vencido el backoff, exactamente uno lo obtiene.
+	conn.Exec(`UPDATE webhook_events SET next_attempt_at=NOW()-INTERVAL '1 second' WHERE id=$1`, id)
+	wins = 0
+	start = make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if ok, _ := db.ClaimWebhookEvent(conn, id, time.Minute); ok {
+				atomic.AddInt32(&wins, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("con el backoff vencido exactamente uno debe reclamarlo, lo reclamaron %d", wins)
+	}
+}

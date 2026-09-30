@@ -1,6 +1,7 @@
 package db
 
 import (
+	"encoding/json"
 	"errors"
 	"KidStoreStore/src/crypto"
 	"KidStoreStore/src/safe"
@@ -1365,10 +1366,15 @@ func RefundOrder(db *sql.DB, orderID uuid.UUID) error {
 	var customerID uuid.UUID
 	var priceKC int
 	var status string
-	err = tx.QueryRow(`SELECT customer_id, price_kc, status FROM orders WHERE id=$1 FOR UPDATE`, orderID).
-		Scan(&customerID, &priceKC, &status)
+	var evidence sql.NullString
+	err = tx.QueryRow(`SELECT customer_id, price_kc, status, delivery_evidence FROM orders WHERE id=$1 FOR UPDATE`, orderID).
+		Scan(&customerID, &priceKC, &status, &evidence)
 	if err != nil { return fmt.Errorf("order not found") }
 	if status == "refunded" || status == "sent" { return fmt.Errorf("order cannot be refunded: status is %s", status) }
+	// Un pedido con evidencia de entrega guardada NUNCA se reembolsa, sea cual
+	// sea su status (p. ej. un 'review' o 'failed' al que después llegó la
+	// confirmación de Epic): el ítem ya está en la cuenta del cliente.
+	if strings.TrimSpace(evidence.String) != "" { return ErrOrderHasDeliveryEvidence }
 	if _, err := tx.Exec(`UPDATE customers SET kc_balance=kc_balance+$1, updated_at=NOW() WHERE id=$2`, priceKC, customerID); err != nil { return err }
 	if _, err := tx.Exec(`UPDATE orders SET status='refunded', updated_at=NOW() WHERE id=$1`, orderID); err != nil { return err }
 	return tx.Commit()
@@ -1440,10 +1446,48 @@ func ClaimPendingOrders(database *sql.DB) ([]types.Order, error) {
 	return orders, nil
 }
 
+// UpdateOrderStatus solo cambia pedidos que el worker todavía tiene en curso
+// ('pending'/'processing'). Una respuesta atrasada de un trabajador lento (o de
+// otra réplica) nunca devuelve a 'pending' un pedido que ya se entregó, se
+// reembolsó o está en revisión — devuelve ErrOrderNotActive en ese caso.
 func UpdateOrderStatus(db *sql.DB, orderID uuid.UUID, status string, gameAccountID *uuid.UUID, errMsg *string) error {
-	_, err := db.Exec(`UPDATE orders SET status=$1, game_account_id=$2, error_msg=$3, updated_at=NOW() WHERE id=$4`,
+	res, err := db.Exec(`UPDATE orders SET status=$1, game_account_id=$2, error_msg=$3, updated_at=NOW()
+		WHERE id=$4 AND status IN ('pending','processing') AND COALESCE(delivery_evidence,'') = ''`,
 		status, gameAccountID, errMsg, orderID)
-	return err
+	if err != nil { return err }
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrOrderNotActive
+	}
+	return nil
+}
+
+var (
+	// ErrOrderNotActive: el pedido ya no está en curso (entregado, reembolsado,
+	// fallido o en revisión); la escritura se descartó a propósito.
+	ErrOrderNotActive = errors.New("el pedido ya no está en curso: no se modifica")
+	// ErrOrderHasDeliveryEvidence: el pedido tiene evidencia de entrega guardada
+	// — no se reembolsa ni se manda a revisión como si no se hubiera entregado.
+	ErrOrderHasDeliveryEvidence = errors.New("el pedido tiene evidencia de entrega: no se reembolsa")
+	// ErrInvalidDeliveryEvidence: se intentó registrar una entrega sin una
+	// evidencia verificable (vacía, JSON inválido o sin la respuesta de Epic).
+	ErrInvalidDeliveryEvidence = errors.New("evidencia de entrega vacía o inválida")
+)
+
+// ValidDeliveryEvidence comprueba que la evidencia sea la que arma
+// fortnite.SendGift: un objeto JSON con la respuesta de Epic (objeto no
+// vacío), el offer_id y la cuenta receptora.
+func ValidDeliveryEvidence(evidence string) bool {
+	var ev struct {
+		EpicResponse map[string]json.RawMessage `json:"epic_response"`
+		OfferID      string                     `json:"offer_id"`
+		Receiver     string                     `json:"receiver_account_id"`
+	}
+	if err := json.Unmarshal([]byte(evidence), &ev); err != nil {
+		return false
+	}
+	return len(ev.EpicResponse) > 0 && ev.OfferID != "" && ev.Receiver != ""
 }
 
 // MarkOrderSendAttempted se llama justo ANTES de intentar de verdad enviar el
@@ -1474,14 +1518,29 @@ func MarkOrderSendAttempted(db *sql.DB, orderID uuid.UUID, attempting bool) (was
 	tx, err := db.Begin()
 	if err != nil { return false, err }
 	defer tx.Rollback()
-	if err := tx.QueryRow(`SELECT send_attempted FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&wasAlreadyAttempted); err != nil {
+	var status string
+	var evidence sql.NullString
+	if err := tx.QueryRow(`SELECT send_attempted, status, delivery_evidence FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&wasAlreadyAttempted, &status, &evidence); err != nil {
 		return false, err
+	}
+	// Un trabajador atrasado (otra réplica, un lease vencido) no puede empezar
+	// un envío sobre un pedido que ya no está en curso o que ya tiene evidencia.
+	if attempting && ((status != "pending" && status != "processing") || strings.TrimSpace(evidence.String) != "") {
+		return false, ErrOrderNotActive
 	}
 	if _, err := tx.Exec(`UPDATE orders SET send_attempted=$1, updated_at=NOW() WHERE id=$2`, attempting, orderID); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil { return false, err }
 	return wasAlreadyAttempted, nil
+}
+
+// OrderSendAttempted indica si el pedido tiene un intento de envío a Epic sin
+// resolver (send_attempted) — ver MarkOrderSendAttempted.
+func OrderSendAttempted(db *sql.DB, orderID uuid.UUID) (bool, error) {
+	var attempted bool
+	err := db.QueryRow(`SELECT send_attempted FROM orders WHERE id=$1`, orderID).Scan(&attempted)
+	return attempted, err
 }
 
 // ResolveOrderReview decide y aplica, en UNA sola transacción atómica, qué
@@ -1508,8 +1567,15 @@ func ResolveOrderReview(db *sql.DB, orderID uuid.UUID, reviewNote string) (wasAt
 	tx, err := db.Begin()
 	if err != nil { return false, err }
 	defer tx.Rollback()
-	if err := tx.QueryRow(`SELECT send_attempted FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&wasAttempting); err != nil {
+	var status string
+	var evidence sql.NullString
+	if err := tx.QueryRow(`SELECT send_attempted, status, delivery_evidence FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&wasAttempting, &status, &evidence); err != nil {
 		return false, err
+	}
+	// Otro trabajador (o una recuperación) ya registró la entrega: ni revisión
+	// ni reembolso — se deja como está.
+	if status == "sent" || strings.TrimSpace(evidence.String) != "" {
+		return false, ErrOrderHasDeliveryEvidence
 	}
 	if wasAttempting {
 		if _, err := tx.Exec(`UPDATE orders SET status='review', error_msg=$1, send_attempted=false, updated_at=NOW() WHERE id=$2`, reviewNote, orderID); err != nil {
@@ -1534,7 +1600,9 @@ func ResolveOrderReview(db *sql.DB, orderID uuid.UUID, reviewNote string) (wasAt
 // proceso pudiera dejar un estado a medias.
 func SetOrderReviewOrClear(db *sql.DB, orderID uuid.UUID, needsReview bool, reviewNote string) error {
 	if needsReview {
-		_, err := db.Exec(`UPDATE orders SET status='review', error_msg=$1, send_attempted=false, updated_at=NOW() WHERE id=$2`, reviewNote, orderID)
+		// Nunca sobre un pedido ya entregado o reembolsado (respuesta atrasada).
+		_, err := db.Exec(`UPDATE orders SET status='review', error_msg=$1, send_attempted=false, updated_at=NOW()
+			WHERE id=$2 AND status NOT IN ('sent','refunded')`, reviewNote, orderID)
 		return err
 	}
 	_, err := db.Exec(`UPDATE orders SET send_attempted=false, updated_at=NOW() WHERE id=$1`, orderID)
@@ -1571,11 +1639,32 @@ func ResolveReviewOrder(db *sql.DB, orderID uuid.UUID, action, adminActor string
 // entrega" y "limpiar la marca de intento" donde una caída del proceso
 // pudiera dejar un estado contradictorio (pedido 'sent' pero con
 // send_attempted todavía en true, o viceversa).
+//
+// Es idempotente (volver a guardarla con la misma evidencia no cambia nada), así
+// que el worker puede reintentarla tras un fallo sin reenviar el regalo. Nunca
+// pisa un pedido ya reembolsado: en ese caso devuelve ErrOrderAlreadyRefunded
+// (el ítem se entregó Y el KC se devolvió — lo tiene que ver un admin).
 func MarkOrderDelivered(db *sql.DB, orderID, gameAccountID uuid.UUID, evidence string) error {
-	_, err := db.Exec(`UPDATE orders SET status='sent', game_account_id=$1, error_msg=NULL, delivery_evidence=$2, send_attempted=false, updated_at=NOW() WHERE id=$3`,
+	if !ValidDeliveryEvidence(evidence) {
+		return ErrInvalidDeliveryEvidence
+	}
+	res, err := db.Exec(`UPDATE orders SET status='sent', game_account_id=$1, error_msg=NULL, delivery_evidence=$2, send_attempted=false, updated_at=NOW()
+		WHERE id=$3 AND status <> 'refunded'`,
 		gameAccountID, evidence, orderID)
-	return err
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrOrderAlreadyRefunded
+	}
+	return nil
 }
+
+// ErrOrderAlreadyRefunded: MarkOrderDelivered no aplicó porque el pedido ya no
+// existe o ya se reembolsó.
+var ErrOrderAlreadyRefunded = errors.New("el pedido ya se reembolsó o no existe: no se marca como entregado")
 
 // MarkOrderFailedIfNotTerminal transiciona un pedido a 'failed' SOLO si no
 // está ya en un estado que un reembolso jamás debería poder revertir:
@@ -1596,7 +1685,7 @@ func MarkOrderDelivered(db *sql.DB, orderID, gameAccountID uuid.UUID, evidence s
 func MarkOrderFailedIfNotTerminal(db *sql.DB, orderID uuid.UUID, errMsg string) (applied bool, err error) {
 	result, err := db.Exec(`
 		UPDATE orders SET status='failed', error_msg=$1, updated_at=NOW()
-		WHERE id=$2 AND status NOT IN ('refunded','sent','review')`, errMsg, orderID)
+		WHERE id=$2 AND status NOT IN ('refunded','sent','review') AND COALESCE(delivery_evidence,'') = ''`, errMsg, orderID)
 	if err != nil { return false, err }
 	n, err := result.RowsAffected()
 	return n > 0, err
@@ -2175,11 +2264,17 @@ const webhookEventResolvedSQL = `(processed_at IS NOT NULL AND review_at IS NULL
 // solo UNO lo obtiene mientras el lease esté vigente. Devuelve false si el
 // evento ya está resuelto, en revisión, o lo tiene otro trabajador. El lease
 // se libera al asentar el resultado; si el proceso se cae, vence solo.
+//
+// El backoff (next_attempt_at) se comprueba en el MISMO UPDATE: un trabajador
+// que listó el evento antes de que otro registrara un fallo (y agendara el
+// siguiente intento) ya no puede reclamarlo antes de tiempo — sin esto, varias
+// réplicas reintentaban un evento en backoff apenas se liberaba el lease.
 func ClaimWebhookEvent(db *sql.DB, id uuid.UUID, lease time.Duration) (bool, error) {
 	res, err := db.Exec(`UPDATE webhook_events SET claimed_until = NOW() + $2::interval
 		WHERE id=$1 AND review_at IS NULL
 		  AND (processed_at IS NULL OR outcome LIKE 'error:%')
-		  AND (claimed_until IS NULL OR claimed_until < NOW())`,
+		  AND (claimed_until IS NULL OR claimed_until < NOW())
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())`,
 		id, fmt.Sprintf("%d seconds", int64(lease.Seconds())))
 	if err != nil { return false, err }
 	n, err := res.RowsAffected()

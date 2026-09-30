@@ -850,6 +850,16 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 		return "", fmt.Errorf("error enviando gift, status: %d", resp.StatusCode)
 	}
 
+	// Un 2xx solo confirma la entrega si trae el perfil que Epic devuelve tras
+	// la compra (profileRevision/profileId). Un cuerpo vacío (204), HTML de un
+	// intermediario o JSON truncado NO es una confirmación: antes, json.Marshal
+	// fallaba en silencio con ese cuerpo, la evidencia salía "" y el pedido se
+	// registraba como entregado sin prueba alguna. Se trata como resultado
+	// incierto: ni entregado, ni rechazado.
+	if !isGiftConfirmation(respBody) {
+		return "", fmt.Errorf("%w: status %d sin una confirmación de entrega verificable de Epic", ErrRequestUncertain, resp.StatusCode)
+	}
+
 	// Envolver la respuesta cruda de Epic junto con datos que la ubican en el
 	// tiempo y el contexto del pedido — esto es lo que queda guardado como
 	// "evidencia de entrega" del pedido.
@@ -860,8 +870,26 @@ func SendGift(database *sql.DB, account types.GameAccount, receiverAccountID, of
 		"offer_id":            offerID,
 		"captured_at":         time.Now().UTC().Format(time.RFC3339),
 	}
-	evidenceBytes, _ := json.Marshal(evidenceObj)
+	evidenceBytes, err := json.Marshal(evidenceObj)
+	if err != nil {
+		return "", fmt.Errorf("%w: no se pudo armar la evidencia de entrega: %v", ErrRequestUncertain, err)
+	}
 	return string(evidenceBytes), nil
+}
+
+// isGiftConfirmation: el cuerpo de un 2xx de GiftCatalogEntry es el perfil MCP
+// actualizado — un objeto JSON con profileRevision numérico y profileId.
+func isGiftConfirmation(body []byte) bool {
+	var profile struct {
+		ProfileRevision *json.Number `json:"profileRevision"`
+		ProfileID       string       `json:"profileId"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&profile); err != nil {
+		return false
+	}
+	return profile.ProfileRevision != nil && profile.ProfileID != ""
 }
 
 // ==================== VBUCKS BALANCE ====================

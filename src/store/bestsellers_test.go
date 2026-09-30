@@ -124,9 +124,9 @@ func TestHandlerGetBestSellers_SoloObjetosDeLaTiendaActualYSinCantidades(t *test
 	// La tienda falsa solo tiene "v2:/offer-1" con layout; se le agregan 3 más.
 	entries := `{"offerId":"v2:/offer-1","finalPrice":800,"layout":{"id":"s"},"brItems":[{"name":"X"}]}`
 	for _, id := range []string{"bsh-2", "bsh-3", "bsh-4"} {
-		entries += fmt.Sprintf(`,{"offerId":"%s","finalPrice":100,"layout":{"id":"s"}}`, id)
+		entries += fmt.Sprintf(`,{"offerId":"%s","finalPrice":100,"layout":{"id":"s"},"brItems":[{"name":"Y"}]}`, id)
 	}
-	entries += `,{"offerId":"bsh-sin-layout","finalPrice":100}`
+	entries += `,{"offerId":"bsh-sin-layout","finalPrice":100,"brItems":[{"name":"Z"}]}`
 	body := fmt.Sprintf(`{"status":200,"data":{"date":"2026-09-29T00:00:00Z","entries":[%s]}}`, entries)
 	shopCacheMu.Lock()
 	shopCache["es-419"] = &shopCacheEntry{body: []byte(body), fetchedAt: time.Now()}
