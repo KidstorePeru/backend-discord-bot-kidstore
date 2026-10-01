@@ -596,48 +596,107 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 	if err != nil {
 		return shopItem{}, err
 	}
+	type itemImages struct {
+		Featured  string `json:"featured"`
+		Icon      string `json:"icon"`
+		SmallIcon string `json:"smallIcon"`
+		Large     string `json:"large"`
+		Small     string `json:"small"`
+	}
+	type namedItem struct {
+		Name   string     `json:"name"`
+		Images itemImages `json:"images"`
+	}
 	var parsed struct {
 		Data struct {
 			Entries []struct {
 				OfferID    string `json:"offerId"`
 				FinalPrice int    `json:"finalPrice"`
 				Bundle     *struct {
-					Name string `json:"name"`
+					Name  string `json:"name"`
+					Image string `json:"image"`
 				} `json:"bundle"`
-				BrItems []struct {
-					Name   string `json:"name"`
-					Images struct {
-						Featured  string `json:"featured"`
-						Icon      string `json:"icon"`
-						SmallIcon string `json:"smallIcon"`
-					} `json:"images"`
-				} `json:"brItems"`
-				Tracks []struct {
-					Title string `json:"title"`
+				NewDisplayAsset *struct {
+					RenderImages []struct {
+						ProductTag string `json:"productTag"`
+						Image      string `json:"image"`
+					} `json:"renderImages"`
+				} `json:"newDisplayAsset"`
+				BrItems []namedItem `json:"brItems"`
+				Tracks  []struct {
+					Title    string `json:"title"`
+					AlbumArt string `json:"albumArt"`
 				} `json:"tracks"`
+				Cars        []namedItem `json:"cars"`
+				Instruments []namedItem `json:"instruments"`
+				LegoKits    []namedItem `json:"legoKits"`
 			} `json:"entries"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return shopItem{}, fmt.Errorf("respuesta de tienda inesperada: %w", err)
 	}
+	first := func(vals ...string) string {
+		for _, v := range vals {
+			if v != "" {
+				return v
+			}
+		}
+		return ""
+	}
 	for _, e := range parsed.Data.Entries {
 		if e.OfferID != offerID {
 			continue
 		}
 		item := shopItem{FinalPrice: e.FinalPrice}
+
+		// Nombre: el del lote, o el del primer objeto de la oferta.
 		switch {
-		case e.Bundle != nil:
+		case e.Bundle != nil && e.Bundle.Name != "":
 			item.Name = e.Bundle.Name
 		case len(e.BrItems) > 0:
 			item.Name = e.BrItems[0].Name
-			item.Image = e.BrItems[0].Images.Featured
-			if item.Image == "" { item.Image = e.BrItems[0].Images.Icon }
-			if item.Image == "" { item.Image = e.BrItems[0].Images.SmallIcon }
 		case len(e.Tracks) > 0:
 			item.Name = e.Tracks[0].Title
+		case len(e.Cars) > 0:
+			item.Name = e.Cars[0].Name
+		case len(e.Instruments) > 0:
+			item.Name = e.Instruments[0].Name
+		case len(e.LegoKits) > 0:
+			item.Name = e.LegoKits[0].Name
 		}
 		if item.Name == "" { item.Name = "Item" }
+
+		// Imagen: la misma que muestra la tienda (offerImages en model.ts) —
+		// portada del tema musical, render de la oferta (primero los de Battle
+		// Royale), imagen del lote y, por último, la del primer objeto. Antes
+		// los lotes, temas, autos e instrumentos quedaban sin imagen y los
+		// correos mostraban el ícono de KC en vez del producto.
+		if len(e.Tracks) > 0 && e.Tracks[0].AlbumArt != "" {
+			item.Image = e.Tracks[0].AlbumArt
+		}
+		if item.Image == "" && e.NewDisplayAsset != nil {
+			for _, br := range []bool{true, false} {
+				for _, r := range e.NewDisplayAsset.RenderImages {
+					if r.Image != "" && (!br || r.ProductTag == "Product.BR") {
+						item.Image = r.Image
+						break
+					}
+				}
+				if item.Image != "" { break }
+			}
+		}
+		if item.Image == "" && e.Bundle != nil { item.Image = e.Bundle.Image }
+		if item.Image == "" && len(e.BrItems) > 0 {
+			im := e.BrItems[0].Images
+			item.Image = first(im.Featured, im.Icon, im.SmallIcon)
+		}
+		for _, list := range [][]namedItem{e.Cars, e.Instruments, e.LegoKits} {
+			if item.Image == "" && len(list) > 0 {
+				im := list[0].Images
+				item.Image = first(im.Large, im.Small, im.Featured, im.Icon)
+			}
+		}
 		return item, nil
 	}
 	return shopItem{}, fmt.Errorf("item no encontrado en la tienda actual")

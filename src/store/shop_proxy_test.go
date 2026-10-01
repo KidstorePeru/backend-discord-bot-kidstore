@@ -403,3 +403,38 @@ func TestValidateShopBody_AceptaEntradasValidasVariadas(t *testing.T) {
 		t.Fatalf("entradas válidas no deben rechazarse: %v", err)
 	}
 }
+
+// Regresión: al comprar un lote (o un tema musical, auto o instrumento), el
+// pedido guardaba solo el nombre y ninguna imagen — los correos de "Pedido
+// enviado" mostraban el ícono de KC en vez del producto. La imagen se elige
+// igual que en la tienda (offerImages en model.ts).
+func TestResolveShopItem_ImagenDeCadaTipoDeOferta(t *testing.T) {
+	f := withFakeShop(t)
+	f.body.Store(`{"status":200,"data":{"date":"x","entries":[
+		{"offerId":"lote","finalPrice":3400,"bundle":{"name":"Lote Madison Beer","image":"https://fortnite-api.com/bundle.png"},
+		 "newDisplayAsset":{"renderImages":[{"productTag":"Product.Juno","image":"https://fortnite-api.com/juno.png"},{"productTag":"Product.BR","image":"https://fortnite-api.com/render-br.png"}]},
+		 "brItems":[{"name":"Madison","images":{"featured":"https://fortnite-api.com/featured.png"}}]},
+		{"offerId":"lote-sin-render","finalPrice":2000,"bundle":{"name":"Lote X","image":"https://fortnite-api.com/bundle-x.png"},"brItems":[{"name":"A","images":{"icon":"https://fortnite-api.com/a.png"}}]},
+		{"offerId":"tema","finalPrice":500,"tracks":[{"title":"Poker Face","albumArt":"https://cdn.fortnite-api.com/tracks/poker.jpg"}]},
+		{"offerId":"auto","finalPrice":1500,"cars":[{"name":"Dominus GT","images":{"small":"https://fortnite-api.com/car-s.png","large":"https://fortnite-api.com/car-l.png"}}]},
+		{"offerId":"instrumento","finalPrice":800,"instruments":[{"name":"Cetro","images":{"large":"https://fortnite-api.com/inst.png"}}]},
+		{"offerId":"skin","finalPrice":1200,"brItems":[{"name":"Isaac","images":{"featured":"","icon":"https://fortnite-api.com/isaac.png"}}]}
+	]}}`)
+	cases := map[string]struct{ name, image string }{
+		"lote":            {"Lote Madison Beer", "https://fortnite-api.com/render-br.png"},
+		"lote-sin-render": {"Lote X", "https://fortnite-api.com/bundle-x.png"},
+		"tema":            {"Poker Face", "https://cdn.fortnite-api.com/tracks/poker.jpg"},
+		"auto":            {"Dominus GT", "https://fortnite-api.com/car-l.png"},
+		"instrumento":     {"Cetro", "https://fortnite-api.com/inst.png"},
+		"skin":            {"Isaac", "https://fortnite-api.com/isaac.png"},
+	}
+	for id, want := range cases {
+		item, err := resolveShopItem(context.Background(), id)
+		if err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+		if item.Name != want.name || item.Image != want.image {
+			t.Errorf("%s: obtuve nombre=%q imagen=%q, se esperaba %q / %q", id, item.Name, item.Image, want.name, want.image)
+		}
+	}
+}
