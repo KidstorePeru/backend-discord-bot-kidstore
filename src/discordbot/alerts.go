@@ -379,3 +379,31 @@ func AlertNoActiveBots(pendingOrders int) {
 	)
 	slog.Info("Discord alert: sin bots activos", "pedidos_pendientes", pendingOrders)
 }
+
+// AlertBackupFailed avisa que el respaldo diario de la base de datos falló
+// (como mucho una vez por día, hasta que vuelva a funcionar).
+func AlertBackupFailed(reason string) {
+	if !shouldAlert("backup_failed_" + time.Now().UTC().Format("20060102")) {
+		return
+	}
+	sendAdminAlert(
+		"💾 El respaldo de la base de datos falló",
+		fmt.Sprintf("No se pudo guardar la copia de seguridad diaria:\n> %s\n\nLa tienda sigue funcionando normal, pero si se pierde la base de datos no habría una copia reciente de los saldos de KC, pedidos y cuentas. Revisa las variables BACKUP_* en Railway y el almacenamiento (bucket). Se reintenta cada hora.", reason),
+		colorAlert,
+	)
+}
+
+// ClearBackupFailedAlert — el respaldo volvió a funcionar: si falla de
+// nuevo hoy, se vuelve a avisar.
+func ClearBackupFailedAlert() {
+	clearAlert("backup_failed_" + time.Now().UTC().Format("20060102"))
+}
+
+// AlertBackupsWorking confirma la primera copia guardada en el almacenamiento.
+func AlertBackupsWorking(sizeBytes, rows, retentionDays int) {
+	sendAdminAlert(
+		"💾 Respaldos de la base de datos activados",
+		fmt.Sprintf("Se guardó la primera copia de seguridad (%d filas, %.1f MB, cifrada). Desde ahora se guarda una copia por día y se conservan las de los últimos %d días.", rows, float64(sizeBytes)/(1024*1024), retentionDays),
+		0x22C55E,
+	)
+}

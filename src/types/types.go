@@ -77,6 +77,19 @@ type EnvConfig struct {
 	AllowUnsignedWebhooks bool `envconfig:"ALLOW_UNSIGNED_WEBHOOKS" default:"false"`
 	// AppEnv (APP_ENV) identifica el entorno. Por defecto "production" (seguro).
 	AppEnv string `envconfig:"APP_ENV" default:"production"`
+
+	// Respaldo diario de la base de datos (src/backup) en un almacenamiento
+	// compatible con S3 (Cloudflare R2, Backblaze B2...). Si no se configura,
+	// no se hacen respaldos. BACKUP_ENCRYPTION_KEY cifra las copias: sin
+	// ella no se pueden abrir, así que hay que guardarla también fuera de
+	// Railway (por ejemplo, en un gestor de contraseñas).
+	BackupS3Endpoint        string `envconfig:"BACKUP_S3_ENDPOINT"`
+	BackupS3Bucket          string `envconfig:"BACKUP_S3_BUCKET"`
+	BackupS3AccessKeyID     string `envconfig:"BACKUP_S3_ACCESS_KEY_ID"`
+	BackupS3SecretAccessKey string `envconfig:"BACKUP_S3_SECRET_ACCESS_KEY"`
+	BackupS3Region          string `envconfig:"BACKUP_S3_REGION" default:"auto"`
+	BackupEncryptionKey     string `envconfig:"BACKUP_ENCRYPTION_KEY"`
+	BackupRetentionDays     int    `envconfig:"BACKUP_RETENTION_DAYS" default:"30"`
 	NOWPaymentsAPIKey     string `envconfig:"NOWPAYMENTS_API_KEY"`
 	// NOWPaymentsIPNSecret firma los callbacks IPN de NOWPayments (header
 	// x-nowpayments-sig) — se genera en el dashboard de NOWPayments, en

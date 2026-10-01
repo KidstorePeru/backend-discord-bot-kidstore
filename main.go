@@ -473,6 +473,8 @@ func main() {
 	discordbot.SetEmailSender(store.SendPaymentApprovedEmail)
 	discordbot.Start(cfg, database)
 
+	startDatabaseBackups(cfg, database)
+
 	port := cfg.Port
 	if port == "" { port = "8081" }
 	// Sin timeouts, el http.Server de Go no corta NUNCA una conexión lenta
