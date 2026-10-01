@@ -240,6 +240,9 @@ func main() {
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"service": "KidStore Store API", "status": "ok"})
 	})
+	// Para el monitor externo de caídas (ver health.go).
+	router.GET("/health", healthHandler(database))
+	router.HEAD("/health", healthHandler(database))
 
 	// ── Verificación de email (pública) ──
 	router.GET("/store/verify-email", store.HandlerVerifyEmail(database, cfg.SecretKey))
