@@ -127,6 +127,8 @@ func fingerprint(t *testing.T, conn *sql.DB) map[string]string {
 func TestRespaldo_SeRestauraIgualEnUnaBaseVacia(t *testing.T) {
 	src := newEmptyDB(t)
 	seed(t, src)
+	// La copia de la tienda (caché descartable) no se respalda.
+	mustExec(t, src, `INSERT INTO shop_cache (lang, body) VALUES ('es-419', '{"status":200}')`)
 
 	plain, header, err := Dump(context.Background(), src, time.Now())
 	if err != nil {
@@ -134,6 +136,9 @@ func TestRespaldo_SeRestauraIgualEnUnaBaseVacia(t *testing.T) {
 	}
 	if header.Tables["customers"] != 2 || header.Tables["orders"] != 1 || header.Tables["bot_schedule"] != 1 {
 		t.Errorf("cabecera inesperada: %v", header.Tables)
+	}
+	if _, ok := header.Tables["shop_cache"]; ok {
+		t.Error("shop_cache no debería incluirse en el respaldo")
 	}
 	data, err := Encrypt(plain, testKey)
 	if err != nil {
@@ -144,6 +149,9 @@ func TestRespaldo_SeRestauraIgualEnUnaBaseVacia(t *testing.T) {
 	}
 
 	dst := newEmptyDB(t)
+	// La app ya arrancó contra la base nueva y guardó la tienda: eso no
+	// cuenta como "la base ya tiene datos".
+	mustExec(t, dst, `INSERT INTO shop_cache (lang, body) VALUES ('en', '{"status":200}')`)
 	result, err := Restore(context.Background(), dst, data, testKey)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
@@ -153,6 +161,9 @@ func TestRespaldo_SeRestauraIgualEnUnaBaseVacia(t *testing.T) {
 	}
 	want, got := fingerprint(t, src), fingerprint(t, dst)
 	for table := range want {
+		if cacheTables[table] {
+			continue
+		}
 		if want[table] != got[table] {
 			t.Errorf("la tabla %s no quedó igual:\noriginal:  %s\nrestaurada: %s", table, want[table], got[table])
 		}

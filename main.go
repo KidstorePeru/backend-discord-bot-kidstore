@@ -147,6 +147,7 @@ func main() {
 
 	if err := db.CreateTables(database); err != nil { log.Fatalf("Error creando tablas: %v", err) }
 	slog.Info("Tablas verificadas")
+	store.SetShopCacheDB(database)
 
 	if cfg.EncryptionKey != "" {
 		if err := db.MigrateEncryptTokens(database, cfg.EncryptionKey); err != nil {

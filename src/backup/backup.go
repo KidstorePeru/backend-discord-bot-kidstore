@@ -87,6 +87,9 @@ func Dump(ctx context.Context, database *sql.DB, now time.Time) ([]byte, Header,
 	var body bytes.Buffer
 	enc := json.NewEncoder(&body)
 	for _, table := range tables {
+		if cacheTables[table] {
+			continue
+		}
 		rows, err := tx.QueryContext(ctx, `SELECT row_to_json(t)::text FROM `+pq.QuoteIdentifier(table)+` t`)
 		if err != nil {
 			return nil, Header{}, fmt.Errorf("leyendo %s: %w", table, err)
@@ -275,7 +278,7 @@ func Restore(ctx context.Context, database *sql.DB, data []byte, passphrase stri
 	existingSet := map[string]bool{}
 	for _, t := range existing {
 		existingSet[t] = true
-		if seededTables[t] {
+		if seededTables[t] || cacheTables[t] {
 			continue
 		}
 		var hasRows bool
@@ -365,6 +368,10 @@ func Restore(ctx context.Context, database *sql.DB, data []byte, passphrase stri
 // defecto (el horario de los bots). No cuentan como "la base ya tiene
 // datos", y su contenido se reemplaza por el del respaldo.
 var seededTables = map[string]bool{"bot_schedule": true}
+
+// cacheTables: copias descartables (se vuelven a llenar solas) que no vale
+// la pena respaldar; tampoco cuentan como "la base ya tiene datos".
+var cacheTables = map[string]bool{"shop_cache": true}
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)

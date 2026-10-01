@@ -8,6 +8,7 @@ import (
 	"KidStoreStore/src/safe"
 	"KidStoreStore/src/types"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -343,9 +344,76 @@ func markStale(body []byte) ([]byte, bool) {
 // httptest.Server, igual que nowPaymentsBaseURL.
 var shopAPIURL = "https://fortnite-api.com/v2/shop"
 
+// shopCacheDB: tercer respaldo de la tienda, en Postgres. El archivo en disco
+// no sobrevive a un deploy (cada contenedor de Railway empieza con el disco
+// vacío): si fortnite-api.com estaba caído justo después de un deploy, la
+// tienda quedaba en blanco. Se escribe solo cuando el catálogo cambia (ver
+// shopDBSavedHash), no en cada consulta: son ~1 MB por idioma.
+var (
+	shopCacheDB     *sql.DB
+	shopDBSavedHash = map[string][32]byte{} // protegido por shopCacheMu
+)
+
+// SetShopCacheDB activa el respaldo de la tienda en la base de datos.
+func SetShopCacheDB(database *sql.DB) { shopCacheDB = database }
+
+func saveShopDBCache(lang string, body []byte) {
+	if shopCacheDB == nil {
+		return
+	}
+	sum := sha256.Sum256(body)
+	shopCacheMu.RLock()
+	prev, saved := shopDBSavedHash[lang]
+	shopCacheMu.RUnlock()
+	if saved && prev == sum {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.SaveShopCache(ctx, shopCacheDB, lang, string(body)); err != nil {
+		slog.Warn("no se pudo guardar el respaldo de la tienda en la base de datos", "lang", lang, "error", err)
+		return
+	}
+	shopCacheMu.Lock()
+	shopDBSavedHash[lang] = sum
+	shopCacheMu.Unlock()
+}
+
+func loadShopDBCache(lang string) ([]byte, bool) {
+	if shopCacheDB == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	body, err := db.LoadShopCache(ctx, shopCacheDB, lang)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			slog.Warn("no se pudo leer el respaldo de la tienda de la base de datos", "lang", lang, "error", err)
+		}
+		return nil, false
+	}
+	if err := validateShopBody([]byte(body)); err != nil {
+		slog.Warn("respaldo de la tienda en la base de datos inválido, se ignora", "lang", lang, "error", err)
+		return nil, false
+	}
+	return []byte(body), true
+}
+
+// rememberStaleShop deja en memoria (ya vencida) una tienda recuperada del
+// disco o de la base de datos: así, mientras el proveedor siga caído, las
+// siguientes visitas la sirven desde memoria en vez de releerla cada vez. No
+// pisa una copia que ya esté en memoria.
+func rememberStaleShop(lang string, body []byte) {
+	shopCacheMu.Lock()
+	if _, ok := shopCache[lang]; !ok {
+		shopCache[lang] = &shopCacheEntry{body: body, fetchedAt: time.Time{}}
+	}
+	shopCacheMu.Unlock()
+}
+
 // staleShopBody devuelve la última tienda buena marcada _stale: la de memoria
 // (aunque esté vencida) o, si el proceso acaba de arrancar, la del archivo en
-// disco de la vez anterior.
+// disco de la vez anterior o, tras un deploy, la guardada en la base de datos.
 func staleShopBody(lang string, entry *shopCacheEntry, inMemory bool) ([]byte, bool) {
 	if inMemory {
 		if stale, ok := markStale(entry.body); ok {
@@ -353,7 +421,13 @@ func staleShopBody(lang string, entry *shopCacheEntry, inMemory bool) ([]byte, b
 		}
 	}
 	if diskBody, hit := loadShopDiskCache(lang); hit {
+		rememberStaleShop(lang, diskBody)
 		return markStale(diskBody)
+	}
+	if dbBody, hit := loadShopDBCache(lang); hit {
+		slog.Warn("tienda servida desde el respaldo en la base de datos (proveedor caído)", "lang", lang)
+		rememberStaleShop(lang, dbBody)
+		return markStale(dbBody)
 	}
 	return nil, false
 }
@@ -439,6 +513,7 @@ func fetchShopBody(ctx context.Context, lang string) ([]byte, error) {
 	delete(shopLastFailure, lang)
 	shopCacheMu.Unlock()
 	saveShopDiskCache(lang, body)
+	saveShopDBCache(lang, body)
 
 	return body, nil
 }

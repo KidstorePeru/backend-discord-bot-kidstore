@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"KidStoreStore/src/crypto"
@@ -473,6 +474,14 @@ func CreateTables(db *sql.DB) error {
 			created_at TIMESTAMP NOT NULL DEFAULT NOW()
 		)`,
 		`DELETE FROM oauth_login_codes WHERE expires_at < NOW()`,
+		// Última tienda buena de fortnite-api.com por idioma: respaldo para
+		// cuando el proveedor está caído justo después de un deploy (el
+		// disco temporal del contenedor empieza vacío en cada deploy).
+		`CREATE TABLE IF NOT EXISTS shop_cache (
+			lang VARCHAR(10) PRIMARY KEY,
+			body TEXT NOT NULL,
+			fetched_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
 		// El código de reclamo pasó de 3 a 6 bytes al azar (24→48 bits de
 		// entropía) — "KS-YYMMDD-" + 12 caracteres hex ya no entra en el
 		// VARCHAR(20) original.
@@ -1928,6 +1937,21 @@ func DecrementRemainingGifts(db *sql.DB, accountID uuid.UUID) error {
 func UpdateRemainingGifts(db *sql.DB, accountID uuid.UUID, remaining int) error {
 	_, err := db.Exec(`UPDATE game_accounts SET remaining_gifts=$1, updated_at=NOW() WHERE id=$2`, remaining, accountID)
 	return err
+}
+
+// SaveShopCache guarda la última tienda buena de un idioma (ver shop_cache).
+func SaveShopCache(ctx context.Context, db *sql.DB, lang, body string) error {
+	_, err := db.ExecContext(ctx, `INSERT INTO shop_cache (lang, body, fetched_at) VALUES ($1, $2, NOW())
+		ON CONFLICT (lang) DO UPDATE SET body = EXCLUDED.body, fetched_at = EXCLUDED.fetched_at`, lang, body)
+	return err
+}
+
+// LoadShopCache lee la última tienda buena guardada de un idioma
+// (sql.ErrNoRows si nunca se guardó).
+func LoadShopCache(ctx context.Context, db *sql.DB, lang string) (string, error) {
+	var body string
+	err := db.QueryRowContext(ctx, `SELECT body FROM shop_cache WHERE lang = $1`, lang).Scan(&body)
+	return body, err
 }
 
 // SyncRemainingGifts fija remaining_gifts solo si sigue valiendo expected
