@@ -403,7 +403,19 @@ func ClearBackupFailedAlert() {
 func AlertBackupsWorking(sizeBytes, rows, retentionDays int) {
 	sendAdminAlert(
 		"💾 Respaldos de la base de datos activados",
-		fmt.Sprintf("Se guardó la primera copia de seguridad (%d filas, %.1f MB, cifrada). Desde ahora se guarda una copia por día y se conservan las de los últimos %d días.", rows, float64(sizeBytes)/(1024*1024), retentionDays),
+		fmt.Sprintf("Se guardó la primera copia de seguridad (%d filas, %s, cifrada). Desde ahora se guarda una copia por día y se conservan las de los últimos %d días.", rows, humanSize(sizeBytes), retentionDays),
 		0x22C55E,
 	)
+}
+
+// humanSize: 850 B, 46 KB, 1.2 MB ("0.0 MB" no le dice nada a nadie).
+func humanSize(n int) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%d B", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%d KB", (n+512)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
+	}
 }
