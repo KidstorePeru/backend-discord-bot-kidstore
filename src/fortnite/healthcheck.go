@@ -94,12 +94,15 @@ func checkOneToken(database *sql.DB, account types.GameAccount) {
 		failureCountsMu.Unlock()
 		discordbot.ClearBotDeactivatedAlert(account.ID) // token OK → si se desactiva de nuevo, avisar otra vez
 
-		// Sincronizar el balance real de V-Bucks desde Epic — así el panel
-		// admin nunca queda desactualizado ni depende de que alguien lo
-		// edite a mano tras cargar pavos a la cuenta.
-		if realVbucks, err := GetRealVBucksBalance(database, account); err != nil {
+		// Sincronizar el balance real de V-Bucks y los regalos disponibles
+		// desde Epic — así el panel admin nunca queda desactualizado ni
+		// depende de que alguien lo edite a mano tras cargar pavos a la
+		// cuenta o enviar regalos desde otro lado con la misma cuenta.
+		if profile, err := GetBotProfile(database, account); err != nil {
 			slog.Warn("HealthCheck: no se pudo sincronizar V-Bucks", "bot", account.DisplayName, "error", err)
 		} else {
+			realVbucks := profile.VBucks
+			syncRemainingGifts(database, account, profile)
 			if realVbucks != account.VBucks {
 				if err := db.UpdateBotVbucks(database, account.ID, realVbucks); err != nil {
 					slog.Warn("HealthCheck: error guardando V-Bucks sincronizados", "bot", account.DisplayName, "error", err)
@@ -154,4 +157,24 @@ func checkOneToken(database *sql.DB, account types.GameAccount) {
 
 	// Pequeña pausa entre cuentas para no saturar la API de Epic
 	time.Sleep(2 * time.Second)
+}
+
+// syncRemainingGifts guarda los regalos disponibles que reporta Epic. Solo
+// escribe si el valor en la base sigue siendo el que se leyó al empezar la
+// verificación: si mientras tanto el worker de pedidos envió un regalo (y
+// descontó uno), no se pisa ese cambio; la próxima verificación vuelve a
+// compararlo con Epic.
+func syncRemainingGifts(database *sql.DB, account types.GameAccount, profile BotProfile) {
+	remaining, ok := profile.RemainingGifts()
+	if !ok || remaining == account.RemainingGifts {
+		return
+	}
+	updated, err := db.SyncRemainingGifts(database, account.ID, account.RemainingGifts, remaining)
+	if err != nil {
+		slog.Warn("HealthCheck: error guardando regalos disponibles sincronizados", "bot", account.DisplayName, "error", err)
+		return
+	}
+	if updated {
+		slog.Info("HealthCheck: regalos disponibles sincronizados", "bot", account.DisplayName, "anterior", account.RemainingGifts, "real", remaining)
+	}
 }

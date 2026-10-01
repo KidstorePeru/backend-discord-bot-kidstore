@@ -613,6 +613,10 @@ func IsWithinSchedule(db *sql.DB) (bool, string) {
 // valor que se le asigna a una cuenta recién vinculada (ver fortnite.go).
 const dailyGiftLimit = 5
 
+// DailyGiftLimit es dailyGiftLimit para otros paquetes (fortnite lo usa al
+// calcular los regalos disponibles a partir del historial de Epic).
+const DailyGiftLimit = dailyGiftLimit
+
 // ResetDailyGifts repone remaining_gifts=5 en todas las cuentas bot cuyo
 // último reseteo fue en un día anterior al de hoy (según la zona horaria
 // configurada en el horario de bots) — esto es lo que hace real la promesa
@@ -1924,6 +1928,18 @@ func DecrementRemainingGifts(db *sql.DB, accountID uuid.UUID) error {
 func UpdateRemainingGifts(db *sql.DB, accountID uuid.UUID, remaining int) error {
 	_, err := db.Exec(`UPDATE game_accounts SET remaining_gifts=$1, updated_at=NOW() WHERE id=$2`, remaining, accountID)
 	return err
+}
+
+// SyncRemainingGifts fija remaining_gifts solo si sigue valiendo expected
+// (el valor leído antes de consultar a Epic) — devuelve false si otro
+// proceso lo cambió entretanto, para no pisar un descuento recién hecho.
+func SyncRemainingGifts(db *sql.DB, accountID uuid.UUID, expected, remaining int) (bool, error) {
+	result, err := db.Exec(`UPDATE game_accounts SET remaining_gifts=$1, updated_at=NOW() WHERE id=$2 AND remaining_gifts=$3`, remaining, accountID, expected)
+	if err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	return n > 0, nil
 }
 
 func UpdateBotVbucks(db *sql.DB, accountID uuid.UUID, vbucks int) error {
