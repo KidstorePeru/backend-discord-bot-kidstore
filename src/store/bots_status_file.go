@@ -28,6 +28,10 @@ func HandlerBotsStatus(database *sql.DB) gin.HandlerFunc {
 			VBucks         int    `json:"vbucks"`
 			IsActive       bool   `json:"is_active"`
 			CreatedAt      string `json:"created_at"`
+			// Amigos actuales en Epic (nil = sin sincronizar todavía) y el
+			// límite: a una cuenta llena no se le puede mandar solicitud.
+			FriendsCount *int `json:"friends_count"`
+			FriendsLimit int  `json:"friends_limit"`
 		}
 
 		safe := make([]SafeAccount, 0, len(accounts))
@@ -39,6 +43,8 @@ func HandlerBotsStatus(database *sql.DB) gin.HandlerFunc {
 				VBucks:         a.VBucks,
 				IsActive:       a.IsActive,
 				CreatedAt:      a.CreatedAt.Format("2006-01-02"),
+				FriendsCount:   a.FriendsCount,
+				FriendsLimit:   db.BotFriendsLimit,
 			})
 		}
 

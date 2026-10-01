@@ -528,6 +528,11 @@ func CreateTables(db *sql.DB) error {
 			moderated_at TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status, created_at DESC)`,
+		// Cantidad de amigos de cada cuenta bot en Epic (límite 1000): la página
+		// de Bots la muestra para que los clientes no le manden solicitud a
+		// una cuenta llena. NULL = todavía no sincronizada.
+		`ALTER TABLE game_accounts ADD COLUMN IF NOT EXISTS friends_count INTEGER`,
+		`ALTER TABLE game_accounts ADD COLUMN IF NOT EXISTS friends_synced_at TIMESTAMP`,
 		// Preferencias de aviso del cliente (los de la web siempre se muestran).
 		`ALTER TABLE customers ADD COLUMN IF NOT EXISTS notify_email BOOLEAN NOT NULL DEFAULT true`,
 		`ALTER TABLE customers ADD COLUMN IF NOT EXISTS notify_discord BOOLEAN NOT NULL DEFAULT true`,
@@ -1908,7 +1913,7 @@ func GetAllGameAccounts(db *sql.DB, encKey string) ([]types.GameAccount, error) 
 	rows, err := db.Query(`
 		SELECT id, display_name, remaining_gifts, vbucks,
 		       access_token, access_token_exp_date, refresh_token, refresh_token_exp_date,
-		       is_active, created_at, updated_at
+		       is_active, created_at, updated_at, friends_count
 		FROM game_accounts ORDER BY created_at ASC`)
 	if err != nil { return nil, err }
 	defer rows.Close()
@@ -1919,7 +1924,7 @@ func GetActiveGameAccounts(db *sql.DB, encKey string) ([]types.GameAccount, erro
 	rows, err := db.Query(`
 		SELECT id, display_name, remaining_gifts, vbucks,
 		       access_token, access_token_exp_date, refresh_token, refresh_token_exp_date,
-		       is_active, created_at, updated_at
+		       is_active, created_at, updated_at, friends_count
 		FROM game_accounts WHERE is_active=true ORDER BY remaining_gifts DESC`)
 	if err != nil { return nil, err }
 	defer rows.Close()
@@ -1931,10 +1936,15 @@ func scanGameAccounts(rows *sql.Rows, encKey string) ([]types.GameAccount, error
 	for rows.Next() {
 		var a types.GameAccount
 		var encAccess, encRefresh string
+		var friends sql.NullInt64
 		if err := rows.Scan(&a.ID, &a.DisplayName, &a.RemainingGifts, &a.VBucks,
 			&encAccess, &a.AccessTokenExpDate, &encRefresh, &a.RefreshTokenExpDate,
-			&a.IsActive, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			&a.IsActive, &a.CreatedAt, &a.UpdatedAt, &friends); err != nil {
 			return nil, err
+		}
+		if friends.Valid {
+			n := int(friends.Int64)
+			a.FriendsCount = &n
 		}
 		// Antes, si el token de UNA sola cuenta no se podía descifrar (fila
 		// corrupta, o sobreviviente de antes de que ENCRYPTION_KEY quedara
@@ -2001,6 +2011,23 @@ func LoadShopCache(ctx context.Context, db *sql.DB, lang string) (string, error)
 	var body string
 	err := db.QueryRowContext(ctx, `SELECT body FROM shop_cache WHERE lang = $1`, lang).Scan(&body)
 	return body, err
+}
+
+// BotFriendsLimit — máximo de amigos que Epic permite por cuenta.
+const BotFriendsLimit = 1000
+
+// SetBotFriendsCount guarda la cantidad real de amigos de una cuenta bot.
+func SetBotFriendsCount(db *sql.DB, accountID uuid.UUID, count int) error {
+	_, err := db.Exec(`UPDATE game_accounts SET friends_count=$2, friends_synced_at=NOW() WHERE id=$1`, accountID, count)
+	return err
+}
+
+// AddBotFriendsCount suma amigos recién aceptados (solo si ya se conocía la
+// cantidad; la próxima sincronización trae el número exacto).
+func AddBotFriendsCount(db *sql.DB, accountID uuid.UUID, delta int) error {
+	_, err := db.Exec(`UPDATE game_accounts SET friends_count = LEAST(friends_count + $2, $3)
+		WHERE id=$1 AND friends_count IS NOT NULL`, accountID, delta, BotFriendsLimit)
+	return err
 }
 
 // SyncRemainingGifts fija remaining_gifts solo si sigue valiendo expected

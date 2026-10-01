@@ -300,6 +300,11 @@ func HandlerFinishConnectBotAccount(database *sql.DB) gin.HandlerFunc {
 		// alerta anterior, permitir que vuelva a avisar si se desactiva de nuevo
 		// más adelante, en vez de quedar silenciada para siempre.
 		discordbot.ClearBotDeactivatedAlert(accountID)
+		// La página de Bots muestra cuántos amigos tiene: se cuenta enseguida.
+		go func(acc types.GameAccount) {
+			defer safe.Recover("syncFriendsCount.link")
+			syncFriendsCount(database, acc)
+		}(account)
 
 		// 3. Obtener device secrets para re-autenticación permanente (opcional pero importante)
 		reqSecrets, _ := http.NewRequest("POST",
@@ -720,6 +725,18 @@ func ListFriends(database *sql.DB, account types.GameAccount) ([]types.EpicFrien
 	return friends, nil
 }
 
+// syncFriendsCount guarda cuántos amigos tiene la cuenta bot en Epic.
+func syncFriendsCount(database *sql.DB, account types.GameAccount) {
+	friends, err := ListFriends(database, account)
+	if err != nil {
+		slog.Warn("Bots: no se pudo contar los amigos", "bot", account.DisplayName, "error", err)
+		return
+	}
+	if err := db.SetBotFriendsCount(database, account.ID, len(friends)); err == nil {
+		slog.Info("Bots: amigos sincronizados", "bot", account.DisplayName, "amigos", len(friends))
+	}
+}
+
 // ResolveDisplayNames resuelve en un solo request los displayName de varios
 // accountId (usa la sesión de una cuenta bot cualquiera, no importa cuál).
 func ResolveDisplayNames(database *sql.DB, account types.GameAccount, accountIDs []string) (map[string]string, error) {
@@ -964,8 +981,20 @@ func acceptPendingFriendRequests(database *sql.DB) {
 				}
 				acceptResp, _, err := executeWithRefresh(database, account, acceptReq)
 				if err == nil {
+					body, _ := io.ReadAll(io.LimitReader(acceptResp.Body, 4096))
 					acceptResp.Body.Close()
-					slog.Info("Bots: solicitud aceptada", "friendAccountId", friend.AccountId, "bot", account.DisplayName)
+					switch {
+					case acceptResp.StatusCode >= 200 && acceptResp.StatusCode < 300:
+						slog.Info("Bots: solicitud aceptada", "friendAccountId", friend.AccountId, "bot", account.DisplayName)
+						db.AddBotFriendsCount(database, account.ID, 1)
+					default:
+						// Por ejemplo, el límite de 1000 amigos (del bot o del
+						// cliente: la respuesta no siempre dice de cuál). No se
+						// adivina: la sincronización de cada 15 minutos trae el
+						// número real de amigos del bot.
+						slog.Warn("Bots: Epic no aceptó la solicitud", "bot", account.DisplayName,
+							"status", acceptResp.StatusCode, "respuesta", string(body))
+					}
 				}
 			}
 		}()
@@ -976,6 +1005,10 @@ func acceptPendingFriendRequests(database *sql.DB) {
 
 func StartFriendship48hChecker(database *sql.DB, intervalSeconds int) {
 	go func() {
+		// Primera vuelta al poco de arrancar (también actualiza la cantidad
+		// de amigos de cada bot); después, cada intervalSeconds.
+		time.Sleep(90 * time.Second)
+		safe.Run("StartFriendship48hChecker", func() { checkFriendship48h(database) })
 		ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
@@ -1012,7 +1045,13 @@ func checkFriendship48h(database *sql.DB) {
 			defer safe.Recover("checkFriendship48h." + account.DisplayName)
 
 			friends, err := ListFriends(database, account)
-			if err != nil || len(friends) == 0 {
+			if err != nil {
+				return
+			}
+			// Con la misma lista se actualiza la cantidad de amigos que
+			// muestra la página de Bots (sin pedirle nada extra a Epic).
+			db.SetBotFriendsCount(database, account.ID, len(friends))
+			if len(friends) == 0 {
 				return
 			}
 

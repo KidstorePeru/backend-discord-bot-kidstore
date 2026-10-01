@@ -194,6 +194,9 @@ type GameAccount struct {
 	IsActive            bool      `json:"is_active"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+	// FriendsCount: amigos actuales en Epic (límite 1000). nil = todavía no
+	// se sabe (cuenta recién vinculada o sin sincronizar).
+	FriendsCount *int `json:"friends_count"`
 }
 
 type GameAccountSecrets struct {
