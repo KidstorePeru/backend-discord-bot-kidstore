@@ -5,6 +5,7 @@ import (
 	"KidStoreStore/src/types"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -198,7 +199,39 @@ func handleBotsCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			{Name: "🗓️ Horario de atención", Value: fmt.Sprintf("%02d:00 — %02d:00 (%s)", schedule.StartHour, schedule.EndHour, schedule.Timezone), Inline: false},
 		},
 	}
+	embed.Fields = append(embed.Fields, botFriendsFields(accounts)...)
 	respondEmbedEphemeral(s, i, embed)
+}
+
+// botFriendsFields: qué cuentas activas aceptan solicitudes de amistad (Epic
+// permite 1000 amigos por cuenta) y cuáles están llenas, igual que la página
+// de Bots de la web.
+func botFriendsFields(accounts []types.GameAccount) []*discordgo.MessageEmbedField {
+	var open, full []string
+	for _, a := range accounts {
+		if !a.IsActive || a.FriendsCount == nil {
+			continue
+		}
+		if *a.FriendsCount >= db.BotFriendsLimit {
+			full = append(full, a.DisplayName)
+		} else {
+			open = append(open, fmt.Sprintf("`%s` (%d/%d)", a.DisplayName, *a.FriendsCount, db.BotFriendsLimit))
+		}
+	}
+	var fields []*discordgo.MessageEmbedField
+	if len(open) > 0 {
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:  "👥 Agrégalas como amigas",
+			Value: strings.Join(open, "\n") + fmt.Sprintf("\n[Ver todas en la web](%s/bots)", siteURL),
+		})
+	}
+	if len(full) > 0 {
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:  "⛔ Llenas (1000 amigos, no aceptan más)",
+			Value: strings.Join(full, ", "),
+		})
+	}
+	return fields
 }
 
 // "failed" y "refunded" se muestran distinto a propósito: un pedido queda

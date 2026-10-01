@@ -145,10 +145,6 @@ type testCustomerOpts struct {
 	isAdmin   bool
 }
 
-func withKCBalance(n int) func(*testCustomerOpts) {
-	return func(o *testCustomerOpts) { o.kcBalance = n }
-}
-
 // ==================== PAGOS DUPLICADOS / FALLOS DE ACREDITACIÓN (puntos 5, 10) ====================
 
 func TestCreditPaymentOnce_NuncaAcreditaDosVeces(t *testing.T) {
