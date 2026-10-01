@@ -1,6 +1,7 @@
 package store
 
 import (
+	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/types"
 	"bytes"
 	"encoding/json"
@@ -37,11 +38,23 @@ func hasCRLF(s string) bool {
 }
 
 // sendEmail sends an HTML email using Resend API (production) or SMTP (local dev).
+// Si el proveedor rechaza el envío (dominio sin verificar, clave inválida, sin
+// proveedor configurado…), además del log se avisa al admin por Discord: antes
+// el error solo quedaba en los logs y nadie se enteraba de que NINGÚN correo
+// (verificación, pagos, entregas, reclamos) estaba llegando.
 func sendEmail(cfg types.EnvConfig, to, subject, htmlBody string) error {
 	if hasCRLF(to) || hasCRLF(subject) {
 		slog.Error("Email: to/subject con salto de línea, bloqueado (posible inyección de cabeceras)", "to", to, "subject", subject)
 		return fmt.Errorf("destinatario o asunto inválido")
 	}
+	err := deliverEmail(cfg, to, subject, htmlBody)
+	if err != nil {
+		onEmailFailure(emailErrorSummary(err), cfg.SMTPFrom)
+	}
+	return err
+}
+
+func deliverEmail(cfg types.EnvConfig, to, subject, htmlBody string) error {
 	if cfg.ResendAPIKey != "" {
 		return sendViaResend(cfg.ResendAPIKey, cfg.SMTPFrom, to, subject, htmlBody)
 	}
@@ -52,6 +65,33 @@ func sendEmail(cfg types.EnvConfig, to, subject, htmlBody string) error {
 	return fmt.Errorf("no email provider configured")
 }
 
+// onEmailFailure avisa al admin (variable para las pruebas). discordbot limita
+// el aviso a uno por hora para no inundar los mensajes si fallan todos.
+var onEmailFailure = func(summary, from string) {
+	discordbot.AlertEmailFailing(summary, from)
+}
+
+// emailErrorSummary extrae el motivo legible del error del proveedor (el
+// "message" del JSON de Resend), sin datos del destinatario, recortado.
+func emailErrorSummary(err error) string {
+	msg := err.Error()
+	if i := strings.Index(msg, "{"); i >= 0 {
+		var body struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(msg[i:]), &body) == nil && body.Message != "" {
+			msg = strings.TrimSpace(msg[:i]) + " " + body.Message
+		}
+	}
+	if len(msg) > 300 {
+		msg = msg[:300] + "…"
+	}
+	return msg
+}
+
+// resendAPIURL: endpoint de Resend (variable para las pruebas).
+var resendAPIURL = "https://api.resend.com/emails"
+
 func sendViaResend(apiKey, from, to, subject, htmlBody string) error {
 	payload := map[string]interface{}{
 		"from":    fmt.Sprintf("KidStorePeru <%s>", from),
@@ -61,7 +101,7 @@ func sendViaResend(apiKey, from, to, subject, htmlBody string) error {
 	}
 	body, _ := json.Marshal(payload)
 
-	req, _ := http.NewRequest("POST", "https://api.resend.com/emails", bytes.NewBuffer(body))
+	req, _ := http.NewRequest("POST", resendAPIURL, bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 

@@ -134,6 +134,74 @@ const maxManualKCAdjustment = 125000
 
 // HandlerUpdateCustomer — PUT /admin/customers/:id
 // Permite editar epic_username, email, kc_balance e is_admin de un cliente.
+// ── Verificación manual de cuentas ──
+// Para cuando el correo de verificación no le llega al cliente (por ejemplo,
+// el proveedor de correo está rechazando los envíos). El admin solo debe usarlo
+// tras confirmar con el cliente que el correo es suyo.
+
+// HandlerGetPendingRegistrations lista los registros sin verificar (24 h).
+func HandlerGetPendingRegistrations(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		list, err := db.ListPendingRegistrations(database)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo registros pendientes"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "pending": list})
+	}
+}
+
+// HandlerActivatePendingRegistration crea la cuenta de un registro pendiente,
+// igual que si el cliente hubiera abierto el enlace del correo.
+func HandlerActivatePendingRegistration(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		pending, err := db.GetPendingRegistrationByID(database, id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "el registro no existe o ya expiró (24 h): pide al cliente que se registre de nuevo"})
+			return
+		}
+		customer, err := store.ActivatePendingRegistration(database, pending)
+		if err != nil {
+			if err == store.ErrAccountAlreadyExists {
+				c.JSON(http.StatusConflict, gin.H{"success": false, "error": "ya existe una cuenta con ese correo o usuario de Epic"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error creando la cuenta"})
+			return
+		}
+		actor := adminActor(c, database)
+		db.AddAuditLog(database, &customer.ID, "REGISTER", "cuenta creada por activación manual de un admin: "+customer.EpicUsername, c.ClientIP())
+		db.AddAuditLog(database, &customer.ID, "EMAIL_VERIFIED", "verificada manualmente por "+actor, c.ClientIP())
+		c.JSON(http.StatusOK, gin.H{"success": true, "customer": customer.Public()})
+	}
+}
+
+// HandlerVerifyCustomer marca como verificada una cuenta existente que quedó sin verificar.
+func HandlerVerifyCustomer(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "id inválido"})
+			return
+		}
+		if _, err := db.GetCustomerByID(database, id); err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "cliente no encontrado"})
+			return
+		}
+		if err := db.VerifyCustomerEmail(database, id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error verificando la cuenta"})
+			return
+		}
+		db.AddAuditLog(database, &id, "EMAIL_VERIFIED", "verificada manualmente por "+adminActor(c, database), c.ClientIP())
+		c.JSON(http.StatusOK, gin.H{"success": true})
+	}
+}
+
 func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, err := uuid.Parse(c.Param("id"))

@@ -780,6 +780,50 @@ func UpdatePendingRegistrationToken(db *sql.DB, epicUsername, email, passwordHas
 	return err
 }
 
+// PendingRegistrationSummary: lo que el panel admin muestra de un registro
+// pendiente (nunca la contraseña ni el token de verificación).
+type PendingRegistrationSummary struct {
+	ID           uuid.UUID `json:"id"`
+	EpicUsername string    `json:"epic_username"`
+	Email        string    `json:"email"`
+	Lang         string    `json:"lang"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// ListPendingRegistrations: registros todavía sin verificar y sin expirar (24 h).
+func ListPendingRegistrations(db *sql.DB) ([]PendingRegistrationSummary, error) {
+	rows, err := db.Query(`
+		SELECT id, epic_username, email, lang, expires_at, created_at
+		FROM pending_registrations
+		WHERE expires_at > NOW()
+		ORDER BY created_at DESC
+		LIMIT 200`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PendingRegistrationSummary{}
+	for rows.Next() {
+		var p PendingRegistrationSummary
+		if err := rows.Scan(&p.ID, &p.EpicUsername, &p.Email, &p.Lang, &p.ExpiresAt, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func GetPendingRegistrationByID(db *sql.DB, id uuid.UUID) (PendingRegistration, error) {
+	var p PendingRegistration
+	err := db.QueryRow(`
+		SELECT id, epic_username, email, password_hash, verification_token, lang, expires_at, created_at
+		FROM pending_registrations
+		WHERE id=$1 AND expires_at > NOW()`, id).
+		Scan(&p.ID, &p.EpicUsername, &p.Email, &p.PasswordHash, &p.VerificationToken, &p.Lang, &p.ExpiresAt, &p.CreatedAt)
+	return p, err
+}
+
 func DeletePendingRegistration(db *sql.DB, token string) {
 	db.Exec(`DELETE FROM pending_registrations WHERE verification_token=$1`, token)
 }

@@ -207,6 +207,21 @@ func AlertDeliveryNotPersisted(orderID, epicUsername, itemName string) {
 	)
 }
 
+// AlertEmailFailing avisa que el proveedor de correo está rechazando los envíos
+// (dominio sin verificar en Resend, clave inválida, sin proveedor configurado…).
+// Mientras dure, ningún cliente recibe correos de verificación, pagos, entregas
+// ni reclamos. Como mucho un aviso por hora.
+func AlertEmailFailing(reason, from string) {
+	if !shouldAlert("email_failing_" + time.Now().UTC().Format("2006010215")) {
+		return
+	}
+	sendAdminAlert(
+		"📧 Los correos no se están enviando",
+		fmt.Sprintf("El proveedor de correo rechazó un envío desde **%s**:\n> %s\n\nMientras no se solucione, los clientes NO reciben correos de verificación de cuenta, recuperación de contraseña, pagos, entregas ni reclamos. Revisa el dominio y la clave en Resend (RESEND_API_KEY) o la configuración SMTP. Si alguien no puede registrarse, puedes activar su cuenta a mano desde el panel admin → Clientes.", from, reason),
+		colorAlert,
+	)
+}
+
 // complaintNoun: "un reclamo" / "una queja" (y en mayúscula, "El reclamo" / "La queja").
 func complaintNoun(kind string, definite bool) string {
 	switch {
