@@ -528,6 +528,33 @@ func CreateTables(db *sql.DB) error {
 			moderated_at TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status, created_at DESC)`,
+		// Pagos manuales con comprobante subido desde la web (Yape, Plin, bancos,
+		// Bizum). El monto y los KC los calcula el servidor; la imagen se guarda
+		// cifrada en el almacenamiento externo y se borra al mes (proof_key NULL).
+		`CREATE TABLE IF NOT EXISTS manual_payment_requests (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+			package_id VARCHAR(30) NOT NULL,
+			package_name VARCHAR(100) NOT NULL,
+			kc_amount INTEGER NOT NULL CHECK (kc_amount > 0),
+			amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+			currency VARCHAR(3) NOT NULL,
+			amount_pen NUMERIC(12,2) NOT NULL,
+			method VARCHAR(20) NOT NULL,
+			operation_number VARCHAR(40) NOT NULL DEFAULT '',
+			proof_key VARCHAR(200),
+			proof_content_type VARCHAR(40) NOT NULL DEFAULT '',
+			lang VARCHAR(5) NOT NULL DEFAULT 'es',
+			status VARCHAR(10) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+			reject_reason TEXT,
+			reviewed_by VARCHAR(100),
+			reviewed_at TIMESTAMP,
+			recharge_id UUID,
+			proof_deleted_at TIMESTAMP,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_manual_payments_status ON manual_payment_requests(status, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_manual_payments_customer ON manual_payment_requests(customer_id, created_at DESC)`,
 		// Cantidad de amigos de cada cuenta bot en Epic (límite 1000): la página
 		// de Bots la muestra para que los clientes no le manden solicitud a
 		// una cuenta llena. NULL = todavía no sincronizada.

@@ -109,6 +109,10 @@ func interactionUser(i *discordgo.InteractionCreate) *discordgo.User {
 }
 
 func onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Botones y formulario de los avisos de comprobantes de pago manual.
+	if handleManualPaymentInteraction(s, i) {
+		return
+	}
 	if i.Type != discordgo.InteractionApplicationCommand {
 		return
 	}

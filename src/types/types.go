@@ -94,6 +94,10 @@ type EnvConfig struct {
 	// Pedidos entregados FUERA de la web (WhatsApp, Discord, desde 2022): la
 	// portada muestra esta base + los entregados por la web.
 	HistoricOrdersDelivered int `envconfig:"HISTORIC_ORDERS_DELIVERED" default:"10000"`
+
+	// Dirección pública de esta API (para los enlaces de "ver comprobante"
+	// que se mandan al admin por Discord).
+	PublicAPIURL string `envconfig:"PUBLIC_API_URL" default:"https://api.kidstoreperu.net"`
 	NOWPaymentsAPIKey     string `envconfig:"NOWPAYMENTS_API_KEY"`
 	// NOWPaymentsIPNSecret firma los callbacks IPN de NOWPayments (header
 	// x-nowpayments-sig) — se genera en el dashboard de NOWPayments, en

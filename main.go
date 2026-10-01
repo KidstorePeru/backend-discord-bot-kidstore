@@ -197,8 +197,15 @@ func main() {
 	// entero antes de que cualquier validación pudiera rechazarlo,
 	// suficiente para agotar memoria/CPU con pocas peticiones grandes.
 	const maxRequestBodyBytes = 4 << 20 // 4 MB
+	// Única excepción: la subida de comprobantes de pago manual (imagen o PDF
+	// de hasta 5 MB, ver store/manual_payments.go).
+	const maxProofUploadBytes = 8 << 20
 	router.Use(func(c *gin.Context) {
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
+		limit := int64(maxRequestBodyBytes)
+		if c.Request.Method == http.MethodPost && c.FullPath() == "/store/manual-payments" {
+			limit = maxProofUploadBytes
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 		c.Next()
 	})
 
@@ -304,6 +311,8 @@ func main() {
 	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
 	router.GET("/store/stats",           store.HandlerStoreStats(database, cfg.HistoricOrdersDelivered))
 	router.GET("/store/reviews",         store.HandlerPublicReviews(database))
+	// Enlace firmado (24 h) para ver un comprobante desde el aviso de Discord.
+	router.GET("/store/manual-payments/:id/proof", store.HandlerViewProofSigned(database))
 
 	// Libro de Reclamaciones Virtual — público, no requiere cuenta (requisito
 	// legal en Perú: cualquier consumidor debe poder presentar un reclamo).
@@ -358,6 +367,9 @@ func main() {
 		// Reseñas verificadas (solo de pedidos entregados).
 		customer.GET("/reviews/pending-orders", store.HandlerReviewableOrders(database))
 		customer.POST("/reviews",               middleware.RateLimitMiddleware(orderLimiter), store.HandlerCreateReview(database))
+		// Pagos manuales: el cliente sube su comprobante y lo revisa el admin.
+		customer.POST("/manual-payments",       middleware.RateLimitMiddleware(orderLimiter), store.HandlerCreateManualPayment(database))
+		customer.GET("/manual-payments",        store.HandlerListMyManualPayments(database))
 	}
 
 	// ── Admin (API Key + rate limit) ──
@@ -396,6 +408,10 @@ func main() {
 		adminGroup.PUT("/complaints/:id/close",   admin.HandlerCloseComplaint(database))
 		adminGroup.GET("/reviews",          admin.HandlerGetReviews(database))
 		adminGroup.PUT("/reviews/:id",      admin.HandlerModerateReview(database))
+		adminGroup.GET("/manual-payments",             admin.HandlerGetManualPayments(database))
+		adminGroup.GET("/manual-payments/:id/proof",   admin.HandlerGetManualPaymentProof(database))
+		adminGroup.PUT("/manual-payments/:id/approve", admin.HandlerApproveManualPayment(database))
+		adminGroup.PUT("/manual-payments/:id/reject",  admin.HandlerRejectManualPayment(database))
 	}
 
 	// ── Payment expiration goroutine (expire pending payments after 30 min) ──
@@ -497,6 +513,7 @@ func main() {
 	discordbot.Start(cfg, database)
 
 	startDatabaseBackups(cfg, database)
+	startManualPayments(cfg, database)
 
 	port := cfg.Port
 	if port == "" { port = "8081" }

@@ -21,6 +21,7 @@ const (
 	NotifOrderSent    = "order_sent"    // pedido entregado
 	NotifOrderFailed  = "order_failed"  // pedido no entregado (refunded indica si ya se devolvieron los KC)
 	NotifKCCredited   = "kc_credited"   // recarga de KC acreditada
+	NotifManualRejected = "manual_payment_rejected" // comprobante de pago manual rechazado (con motivo)
 )
 
 // NotificationRetention — los avisos más viejos se borran solos.

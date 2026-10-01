@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -35,13 +36,15 @@ type S3Config struct {
 	Region          string
 }
 
-type s3Store struct {
+// S3Store — cliente del almacenamiento. Además de lo que usan los respaldos
+// (ObjectStore) sabe leer un archivo (Get), para los comprobantes de pago.
+type S3Store struct {
 	client *minio.Client
 	bucket string
 }
 
 // NewS3Store crea el cliente. Siempre usa HTTPS.
-func NewS3Store(cfg S3Config) (ObjectStore, error) {
+func NewS3Store(cfg S3Config) (*S3Store, error) {
 	endpoint := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(cfg.Endpoint, "https://"), "http://"), "/")
 	region := cfg.Region
 	if region == "" {
@@ -55,16 +58,16 @@ func NewS3Store(cfg S3Config) (ObjectStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configuración del almacenamiento inválida: %w", err)
 	}
-	return &s3Store{client: client, bucket: cfg.Bucket}, nil
+	return &S3Store{client: client, bucket: cfg.Bucket}, nil
 }
 
-func (s *s3Store) Put(ctx context.Context, key string, data []byte) error {
+func (s *S3Store) Put(ctx context.Context, key string, data []byte) error {
 	_, err := s.client.PutObject(ctx, s.bucket, key, bytes.NewReader(data), int64(len(data)),
 		minio.PutObjectOptions{ContentType: "application/octet-stream"})
 	return err
 }
 
-func (s *s3Store) List(ctx context.Context, prefix string) ([]Object, error) {
+func (s *S3Store) List(ctx context.Context, prefix string) ([]Object, error) {
 	var out []Object
 	for obj := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
 		if obj.Err != nil {
@@ -75,6 +78,20 @@ func (s *s3Store) List(ctx context.Context, prefix string) ([]Object, error) {
 	return out, nil
 }
 
-func (s *s3Store) Delete(ctx context.Context, key string) error {
+// Get lee un archivo completo (con un tope de 20 MB).
+func (s *S3Store) Get(ctx context.Context, key string) ([]byte, error) {
+	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Close()
+	data, err := io.ReadAll(io.LimitReader(obj, 20<<20))
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func (s *S3Store) Delete(ctx context.Context, key string) error {
 	return s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
 }

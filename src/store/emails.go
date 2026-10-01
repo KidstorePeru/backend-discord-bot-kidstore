@@ -1,6 +1,7 @@
 package store
 
 import (
+	"KidStoreStore/src/db"
 	"KidStoreStore/src/discordbot"
 	"KidStoreStore/src/types"
 	"bytes"
@@ -901,5 +902,42 @@ func sendTwoFactorEnabledEmail(cfg types.EnvConfig, toEmail, username, lang stri
 		slog.Error("Email: 2FA enabled send error", "to", toEmail, "error", err)
 	} else {
 		slog.Info("Email: 2FA enabled notification sent", "to", toEmail)
+	}
+}
+
+// ==================== COMPROBANTE DE PAGO MANUAL RECHAZADO ====================
+
+// SendManualPaymentRejectedEmail le explica al cliente por qué no se acreditó
+// su pago manual y cómo volver a enviar el comprobante.
+func SendManualPaymentRejectedEmail(cfg types.EnvConfig, toEmail string, m db.ManualPaymentRequest, reason string) {
+	if !hasEmailProvider(cfg) {
+		return
+	}
+	es := m.Lang != "en"
+	reason = esc(reason)
+	subject, eyebrow, intro, btnText := "", "", "", ""
+	amountLabel, methodLbl, reasonLabel, kcLabel := "", "", "", ""
+	if es {
+		subject = "KidStorePeru — No pudimos acreditar tu pago"
+		eyebrow = "Comprobante rechazado"
+		intro = "Revisamos el comprobante que enviaste y no pudimos acreditar tus KC. Si ya pagaste, vuelve a subir un comprobante claro desde la página de Recargar o escríbenos y lo revisamos contigo."
+		btnText = "Volver a subir comprobante"
+		amountLabel, methodLbl, reasonLabel, kcLabel = "Monto", "Método", "Motivo", "KC"
+	} else {
+		subject = "KidStorePeru — We couldn't credit your payment"
+		eyebrow = "Payment proof rejected"
+		intro = "We reviewed the payment proof you sent and couldn't credit your KC. If you already paid, upload a clear proof again from the Recharge page or message us and we'll review it with you."
+		btnText = "Upload proof again"
+		amountLabel, methodLbl, reasonLabel, kcLabel = "Amount", "Method", "Reason", "KC"
+	}
+	rows := emailRow(reasonLabel, reason)
+	rows += emailRow(amountLabel, esc(formatMoney(m.Amount, m.Currency)))
+	rows += emailRow(methodLbl, esc(methodLabel(m.Method)))
+	rows += emailRow(kcLabel, emailKCIcon(14)+fmt.Sprintf("%d KC", m.KCAmount))
+	body := emailEyebrow(eyebrow) + emailCopy(intro) + emailRows(rows) +
+		emailButton(btnText, "https://www.kidstoreperu.net/recharge")
+	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
+	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
+		slog.Error("Email: manual payment rejected send error", "to", toEmail, "error", err)
 	}
 }

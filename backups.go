@@ -7,6 +7,7 @@ import (
 
 	"KidStoreStore/src/backup"
 	"KidStoreStore/src/discordbot"
+	"KidStoreStore/src/store"
 	"KidStoreStore/src/types"
 )
 
@@ -44,6 +45,44 @@ func backupSettings(cfg types.EnvConfig) (enabled bool, problem string) {
 	return true, ""
 }
 
+// objectStoreFromConfig crea el cliente del almacenamiento (Cloudflare R2) si
+// sus variables están configuradas; si no, devuelve nil.
+func objectStoreFromConfig(cfg types.EnvConfig) *backup.S3Store {
+	if strings.TrimSpace(cfg.BackupS3Endpoint) == "" || strings.TrimSpace(cfg.BackupS3Bucket) == "" ||
+		strings.TrimSpace(cfg.BackupS3AccessKeyID) == "" || strings.TrimSpace(cfg.BackupS3SecretAccessKey) == "" {
+		return nil
+	}
+	s3, err := backup.NewS3Store(backup.S3Config{
+		Endpoint:        cfg.BackupS3Endpoint,
+		Bucket:          cfg.BackupS3Bucket,
+		AccessKeyID:     cfg.BackupS3AccessKeyID,
+		SecretAccessKey: cfg.BackupS3SecretAccessKey,
+		Region:          cfg.BackupS3Region,
+	})
+	if err != nil {
+		slog.Error("Almacenamiento: configuración inválida", "error", err)
+		return nil
+	}
+	return s3
+}
+
+// startManualPayments activa la subida de comprobantes de pago manual: se
+// guardan cifrados (ENCRYPTION_KEY) en la carpeta comprobantes/ del mismo
+// almacenamiento de los respaldos y se borran a los 30 días.
+func startManualPayments(cfg types.EnvConfig, database *sql.DB) {
+	approve, reject := store.ManualPaymentDiscordActions(database)
+	discordbot.SetManualPaymentActions(approve, reject)
+	s3 := objectStoreFromConfig(cfg)
+	if s3 == nil || cfg.EncryptionKey == "" {
+		store.SetManualPaymentsConfig(nil, "", "", cfg.PublicAPIURL)
+		slog.Warn("Comprobantes de pago manual: subida desactivada (falta el almacenamiento BACKUP_S3_* o ENCRYPTION_KEY)")
+		return
+	}
+	store.SetManualPaymentsConfig(s3, cfg.EncryptionKey, cfg.SecretKey, cfg.PublicAPIURL)
+	store.StartProofRetention(database)
+	slog.Info("Comprobantes de pago manual: subida activada (cifrados, se borran a los 30 días)")
+}
+
 func startDatabaseBackups(cfg types.EnvConfig, database *sql.DB) {
 	enabled, problem := backupSettings(cfg)
 	if problem != "" {
@@ -55,16 +94,10 @@ func startDatabaseBackups(cfg types.EnvConfig, database *sql.DB) {
 		slog.Warn("Respaldo diario desactivado: no hay variables BACKUP_* configuradas")
 		return
 	}
-	store, err := backup.NewS3Store(backup.S3Config{
-		Endpoint:        cfg.BackupS3Endpoint,
-		Bucket:          cfg.BackupS3Bucket,
-		AccessKeyID:     cfg.BackupS3AccessKeyID,
-		SecretAccessKey: cfg.BackupS3SecretAccessKey,
-		Region:          cfg.BackupS3Region,
-	})
-	if err != nil {
-		slog.Error("Respaldo diario NO activado", "error", err)
-		discordbot.AlertBackupFailed(err.Error())
+	s3 := objectStoreFromConfig(cfg)
+	if s3 == nil {
+		slog.Error("Respaldo diario NO activado: configuración del almacenamiento inválida")
+		discordbot.AlertBackupFailed("configuración del almacenamiento inválida (BACKUP_S3_*)")
 		return
 	}
 	backup.OnFailure = discordbot.AlertBackupFailed
@@ -74,7 +107,7 @@ func startDatabaseBackups(cfg types.EnvConfig, database *sql.DB) {
 	}
 	backup.Start(&backup.Job{
 		DB:            database,
-		Store:         store,
+		Store:         s3,
 		Passphrase:    cfg.BackupEncryptionKey,
 		RetentionDays: cfg.BackupRetentionDays,
 	})
