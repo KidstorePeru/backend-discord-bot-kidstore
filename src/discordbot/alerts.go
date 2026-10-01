@@ -419,3 +419,25 @@ func humanSize(n int) string {
 		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
 	}
 }
+
+// AlertNewReview avisa al admin que hay una reseña nueva para revisar en el
+// panel (no se publica hasta que la apruebe).
+func AlertNewReview(rating int, itemName, displayName, comment string) {
+	stars := strings.Repeat("★", rating) + strings.Repeat("☆", 5-rating)
+	text := comment
+	if r := []rune(text); len(r) > 300 {
+		text = string(r[:300]) + "…"
+	}
+	if text == "" {
+		text = "(sin comentario)"
+	}
+	color := colorSuccess
+	if rating <= 3 {
+		color = colorWarnSoft
+	}
+	sendAdminAlert(
+		"⭐ Nueva reseña para revisar",
+		fmt.Sprintf("%s — **%s** sobre *%s*:\n> %s\n\nApruébala o recházala en el panel admin → Reseñas. Responder también las negativas genera confianza.", stars, escapeMarkdown(displayName), escapeMarkdown(itemName), escapeMarkdown(text)),
+		color,
+	)
+}

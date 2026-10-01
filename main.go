@@ -302,6 +302,8 @@ func main() {
 	router.GET("/store/shop/bestsellers", store.HandlerGetBestSellers(database))
 	router.GET("/store/bots-status",     store.HandlerBotsStatus(database))
 	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
+	router.GET("/store/stats",           store.HandlerStoreStats(database, cfg.HistoricOrdersDelivered))
+	router.GET("/store/reviews",         store.HandlerPublicReviews(database))
 
 	// Libro de Reclamaciones Virtual — público, no requiere cuenta (requisito
 	// legal en Perú: cualquier consumidor debe poder presentar un reclamo).
@@ -353,6 +355,9 @@ func main() {
 		customer.POST("/wishlist",              middleware.RateLimitMiddleware(searchLimiter), store.HandlerAddWishlistItem(database))
 		customer.DELETE("/wishlist/:itemId",    store.HandlerRemoveWishlistItem(database))
 		customer.GET("/cosmetics/search",       middleware.RateLimitMiddleware(searchLimiter), store.HandlerSearchCosmetics())
+		// Reseñas verificadas (solo de pedidos entregados).
+		customer.GET("/reviews/pending-orders", store.HandlerReviewableOrders(database))
+		customer.POST("/reviews",               middleware.RateLimitMiddleware(orderLimiter), store.HandlerCreateReview(database))
 	}
 
 	// ── Admin (API Key + rate limit) ──
@@ -389,6 +394,8 @@ func main() {
 		adminGroup.GET("/complaints",       admin.HandlerGetAllComplaints(database))
 		adminGroup.PUT("/complaints/:id/respond", admin.HandlerRespondComplaint(database, cfg))
 		adminGroup.PUT("/complaints/:id/close",   admin.HandlerCloseComplaint(database))
+		adminGroup.GET("/reviews",          admin.HandlerGetReviews(database))
+		adminGroup.PUT("/reviews/:id",      admin.HandlerModerateReview(database))
 	}
 
 	// ── Payment expiration goroutine (expire pending payments after 30 min) ──

@@ -90,6 +90,10 @@ type EnvConfig struct {
 	BackupS3Region          string `envconfig:"BACKUP_S3_REGION" default:"auto"`
 	BackupEncryptionKey     string `envconfig:"BACKUP_ENCRYPTION_KEY"`
 	BackupRetentionDays     int    `envconfig:"BACKUP_RETENTION_DAYS" default:"30"`
+
+	// Pedidos entregados FUERA de la web (WhatsApp, Discord, desde 2022): la
+	// portada muestra esta base + los entregados por la web.
+	HistoricOrdersDelivered int `envconfig:"HISTORIC_ORDERS_DELIVERED" default:"10000"`
 	NOWPaymentsAPIKey     string `envconfig:"NOWPAYMENTS_API_KEY"`
 	// NOWPaymentsIPNSecret firma los callbacks IPN de NOWPayments (header
 	// x-nowpayments-sig) — se genera en el dashboard de NOWPayments, en

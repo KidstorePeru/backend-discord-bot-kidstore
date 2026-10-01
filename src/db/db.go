@@ -510,6 +510,24 @@ func CreateTables(db *sql.DB) error {
 			UNIQUE (customer_id, item_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_wishlist_item ON wishlist_items(item_id)`,
+		// Reseñas verificadas: solo de pedidos entregados, una por pedido, y se
+		// publican después de que el admin las apruebe.
+		`CREATE TABLE IF NOT EXISTS reviews (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			order_id UUID NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+			display_name VARCHAR(40) NOT NULL,
+			rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+			comment TEXT NOT NULL DEFAULT '',
+			item_name VARCHAR(255) NOT NULL DEFAULT '',
+			item_image VARCHAR(500) NOT NULL DEFAULT '',
+			lang VARCHAR(5) NOT NULL DEFAULT 'es',
+			status VARCHAR(12) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+			reply TEXT,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			moderated_at TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status, created_at DESC)`,
 		// Preferencias de aviso del cliente (los de la web siempre se muestran).
 		`ALTER TABLE customers ADD COLUMN IF NOT EXISTS notify_email BOOLEAN NOT NULL DEFAULT true`,
 		`ALTER TABLE customers ADD COLUMN IF NOT EXISTS notify_discord BOOLEAN NOT NULL DEFAULT true`,
