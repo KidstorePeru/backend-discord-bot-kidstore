@@ -99,7 +99,7 @@ func handlePerfilCommand(s *discordgo.Session, i *discordgo.InteractionCreate, d
 		Color:       colorAccent,
 		Thumbnail:   &discordgo.MessageEmbedThumbnail{URL: targetDiscordUser.AvatarURL("128")},
 		Fields: []*discordgo.MessageEmbedField{
-			{Name: "📅 Miembro desde", Value: target.CreatedAt.Format("2 de January de 2006"), Inline: true},
+			{Name: "📅 Miembro desde", Value: fechaES(target.CreatedAt), Inline: true},
 		},
 	}
 	respondEmbedEphemeral(s, i, embed)
@@ -146,7 +146,7 @@ func handleOwnProfile(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			{Name: "💸 KC gastado", Value: fmt.Sprintf("%d KC", totalSpentKC), Inline: true},
 			{Name: "📧 Email", Value: email, Inline: true},
 			{Name: "🔗 Métodos vinculados", Value: linkedStr, Inline: false},
-			{Name: "📅 Miembro desde", Value: customer.CreatedAt.Format("2 de January de 2006"), Inline: false},
+			{Name: "📅 Miembro desde", Value: fechaES(customer.CreatedAt), Inline: false},
 		},
 	}
 	respondEmbedEphemeral(s, i, embed)
@@ -291,4 +291,13 @@ func joinComma(items []string) string {
 		out += s
 	}
 	return out
+}
+
+var mesesES = [...]string{"enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"}
+
+// fechaES: "5 de septiembre de 2026" en hora de Perú. time.Format solo escribe
+// los meses en inglés ("5 de September de 2026").
+func fechaES(t time.Time) string {
+	t = t.In(time.FixedZone("PET", -5*60*60))
+	return fmt.Sprintf("%d de %s de %d", t.Day(), mesesES[t.Month()-1], t.Year())
 }

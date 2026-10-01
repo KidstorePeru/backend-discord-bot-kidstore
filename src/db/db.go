@@ -242,15 +242,6 @@ func CreateTables(db *sql.DB) error {
 			END IF;
 		END $$`,
 		`CREATE INDEX IF NOT EXISTS idx_payment_tx_activation ON payment_transactions(activation_code)`,
-		`CREATE TABLE IF NOT EXISTS product_availability (
-			product_id VARCHAR(100) PRIMARY KEY,
-			enabled BOOLEAN NOT NULL DEFAULT true,
-			schedule_enabled BOOLEAN NOT NULL DEFAULT false,
-			start_hour INTEGER NOT NULL DEFAULT 0 CHECK (start_hour >= 0 AND start_hour <= 23),
-			end_hour INTEGER NOT NULL DEFAULT 23 CHECK (end_hour >= 0 AND end_hour <= 23),
-			timezone VARCHAR(64) NOT NULL DEFAULT 'America/Lima',
-			updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-		)`,
 		// Update CHECK constraint to include fulfilled and activating statuses
 		// 'review': un pago con sesión real en la pasarela que llevó más de
 		// reconcileDeadLetterAfter (6h) sin que la pasarela confirmara ni un
@@ -497,66 +488,6 @@ func CreateTables(db *sql.DB) error {
 		}
 	}
 	return nil
-}
-
-// ==================== PRODUCT AVAILABILITY ====================
-
-type ProductAvailability struct {
-	ProductID       string `json:"product_id" binding:"required"`
-	Enabled         bool   `json:"enabled"`
-	ScheduleEnabled bool   `json:"schedule_enabled"`
-	StartHour       int    `json:"start_hour" binding:"min=0,max=23"`
-	EndHour         int    `json:"end_hour"   binding:"min=0,max=23"`
-	Timezone        string `json:"timezone"`
-}
-
-func GetProductAvailability(db *sql.DB, productID string) (ProductAvailability, error) {
-	var a ProductAvailability
-	err := db.QueryRow(`SELECT product_id, enabled, schedule_enabled, start_hour, end_hour, timezone FROM product_availability WHERE product_id=$1`, productID).
-		Scan(&a.ProductID, &a.Enabled, &a.ScheduleEnabled, &a.StartHour, &a.EndHour, &a.Timezone)
-	if err != nil {
-		// Not configured = available by default
-		return ProductAvailability{ProductID: productID, Enabled: true}, nil
-	}
-	return a, nil
-}
-
-func GetAllProductAvailability(db *sql.DB) ([]ProductAvailability, error) {
-	rows, err := db.Query(`SELECT product_id, enabled, schedule_enabled, start_hour, end_hour, timezone FROM product_availability ORDER BY product_id`)
-	if err != nil { return nil, err }
-	defer rows.Close()
-	var items []ProductAvailability
-	for rows.Next() {
-		var a ProductAvailability
-		if err := rows.Scan(&a.ProductID, &a.Enabled, &a.ScheduleEnabled, &a.StartHour, &a.EndHour, &a.Timezone); err != nil { return nil, err }
-		items = append(items, a)
-	}
-	return items, nil
-}
-
-func UpsertProductAvailability(db *sql.DB, a ProductAvailability) error {
-	_, err := db.Exec(`
-		INSERT INTO product_availability (product_id, enabled, schedule_enabled, start_hour, end_hour, timezone, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,NOW())
-		ON CONFLICT (product_id) DO UPDATE SET
-			enabled=EXCLUDED.enabled, schedule_enabled=EXCLUDED.schedule_enabled,
-			start_hour=EXCLUDED.start_hour, end_hour=EXCLUDED.end_hour,
-			timezone=EXCLUDED.timezone, updated_at=NOW()`,
-		a.ProductID, a.Enabled, a.ScheduleEnabled, a.StartHour, a.EndHour, a.Timezone)
-	return err
-}
-
-func IsProductAvailable(db *sql.DB, productID string) bool {
-	a, _ := GetProductAvailability(db, productID)
-	if !a.Enabled { return false }
-	if !a.ScheduleEnabled { return true }
-	loc, err := time.LoadLocation(a.Timezone)
-	if err != nil { loc = time.UTC }
-	hour := time.Now().In(loc).Hour()
-	if a.StartHour <= a.EndHour {
-		return hour >= a.StartHour && hour < a.EndHour
-	}
-	return hour >= a.StartHour || hour < a.EndHour
 }
 
 // ==================== ENCRYPTION MIGRATION ====================
@@ -2167,11 +2098,6 @@ func CancelPendingPayment(db *sql.DB, id uuid.UUID, customerID uuid.UUID) (bool,
 	return n > 0, err
 }
 
-func UpdatePaymentStatus(db *sql.DB, id uuid.UUID, status string, externalID string) error {
-	_, err := db.Exec(`UPDATE payment_transactions SET status=$1, external_id=$2, updated_at=NOW() WHERE id=$3`,
-		status, externalID, id)
-	return err
-}
 
 // CreditPaymentOnce hace, en UNA sola transacción con row lock, las tres
 // cosas que antes pasaban por separado (marcar el pago aprobado, sumar el
@@ -2949,11 +2875,6 @@ func GetKCRechargeByID(db *sql.DB, id uuid.UUID) (types.KCRecharge, error) {
 	return r, err
 }
 
-func CountPendingOrdersByCustomer(db *sql.DB, customerID uuid.UUID) (int, error) {
-	var count int
-	err := db.QueryRow(`SELECT COUNT(*) FROM orders WHERE customer_id=$1 AND status IN ('pending','processing')`, customerID).Scan(&count)
-	return count, err
-}
 
 // ==================== PAYMENT EXPIRATION ====================
 

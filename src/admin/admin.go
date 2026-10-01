@@ -520,44 +520,6 @@ func HandlerGetAllPayments(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
-// ==================== PRODUCT AVAILABILITY ====================
-
-func HandlerGetProductAvailability(database *sql.DB) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		items, err := db.GetAllProductAvailability(database)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo disponibilidad"})
-			return
-		}
-		if items == nil { items = []db.ProductAvailability{} }
-		c.JSON(http.StatusOK, gin.H{"success": true, "items": items})
-	}
-}
-
-func HandlerUpdateProductAvailability(database *sql.DB) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req db.ProductAvailability
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
-			return
-		}
-		if req.Timezone == "" { req.Timezone = "America/Lima" }
-		if err := db.UpsertProductAvailability(database, req); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error guardando disponibilidad"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"success": true, "message": "disponibilidad actualizada"})
-	}
-}
-
-func HandlerCheckProductAvailable(database *sql.DB) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		productID := c.Param("id")
-		available := db.IsProductAvailable(database, productID)
-		c.JSON(http.StatusOK, gin.H{"success": true, "available": available, "product_id": productID})
-	}
-}
-
 func HandlerGetStats(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var totalCustomers, totalOrders, totalSent, totalPending int

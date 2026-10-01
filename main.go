@@ -29,6 +29,21 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// trustedProxyCIDRs: desde dónde puede llegar la conexión del proxy de borde.
+// Además de los rangos privados (RFC 1918) y loopback, Railway entrega el
+// tráfico desde su red interna en el espacio compartido 100.64.0.0/10 (RFC 6598)
+// — en los logs de producción la IP de TODOS los visitantes salía como
+// 100.64.0.x: sin este rango, Gin no leía el X-Forwarded-For del proxy y todos
+// los clientes compartían la misma "IP", así que los límites por IP (login,
+// registro, Libro de Reclamaciones…) se los gastaban entre todos. Ese rango no
+// es enrutable desde internet, así que nadie de afuera puede hacerse pasar por
+// el proxy.
+var trustedProxyCIDRs = []string{
+	"127.0.0.1/8", "::1/128",
+	"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+	"100.64.0.0/10",
+}
+
 func main() {
 	if _, err := os.Stat(".env"); err == nil {
 		if err := godotenv.Load(); err != nil {
@@ -170,10 +185,7 @@ func main() {
 	// esa conexión interna. Si el hosting cambiara a un esquema distinto
 	// (ej. un CDN con IPs públicas propias por delante), esta lista
 	// tendría que actualizarse con esas IPs/rangos específicos.
-	if err := router.SetTrustedProxies([]string{
-		"127.0.0.1/8", "::1/128",
-		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-	}); err != nil {
+	if err := router.SetTrustedProxies(trustedProxyCIDRs); err != nil {
 		log.Fatalf("Error configurando proxies confiables: %v", err)
 	}
 
@@ -285,7 +297,6 @@ func main() {
 	router.GET("/store/shop/bestsellers", store.HandlerGetBestSellers(database))
 	router.GET("/store/bots-status",     store.HandlerBotsStatus(database))
 	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
-	router.GET("/store/product-available/:id", admin.HandlerCheckProductAvailable(database))
 
 	// Libro de Reclamaciones Virtual — público, no requiere cuenta (requisito
 	// legal en Perú: cualquier consumidor debe poder presentar un reclamo).
@@ -348,8 +359,6 @@ func main() {
 		adminGroup.GET("/webhook-events/review",       admin.HandlerListWebhookReview(database))
 		adminGroup.POST("/webhook-events/:id/retry",   admin.HandlerRetryWebhookEvent(database))
 		adminGroup.GET("/payments",         admin.HandlerGetAllPayments(database))
-		adminGroup.GET("/product-availability",  admin.HandlerGetProductAvailability(database))
-		adminGroup.PUT("/product-availability",  admin.HandlerUpdateProductAvailability(database))
 		adminGroup.GET("/bot-schedule",     admin.HandlerGetBotSchedule(database))
 		adminGroup.PUT("/bot-schedule",     admin.HandlerUpdateBotSchedule(database))
 		adminGroup.GET("/bots",             fortnite.HandlerGetBotAccounts(database))
