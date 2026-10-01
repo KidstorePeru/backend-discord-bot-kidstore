@@ -407,6 +407,7 @@ func HandlerRechargeKC(database *sql.DB) gin.HandlerFunc {
 		db.AddAuditLog(database, &customerID, "KC_RECHARGED",
 			fmt.Sprintf("recarga de %d KC por %s", req.AmountKC, approvedBy), c.ClientIP())
 		discordbot.NotifyRecharge(customer, req.AmountKC, customer.KCBalance, "Manual (admin)")
+		db.AddNotification(database, customerID, db.NotifKCCredited, map[string]any{"amount_kc": req.AmountKC, "method": "manual"})
 		// Antes esta recarga solo avisaba por Discord (y solo si el cliente lo
 		// tenia vinculado) — un cliente que paga por Yape/Plin sin Discord
 		// nunca se enteraba de que ya se le acredito el KC.

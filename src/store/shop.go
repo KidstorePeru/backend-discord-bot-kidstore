@@ -660,17 +660,20 @@ type shopItem struct {
 	FinalPrice  int
 }
 
-// resolveShopItem busca un offerId en la tienda actual y devuelve sus datos
-// REALES (precio, nombre e imagen). Nunca hay que confiar en lo que manda el
-// cliente al crear un pedido — ni el precio, ni el nombre, ni la imagen —
-// cualquiera podría interceptar la petición y, además de intentar pagar de
-// menos, meter texto/HTML arbitrario en item_name que después se muestra tal
-// cual en el correo de confirmación. Esta es la única fuente de verdad.
-func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
-	body, err := fetchShopBody(ctx, "es-419")
-	if err != nil {
-		return shopItem{}, err
-	}
+// shopEntryView es una oferta de la tienda ya interpretada: lo que muestra la
+// tienda (nombre, imagen, precio), sus fechas y los IDs de los objetos que
+// trae (la lista de deseos sigue objetos, no ofertas: una skin puede volver
+// sola o dentro de un lote, con otro offerId).
+type shopEntryView struct {
+	OfferID string
+	shopItem
+	InDate  time.Time
+	OutDate time.Time
+	ItemIDs []string
+}
+
+// parseShopEntries interpreta todas las ofertas de una respuesta de la tienda.
+func parseShopEntries(body []byte) ([]shopEntryView, error) {
 	type itemImages struct {
 		Featured  string `json:"featured"`
 		Icon      string `json:"icon"`
@@ -679,6 +682,7 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 		Small     string `json:"small"`
 	}
 	type namedItem struct {
+		ID     string     `json:"id"`
 		Name   string     `json:"name"`
 		Images itemImages `json:"images"`
 	}
@@ -687,6 +691,8 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 			Entries []struct {
 				OfferID    string `json:"offerId"`
 				FinalPrice int    `json:"finalPrice"`
+				InDate     string `json:"inDate"`
+				OutDate    string `json:"outDate"`
 				Bundle     *struct {
 					Name  string `json:"name"`
 					Image string `json:"image"`
@@ -699,6 +705,7 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 				} `json:"newDisplayAsset"`
 				BrItems []namedItem `json:"brItems"`
 				Tracks  []struct {
+					ID       string `json:"id"`
 					Title    string `json:"title"`
 					AlbumArt string `json:"albumArt"`
 				} `json:"tracks"`
@@ -709,7 +716,7 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return shopItem{}, fmt.Errorf("respuesta de tienda inesperada: %w", err)
+		return nil, fmt.Errorf("respuesta de tienda inesperada: %w", err)
 	}
 	first := func(vals ...string) string {
 		for _, v := range vals {
@@ -719,10 +726,8 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 		}
 		return ""
 	}
+	views := make([]shopEntryView, 0, len(parsed.Data.Entries))
 	for _, e := range parsed.Data.Entries {
-		if e.OfferID != offerID {
-			continue
-		}
 		item := shopItem{FinalPrice: e.FinalPrice}
 
 		// Nombre: el del lote, o el del primer objeto de la oferta.
@@ -772,7 +777,46 @@ func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
 				item.Image = first(im.Large, im.Small, im.Featured, im.Icon)
 			}
 		}
-		return item, nil
+
+		view := shopEntryView{OfferID: e.OfferID, shopItem: item}
+		view.InDate, _ = time.Parse(time.RFC3339Nano, e.InDate)
+		view.OutDate, _ = time.Parse(time.RFC3339Nano, e.OutDate)
+		for _, list := range [][]namedItem{e.BrItems, e.Cars, e.Instruments, e.LegoKits} {
+			for _, it := range list {
+				if it.ID != "" {
+					view.ItemIDs = append(view.ItemIDs, it.ID)
+				}
+			}
+		}
+		for _, t := range e.Tracks {
+			if t.ID != "" {
+				view.ItemIDs = append(view.ItemIDs, t.ID)
+			}
+		}
+		views = append(views, view)
+	}
+	return views, nil
+}
+
+// resolveShopItem busca un offerId en la tienda actual y devuelve sus datos
+// REALES (precio, nombre e imagen). Nunca hay que confiar en lo que manda el
+// cliente al crear un pedido — ni el precio, ni el nombre, ni la imagen —
+// cualquiera podría interceptar la petición y, además de intentar pagar de
+// menos, meter texto/HTML arbitrario en item_name que después se muestra tal
+// cual en el correo de confirmación. Esta es la única fuente de verdad.
+func resolveShopItem(ctx context.Context, offerID string) (shopItem, error) {
+	body, err := fetchShopBody(ctx, "es-419")
+	if err != nil {
+		return shopItem{}, err
+	}
+	views, err := parseShopEntries(body)
+	if err != nil {
+		return shopItem{}, err
+	}
+	for _, v := range views {
+		if v.OfferID == offerID {
+			return v.shopItem, nil
+		}
 	}
 	return shopItem{}, fmt.Errorf("item no encontrado en la tienda actual")
 }
@@ -1233,6 +1277,10 @@ func RetryFailedRefunds(database *sql.DB) {
 // confirmarlo primero, ver failOrderAndRefund). "reason" debe ser un texto
 // ya pensado para el cliente, no el error técnico crudo.
 func notifyOrderFailed(database *sql.DB, order types.Order, reason string, refunded bool) {
+	db.AddNotification(database, order.CustomerID, db.NotifOrderFailed, map[string]any{
+		"order_id": order.ID, "item_name": order.ItemName, "item_image": derefString(order.ItemImage),
+		"price_kc": order.PriceKC, "refunded": refunded,
+	})
 	customer, err := db.GetCustomerByID(database, order.CustomerID)
 	if err != nil {
 		return
@@ -1437,6 +1485,7 @@ func retryUnpersistedDelivery(database *sql.DB, orderID uuid.UUID) bool {
 	switch {
 	case err == nil:
 		slog.Info("Worker: entrega pendiente guardada (sin reenviar el regalo)", "orderID", orderID)
+		notifyOrderSent(database, pending.order())
 		db.AddAuditLog(database, &pending.CustomerID, "ORDER_DELIVERY_RECOVERED",
 			fmt.Sprintf("pedido %s: se guardó la evidencia de una entrega que había fallado al persistir", orderID), "worker")
 	case errors.Is(err, db.ErrOrderAlreadyRefunded):
@@ -1785,6 +1834,7 @@ func processOrder(database *sql.DB, order types.Order, accounts []types.GameAcco
 
 			db.AddAuditLog(database, &order.CustomerID, "ORDER_SENT",
 				fmt.Sprintf("pedido %s enviado por bot %s → %s", order.ID, bot.DisplayName, order.EpicUsername), "worker")
+			notifyOrderSent(database, order)
 
 			if customer, custErr := db.GetCustomerByID(database, order.CustomerID); custErr == nil {
 				if customer.Email != nil && *customer.Email != "" {

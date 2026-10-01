@@ -159,6 +159,7 @@ func main() {
 	authLimiter    := middleware.NewIPRateLimiter(5, time.Minute)
 	orderLimiter   := middleware.NewIPRateLimiter(10, time.Minute)
 	adminLimiter   := middleware.NewIPRateLimiter(30, time.Minute)
+	searchLimiter  := middleware.NewIPRateLimiter(40, time.Minute)
 	// Los webhooks de pago son rutas públicas sin autenticación por diseño
 	// (las llaman las pasarelas) — cada solicitud dispara una llamada saliente
 	// real a la API de PayPal/MercadoPago/etc. para verificar el pago. Sin un
@@ -342,6 +343,16 @@ func main() {
 			middleware.RateLimitMiddleware(orderLimiter),
 			store.HandlerCreateOrder(database),
 		)
+		// Campana de notificaciones y lista de deseos («Avísame cuando vuelva»).
+		customer.GET("/notifications",          store.HandlerGetNotifications(database))
+		customer.GET("/notifications/unread",   store.HandlerGetUnreadNotifications(database))
+		customer.POST("/notifications/read",    store.HandlerMarkNotificationsRead(database))
+		customer.GET("/notifications/prefs",    store.HandlerGetNotificationPrefs(database))
+		customer.PUT("/notifications/prefs",    store.HandlerUpdateNotificationPrefs(database))
+		customer.GET("/wishlist",               store.HandlerGetWishlist(database))
+		customer.POST("/wishlist",              middleware.RateLimitMiddleware(searchLimiter), store.HandlerAddWishlistItem(database))
+		customer.DELETE("/wishlist/:itemId",    store.HandlerRemoveWishlistItem(database))
+		customer.GET("/cosmetics/search",       middleware.RateLimitMiddleware(searchLimiter), store.HandlerSearchCosmetics())
 	}
 
 	// ── Admin (API Key + rate limit) ──
@@ -472,6 +483,7 @@ func main() {
 	fortnite.StartFriendRequestAcceptor(database, 300)
 	fortnite.StartFriendship48hChecker(database, 900)
 	fortnite.StartTokenHealthCheck(database, cfg.BotCheckInterval)
+	store.StartWishlistNotifier(database)
 	slog.Info("Workers iniciados", "workers", "pedidos, amigos, health check")
 
 	discordbot.SetEmailSender(store.SendPaymentApprovedEmail)

@@ -482,6 +482,37 @@ func CreateTables(db *sql.DB) error {
 			body TEXT NOT NULL,
 			fetched_at TIMESTAMP NOT NULL DEFAULT NOW()
 		)`,
+		// Centro de notificaciones de la web (campana): un aviso por fila, con
+		// sus datos en JSON — el texto lo arma el frontend en el idioma que el
+		// cliente esté usando al verlo.
+		`CREATE TABLE IF NOT EXISTS notifications (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+			kind VARCHAR(30) NOT NULL,
+			data JSONB NOT NULL DEFAULT '{}'::jsonb,
+			read_at TIMESTAMP,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_notifications_customer ON notifications(customer_id, created_at DESC)`,
+		// Lista de deseos («Avísame cuando vuelva»): sigue OBJETOS (item_id de
+		// fortnite-api), no ofertas. notified_in_date = inDate de la aparición
+		// en la tienda que ya se avisó (una vez por regreso, no cada día).
+		`CREATE TABLE IF NOT EXISTS wishlist_items (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+			item_id VARCHAR(150) NOT NULL,
+			name VARCHAR(150) NOT NULL,
+			item_type VARCHAR(60) NOT NULL DEFAULT '',
+			image TEXT NOT NULL DEFAULT '',
+			lang VARCHAR(5) NOT NULL DEFAULT 'es',
+			notified_in_date TIMESTAMP,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			UNIQUE (customer_id, item_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_wishlist_item ON wishlist_items(item_id)`,
+		// Preferencias de aviso del cliente (los de la web siempre se muestran).
+		`ALTER TABLE customers ADD COLUMN IF NOT EXISTS notify_email BOOLEAN NOT NULL DEFAULT true`,
+		`ALTER TABLE customers ADD COLUMN IF NOT EXISTS notify_discord BOOLEAN NOT NULL DEFAULT true`,
 		// El código de reclamo pasó de 3 a 6 bytes al azar (24→48 bits de
 		// entropía) — "KS-YYMMDD-" + 12 caracteres hex ya no entra en el
 		// VARCHAR(20) original.

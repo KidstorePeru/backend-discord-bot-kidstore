@@ -63,6 +63,7 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 		}
 		if tx.PaymentType == "kc_recharge" && tx.KCAmount > 0 {
 			discordbot.NotifyRecharge(customer, tx.KCAmount, customer.KCBalance, tx.Gateway)
+			db.AddNotification(database, tx.CustomerID, db.NotifKCCredited, map[string]any{"amount_kc": tx.KCAmount, "method": tx.Gateway})
 		}
 	}
 
