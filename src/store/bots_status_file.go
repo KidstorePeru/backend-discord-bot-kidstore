@@ -21,13 +21,13 @@ func HandlerBotsStatus(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
+		// Solo lo que muestra la página Bots: el saldo de V-Bucks de cada
+		// cuenta y su antigüedad son datos internos (están en el panel admin).
 		type SafeAccount struct {
 			ID             string `json:"id"`
 			DisplayName    string `json:"display_name"`
 			RemainingGifts int    `json:"remaining_gifts"`
-			VBucks         int    `json:"vbucks"`
 			IsActive       bool   `json:"is_active"`
-			CreatedAt      string `json:"created_at"`
 			// Amigos actuales en Epic (nil = sin sincronizar todavía) y el
 			// límite: a una cuenta llena no se le puede mandar solicitud.
 			FriendsCount *int `json:"friends_count"`
@@ -40,9 +40,7 @@ func HandlerBotsStatus(database *sql.DB) gin.HandlerFunc {
 				ID:             a.ID.String(),
 				DisplayName:    a.DisplayName,
 				RemainingGifts: a.RemainingGifts,
-				VBucks:         a.VBucks,
 				IsActive:       a.IsActive,
-				CreatedAt:      a.CreatedAt.Format("2006-01-02"),
 				FriendsCount:   a.FriendsCount,
 				FriendsLimit:   db.BotFriendsLimit,
 			})

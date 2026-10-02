@@ -48,6 +48,10 @@ func StartEmbeddedIfNeeded() (cleanup func(), err error) {
 		Username("kidstore_test").
 		Password("kidstore_test").
 		Database("kidstore_test").
+		// UTF-8 como en producción: con la codificación de Windows (WIN1252)
+		// fallaban en las pruebas textos con caracteres como "→".
+		Encoding("UTF8").
+		Locale("C").
 		DataPath(dataDir).
 		RuntimePath(runtimeDir).
 		StartTimeout(90 * time.Second).

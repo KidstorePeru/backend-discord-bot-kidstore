@@ -567,6 +567,29 @@ func HandlerRechargeVoucher(database *sql.DB) gin.HandlerFunc {
 			}
 		}
 
+		// Pago manual con comprobante subido desde la web: se muestra lo que el
+		// cliente pagó de verdad y en su divisa (Bizum cobra en euros; el monto
+		// en soles de la recarga es solo la referencia).
+		if m, mErr := db.GetManualPaymentByRechargeID(database, id); mErr == nil && m.CustomerID == customerID {
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"voucher": gin.H{
+					"type":             "recharge",
+					"reference":        strings.ToUpper(id.String()[:8]),
+					"customer_name":    customer.EpicUsername,
+					"product_name":     m.PackageName,
+					"amount_pen":       m.AmountPEN,
+					"charged_amount":   m.Amount,
+					"charged_currency": m.Currency,
+					"kc_amount":        r.AmountKC,
+					"gateway":          m.Method,
+					"status":           "approved",
+					"created_at":       r.CreatedAt,
+				},
+			})
+			return
+		}
+
 		amountSoles := 0.0
 		if r.AmountSoles != nil { amountSoles = *r.AmountSoles }
 		productName := "Recarga manual de KC"

@@ -153,7 +153,12 @@ func TestComprobante_CifradoYEnlaceFirmado(t *testing.T) {
 	if validProofLink(id, exp, sig, now.Add(25*time.Hour)) {
 		t.Error("el enlace vence a las 24 h")
 	}
-	if validProofLink(uuid.New(), exp, sig, now) || validProofLink(id, exp, sig[:len(sig)-1]+"0", now) {
+	// Firma alterada: se cambia el último carácter por otro distinto.
+	last := "0"
+	if strings.HasSuffix(sig, "0") {
+		last = "1"
+	}
+	if validProofLink(uuid.New(), exp, sig, now) || validProofLink(id, exp, sig[:len(sig)-1]+last, now) {
 		t.Error("un enlace con otro ID o firma alterada no debe valer")
 	}
 }

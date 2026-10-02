@@ -157,6 +157,11 @@ func main() {
 	}
 
 	authLimiter    := middleware.NewIPRateLimiter(5, time.Minute)
+	// Renovar o cerrar la sesión exige un refresh token válido (aleatorio, no
+	// adivinable), así que no necesita el límite estricto del login. Con su
+	// propio contador, muchos clientes detrás de la misma IP (CGNAT de los
+	// operadores móviles) no se quedan sin poder renovar su sesión.
+	sessionLimiter := middleware.NewIPRateLimiter(30, time.Minute)
 	orderLimiter   := middleware.NewIPRateLimiter(10, time.Minute)
 	adminLimiter   := middleware.NewIPRateLimiter(30, time.Minute)
 	searchLimiter  := middleware.NewIPRateLimiter(40, time.Minute)
@@ -265,9 +270,13 @@ func main() {
 		authGroup.POST("/forgot-password",     store.HandlerForgotPassword(database, cfg))
 		authGroup.POST("/reset-password",      store.HandlerResetPassword(database))
 		authGroup.POST("/resend-verification", store.HandlerResendVerification(database, cfg))
-		authGroup.POST("/refresh-token",      store.HandlerRefreshToken(database, cfg.SecretKey))
-		authGroup.POST("/logout",             store.HandlerLogout(database))
 		authGroup.POST("/login/2fa",          store.HandlerLoginVerify2FA(database, cfg.SecretKey))
+	}
+	sessionGroup := router.Group("/store")
+	sessionGroup.Use(middleware.RateLimitMiddleware(sessionLimiter))
+	{
+		sessionGroup.POST("/refresh-token", store.HandlerRefreshToken(database, cfg.SecretKey))
+		sessionGroup.POST("/logout",        store.HandlerLogout(database))
 	}
 
 	// ── OAuth: login/registro con Google y Discord (con rate limit) ──

@@ -290,3 +290,59 @@ func TestPagoManual_DesactivadoSinAlmacenamiento(t *testing.T) {
 		t.Errorf("sin almacenamiento debería responder 503, obtuve %d", w.Code)
 	}
 }
+
+// El comprobante de una recarga pagada con Bizum muestra los euros que pagó el
+// cliente (el monto en soles queda solo como referencia), y el cliente no ve
+// quién del equipo revisó su comprobante.
+func TestPagoManual_ComprobanteEnLaDivisaPagada(t *testing.T) {
+	conn := setupShopTestDB(t)
+	setupManualPayments(t)
+	custID, cleanup := newShopTestCustomer(t, conn, 0)
+	defer cleanup()
+
+	key := "comprobantes/test-bizum"
+	m, err := db.CreateManualPaymentRequest(conn, db.ManualPaymentRequest{
+		ID: uuid.New(), CustomerID: custID, PackageID: "gamer", PackageName: "Gamer 2,400 KC",
+		KCAmount: 2400, Amount: 2.64, Currency: "EUR", AmountPEN: 31.2, Method: "bizum",
+		ProofKey: &key, ProofContentType: "image/jpeg", Lang: "es",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved, err := ApproveManualPayment(conn, m.ID, "Discord: equipo", false)
+	if err != nil || approved.RechargeID == nil {
+		t.Fatalf("aprobar: %+v %v", approved, err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("customer_id", custID.String()); c.Next() })
+	r.GET("/store/voucher/recharge/:id", HandlerRechargeVoucher(conn))
+	r.GET("/store/manual-payments", HandlerListMyManualPayments(conn))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/store/voucher/recharge/"+approved.RechargeID.String(), nil))
+	var v struct {
+		Voucher struct {
+			ProductName     string  `json:"product_name"`
+			ChargedAmount   float64 `json:"charged_amount"`
+			ChargedCurrency string  `json:"charged_currency"`
+			AmountPEN       float64 `json:"amount_pen"`
+			KCAmount        int     `json:"kc_amount"`
+			Gateway         string  `json:"gateway"`
+		} `json:"voucher"`
+	}
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &v) != nil {
+		t.Fatalf("comprobante: %d %s", rec.Code, rec.Body.String())
+	}
+	if v.Voucher.ChargedAmount != 2.64 || v.Voucher.ChargedCurrency != "EUR" || v.Voucher.AmountPEN != 31.2 ||
+		v.Voucher.KCAmount != 2400 || v.Voucher.Gateway != "bizum" || v.Voucher.ProductName != "Gamer 2,400 KC" {
+		t.Errorf("comprobante = %+v", v.Voucher)
+	}
+
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/store/manual-payments", nil))
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "reviewed_by") || strings.Contains(rec.Body.String(), "Discord: equipo") {
+		t.Errorf("el cliente no debería ver quién revisó: %s", rec.Body.String())
+	}
+}

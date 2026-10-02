@@ -148,6 +148,12 @@ func ListManualPaymentsByCustomer(db *sql.DB, customerID uuid.UUID, limit int) (
 		WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2`, customerID, limit)
 }
 
+// GetManualPaymentByRechargeID — la solicitud que generó esa recarga, si la hay
+// (para que el comprobante muestre lo que el cliente pagó de verdad).
+func GetManualPaymentByRechargeID(db *sql.DB, rechargeID uuid.UUID) (ManualPaymentRequest, error) {
+	return scanManual(db.QueryRow(`SELECT `+manualColumns+` FROM manual_payment_requests WHERE recharge_id = $1`, rechargeID))
+}
+
 // AdminListManualPayments — por estado ("" = todas); las pendientes, de la
 // más antigua a la más nueva (para atenderlas en orden).
 func AdminListManualPayments(db *sql.DB, status string, limit int) ([]ManualPaymentRequest, error) {

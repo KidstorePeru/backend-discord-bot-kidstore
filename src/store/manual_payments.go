@@ -350,7 +350,8 @@ func HandlerCreateManualPayment(database *sql.DB) gin.HandlerFunc {
 		}
 		customKC, _ := strconv.Atoi(c.PostForm("custom_kc"))
 		eur := currentConversionRates()["EUR"]
-		quote, err := quoteManual(strings.TrimSpace(c.PostForm("package_id")), customKC, strings.TrimSpace(c.PostForm("method")), eur)
+		method := strings.TrimSpace(c.PostForm("method"))
+		quote, err := quoteManual(strings.TrimSpace(c.PostForm("package_id")), customKC, method, eur)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "paquete o método de pago inválido"})
 			return
@@ -420,7 +421,7 @@ func HandlerCreateManualPayment(database *sql.DB) gin.HandlerFunc {
 		created, err := db.CreateManualPaymentRequest(database, db.ManualPaymentRequest{
 			ID: id, CustomerID: customerID, PackageID: quote.PackageID, PackageName: quote.PackageName,
 			KCAmount: quote.KC, Amount: quote.Amount, Currency: quote.Currency, AmountPEN: quote.AmountPEN,
-			Method: c.PostForm("method"), OperationNumber: operation, ProofKey: &key, ProofContentType: contentType,
+			Method: method, OperationNumber: operation, ProofKey: &key, ProofContentType: contentType,
 			Lang: requestLang(c),
 		})
 		if err != nil {
@@ -464,6 +465,10 @@ func HandlerListMyManualPayments(database *sql.DB) gin.HandlerFunc {
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "no se pudieron cargar tus comprobantes"})
 			return
+		}
+		// Quién lo revisó (usuario de Discord o de Epic del equipo) es interno.
+		for i := range list {
+			list[i].ReviewedBy = nil
 		}
 		c.JSON(http.StatusOK, gin.H{"success": true, "requests": list, "enabled": manualUploadsEnabled(),
 			"max_pending": db.MaxPendingManualPayments})
