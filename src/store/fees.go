@@ -33,6 +33,18 @@ type GatewayFee struct {
 	Fixed   float64 `json:"fixed"`   // cargo fijo por operación (S/ en Mercado Pago, US$ en PayPal y cripto)
 	Tax     float64 `json:"tax"`     // % de impuesto sobre la comisión (IGV)
 	Margin  float64 `json:"margin"`  // % extra de seguridad (opcional)
+	// Tramo por volumen (Mercado Pago): si en el mes se cobra más que
+	// VolumeThreshold, la comisión pasa a VolumePercent (0 = sin tramo).
+	VolumeThreshold float64 `json:"volume_threshold"`
+	VolumePercent   float64 `json:"volume_percent"`
+}
+
+// effective: la tarifa que corresponde con lo cobrado en el mes.
+func (g GatewayFee) effective(monthVolume float64) GatewayFee {
+	if g.VolumeThreshold > 0 && g.VolumePercent > 0 && monthVolume > g.VolumeThreshold {
+		g.Percent = g.VolumePercent
+	}
+	return g
 }
 
 // RemittanceFee — costo de traer a Perú lo cobrado por Bizum.
@@ -52,11 +64,12 @@ type PaymentFees struct {
 const paymentFeesKey = "payment_fees"
 
 // Tarifas públicas: Mercado Pago Perú con dinero disponible al instante
-// (3.49% + S/1 + IGV) y PayPal Perú para cobros del extranjero (5.4% + 1.5%
-// internacional + US$0.30). El admin las ajusta en el panel con las de su
-// cuenta. NOWPayments: su comisión ya la paga el cliente (0 = nada extra).
+// (3.49% + S/1 + IGV; 3.99% + S/1 por encima de S/25,000 cobrados en el mes)
+// y PayPal Perú para cobros del extranjero (5.4% + 1.5% internacional +
+// US$0.30). El admin las ajusta en el panel con las de su cuenta.
+// NOWPayments: su comisión ya la paga el cliente (0 = nada extra).
 var defaultPaymentFees = PaymentFees{
-	MercadoPago: GatewayFee{Percent: 3.49, Fixed: 1.00, Tax: 18},
+	MercadoPago: GatewayFee{Percent: 3.49, Fixed: 1.00, Tax: 18, VolumeThreshold: 25000, VolumePercent: 3.99},
 	PayPal:      GatewayFee{Percent: 6.9, Fixed: 0.30},
 	Bizum:       RemittanceFee{Percent: 1.5},
 }
@@ -95,7 +108,53 @@ func LoadPaymentFees(database *sql.DB) {
 func between(v, lo, hi float64) bool { return !math.IsNaN(v) && v >= lo && v <= hi }
 
 func (g GatewayFee) valid() bool {
-	return between(g.Percent, 0, 20) && between(g.Fixed, 0, 20) && between(g.Tax, 0, 30) && between(g.Margin, 0, 10)
+	return between(g.Percent, 0, 20) && between(g.Fixed, 0, 20) && between(g.Tax, 0, 30) && between(g.Margin, 0, 10) &&
+		between(g.VolumeThreshold, 0, 100_000_000) && between(g.VolumePercent, 0, 20)
+}
+
+// ==================== VOLUMEN DEL MES (tramo de Mercado Pago) ====================
+
+var (
+	monthVolumeMu  sync.Mutex
+	monthVolume    float64
+	monthVolumeAt  time.Time
+	monthVolumeKey string // mes al que corresponde (AAAA-MM, hora de Lima)
+)
+
+// limaMonthStart: inicio del mes en curso en hora de Lima.
+func limaMonthStart(now time.Time) time.Time {
+	loc, err := time.LoadLocation("America/Lima")
+	if err != nil {
+		loc = time.FixedZone("PET", -5*3600)
+	}
+	n := now.In(loc)
+	return time.Date(n.Year(), n.Month(), 1, 0, 0, 0, 0, loc)
+}
+
+// mercadoPagoMonthVolume: lo cobrado con Mercado Pago en el mes (cacheado 5 min).
+func mercadoPagoMonthVolume(database *sql.DB) float64 {
+	start := limaMonthStart(time.Now())
+	key := start.Format("2006-01")
+	monthVolumeMu.Lock()
+	defer monthVolumeMu.Unlock()
+	if monthVolumeKey == key && time.Since(monthVolumeAt) < 5*time.Minute {
+		return monthVolume
+	}
+	v, err := db.MercadoPagoVolumeSince(database, start.UTC())
+	if err != nil {
+		slog.Warn("Comisiones: no se pudo calcular el volumen del mes de Mercado Pago", "error", err)
+		return monthVolume // se mantiene el último valor conocido
+	}
+	monthVolume, monthVolumeAt, monthVolumeKey = v, time.Now(), key
+	return v
+}
+
+// effectivePaymentFees: las comisiones vigentes con el tramo de Mercado Pago
+// que corresponde según lo cobrado en el mes.
+func effectivePaymentFees(database *sql.DB) PaymentFees {
+	f := CurrentPaymentFees()
+	f.MercadoPago = f.MercadoPago.effective(mercadoPagoMonthVolume(database))
+	return f
 }
 
 func (f PaymentFees) validate() error {
@@ -136,20 +195,28 @@ func bizumTotal(basePEN, eurPerPEN float64, f RemittanceFee) (total, fee float64
 
 // ==================== ENDPOINTS ====================
 
-// HandlerGetPaymentFees (público): la web muestra el desglose antes de pagar.
-func HandlerGetPaymentFees(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"success": true, "fees": CurrentPaymentFees()})
+// HandlerGetPaymentFees (público): la web muestra el desglose antes de pagar,
+// con la comisión de Mercado Pago que corresponde al volumen del mes.
+func HandlerGetPaymentFees(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"success": true, "fees": effectivePaymentFees(database)})
+	}
 }
 
-// HandlerAdminGetPaymentFees: las comisiones vigentes y quién las cambió.
-func HandlerAdminGetPaymentFees(c *gin.Context) {
-	paymentFeesMu.RLock()
-	defer paymentFeesMu.RUnlock()
-	resp := gin.H{"success": true, "fees": paymentFees, "defaults": defaultPaymentFees, "updated_by": paymentFeesBy}
-	if !paymentFeesUpdated.IsZero() {
-		resp["updated_at"] = paymentFeesUpdated
+// HandlerAdminGetPaymentFees: las comisiones configuradas, quién las cambió y
+// lo cobrado con Mercado Pago en el mes (para el tramo por volumen).
+func HandlerAdminGetPaymentFees(database *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		volume := mercadoPagoMonthVolume(database)
+		paymentFeesMu.RLock()
+		defer paymentFeesMu.RUnlock()
+		resp := gin.H{"success": true, "fees": paymentFees, "defaults": defaultPaymentFees, "updated_by": paymentFeesBy,
+			"mercadopago_month_volume": volume, "mercadopago_percent_now": paymentFees.MercadoPago.effective(volume).Percent}
+		if !paymentFeesUpdated.IsZero() {
+			resp["updated_at"] = paymentFeesUpdated
+		}
+		c.JSON(http.StatusOK, resp)
 	}
-	c.JSON(http.StatusOK, resp)
 }
 
 // HandlerAdminUpdatePaymentFees guarda las comisiones nuevas.

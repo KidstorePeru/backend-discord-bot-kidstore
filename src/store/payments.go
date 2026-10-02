@@ -206,7 +206,7 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		// amount_usd siguen siendo el precio; fee_amount es lo que se suma, en
 		// la divisa en que cobra la pasarela (soles en Mercado Pago, dólares en
 		// PayPal y NOWPayments).
-		fees := CurrentPaymentFees()
+		fees := effectivePaymentFees(database) // con el tramo de Mercado Pago del mes
 		var fee float64
 		switch req.Gateway {
 		case "mercadopago":

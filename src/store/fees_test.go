@@ -84,6 +84,19 @@ func TestComision_Bizum_CubreLaRemesaYElCambio(t *testing.T) {
 	}
 }
 
+func TestComision_TramoPorVolumen(t *testing.T) {
+	mp := defaultPaymentFees.MercadoPago
+	for volume, want := range map[float64]float64{0: 3.49, 25_000: 3.49, 25_000.01: 3.99, 80_000: 3.99} {
+		if got := mp.effective(volume).Percent; got != want {
+			t.Errorf("volumen S/%.2f: %.2f%%, se esperaba %.2f%%", volume, got, want)
+		}
+	}
+	sinTramo := GatewayFee{Percent: 3.29, Fixed: 1, Tax: 18}
+	if got := sinTramo.effective(1_000_000).Percent; got != 3.29 {
+		t.Errorf("sin tramo configurado la comisión no cambia: %.2f%%", got)
+	}
+}
+
 func TestComision_Validacion(t *testing.T) {
 	if err := defaultPaymentFees.validate(); err != nil {
 		t.Fatalf("las comisiones por defecto deben ser válidas: %v", err)

@@ -3100,6 +3100,16 @@ func DeletePayment(db *sql.DB, id uuid.UUID) error {
 	return err
 }
 
+// MercadoPagoVolumeSince — total cobrado por Mercado Pago (precio + comisión)
+// en los pagos acreditados desde since: Mercado Pago cobra más comisión a
+// partir de cierto volumen mensual.
+func MercadoPagoVolumeSince(db *sql.DB, since time.Time) (float64, error) {
+	var total float64
+	err := db.QueryRow(`SELECT COALESCE(SUM(amount_pen + fee_amount), 0) FROM payment_transactions
+		WHERE gateway = 'mercadopago' AND kc_credited_at IS NOT NULL AND kc_credited_at >= $1`, since).Scan(&total)
+	return total, err
+}
+
 // SetPaymentNetReceived guarda lo que la pasarela depositó de verdad por el pago.
 func SetPaymentNetReceived(db *sql.DB, id uuid.UUID, net float64) error {
 	_, err := db.Exec(`UPDATE payment_transactions SET net_received=$2 WHERE id=$1`, id, net)

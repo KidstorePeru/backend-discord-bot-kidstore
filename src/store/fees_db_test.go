@@ -123,7 +123,7 @@ func TestComisiones_PanelAdmin(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/store/payment-fees", HandlerGetPaymentFees)
+	r.GET("/store/payment-fees", HandlerGetPaymentFees(conn))
 	r.PUT("/admin/payment-fees", HandlerAdminUpdatePaymentFees(conn, func(*gin.Context) string { return "Panel: dueño" }))
 	put := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("PUT", "/admin/payment-fees", strings.NewReader(body))
@@ -140,7 +140,9 @@ func TestComisiones_PanelAdmin(t *testing.T) {
 		t.Fatalf("guardar: %d %s", w.Code, w.Body.String())
 	}
 	// PayPal y cripto no venían en el cuerpo: conservan su valor (nunca quedan en 0).
-	want := PaymentFees{MercadoPago: GatewayFee{Percent: 4.99, Fixed: 1, Tax: 18, Margin: 0.2}, PayPal: defaultPaymentFees.PayPal,
+	want := PaymentFees{MercadoPago: GatewayFee{Percent: 4.99, Fixed: 1, Tax: 18, Margin: 0.2,
+		VolumeThreshold: defaultPaymentFees.MercadoPago.VolumeThreshold, VolumePercent: defaultPaymentFees.MercadoPago.VolumePercent},
+		PayPal: defaultPaymentFees.PayPal,
 		Bizum: RemittanceFee{Percent: 2, Fixed: 1.99, FXMargin: 1.5}}
 	if CurrentPaymentFees() != want {
 		t.Errorf("vigentes = %+v", CurrentPaymentFees())
@@ -275,5 +277,47 @@ func TestPayPal_NetoRecibido(t *testing.T) {
 	got, _ := db.GetPaymentTransaction(conn, id)
 	if asked != "ORDER-9" || got.NetReceived == nil || *got.NetReceived != 8.42 {
 		t.Errorf("neto de PayPal = %v (orden consultada %q)", got.NetReceived, asked)
+	}
+}
+
+// Si en el mes se cobró más de S/25,000 con Mercado Pago, se usa su tarifa
+// más alta (3.99% + S/1): la web y el cobro real pasan solos al tramo nuevo.
+func TestMercadoPago_TramoPorVolumenDelMes(t *testing.T) {
+	conn := setupShopTestDB(t)
+	custID, _, cleanup := newPaymentCustomer(t, conn)
+	defer cleanup()
+	setTestPaymentFees(t, defaultPaymentFees)
+	resetVolume := func() { monthVolumeMu.Lock(); monthVolumeKey = ""; monthVolumeMu.Unlock() }
+	resetVolume()
+	t.Cleanup(resetVolume)
+
+	add := func(amount float64, creditedAt string) {
+		t.Helper()
+		if _, err := conn.Exec(`INSERT INTO payment_transactions (id, customer_id, gateway, payment_type, product_id, product_name,
+			amount_pen, amount_usd, fee_amount, kc_amount, external_id, status, kc_credited_at, created_at, updated_at)
+			VALUES ($1,$2,'mercadopago','kc_recharge','legend','Legend',$3,0,0,12500,'pref','approved',`+creditedAt+`,NOW(),NOW())`,
+			uuid.New(), custID, amount); err != nil {
+			t.Fatal(err)
+		}
+	}
+	percent := func() float64 {
+		t.Helper()
+		resetVolume()
+		return effectivePaymentFees(conn).MercadoPago.Percent
+	}
+
+	add(24_000, "NOW()")
+	add(9_000, "NOW() - INTERVAL '40 days'") // del mes pasado: no cuenta
+	if p := percent(); p != 3.49 {
+		t.Errorf("con S/24,000 en el mes la comisión debe ser 3.49%%, es %.2f%%", p)
+	}
+	add(1_500, "NOW()")
+	if p := percent(); p != 3.99 {
+		t.Errorf("con S/25,500 en el mes la comisión debe ser 3.99%%, es %.2f%%", p)
+	}
+	// Lo cobrado en un pago nuevo usa el tramo alto.
+	total, _ := gatewayTotal(31.20, effectivePaymentFees(conn).MercadoPago)
+	if want, _ := gatewayTotal(31.20, GatewayFee{Percent: 3.99, Fixed: 1, Tax: 18}); total != want {
+		t.Errorf("total = %.2f, se esperaba %.2f", total, want)
 	}
 }
