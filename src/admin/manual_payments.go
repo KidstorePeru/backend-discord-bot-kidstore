@@ -14,6 +14,9 @@ import (
 	"github.com/google/uuid"
 )
 
+// Reviewer — quién hace un cambio desde el panel (queda en el registro).
+func Reviewer(c *gin.Context, database *sql.DB) string { return adminReviewer(c, database) }
+
 // adminReviewer — quién aprueba/rechaza (queda en el registro).
 func adminReviewer(c *gin.Context, database *sql.DB) string {
 	if v, ok := c.Get("customer_id"); ok {

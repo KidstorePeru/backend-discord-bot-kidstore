@@ -136,19 +136,16 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			CustomName  string  `json:"custom_name"`
 			CustomPrice float64 `json:"custom_price"`
 			CustomKC    int     `json:"custom_kc"`
-			// Currency: divisa de referencia del cliente (ISO 4217). Solo la usa
-			// dLocal Go, para cobrar en la moneda real del cliente en vez de
-			// forzar PEN/USD. Las demas pasarelas la ignoran.
-			Currency string `json:"currency"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
 			return
 		}
 
-		// Validate gateway
-		if req.Gateway != "mercadopago" && req.Gateway != "paypal" && req.Gateway != "nowpayments" && req.Gateway != "dlocalgo" {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "gateway invalido"})
+		// Única pasarela automática: Mercado Pago (acepta tarjetas de Perú y
+		// del extranjero). dLocal Go, PayPal y NOWPayments ya no crean pagos.
+		if req.Gateway != "mercadopago" {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "por ahora solo aceptamos pagos automáticos con Mercado Pago"})
 			return
 		}
 
@@ -195,18 +192,12 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			kcAmount = product.KCAmount
 		}
 
-		// Antes esto siempre usaba defaultUSDRate (un valor fijo, pensado
-		// como respaldo para cuando la API de tasas no responde) para TODOS
-		// los pagos en USD, mientras que dLocal Go sí usaba la tasa real y
-		// actualizada vía convertPENToCurrency/currentConversionRates — dos
-		// clientes pagando el mismo paquete de KC el mismo día podían pagar
-		// montos distintos en USD según qué pasarela usaran, y esa
-		// diferencia solo crecería con el tiempo si el tipo de cambio
-		// real se aleja de 0.27. Ahora todas las pasarelas en USD (PayPal,
-		// NOWPayments) usan la misma tasa en vivo que dLocal Go; si la API
-		// de tasas falla, convertPENToCurrency ya cae sola al mismo
-		// defaultUSDRate como respaldo (vía fallbackRates en shop.go), así
-		// que el comportamiento de resguardo no cambia.
+		// La comisión de Mercado Pago la paga el cliente ENCIMA del precio: la
+		// tienda recibe exactamente pricePEN (ver fees.go). amount_pen sigue
+		// siendo el precio; fee_amount, lo que se suma por la pasarela.
+		_, fee := gatewayTotal(pricePEN, CurrentPaymentFees().MercadoPago)
+
+		// Equivalente en USD solo como referencia (Mercado Pago cobra en soles).
 		amountUSD, err := convertPENToCurrency(pricePEN, "USD")
 		if err != nil {
 			amountUSD = pricePEN * defaultUSDRate
@@ -222,25 +213,8 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			ProductName: productName,
 			AmountPEN:   pricePEN,
 			AmountUSD:   amountUSD,
+			FeeAmount:   fee,
 			KCAmount:    kcAmount,
-		}
-
-		// dLocal Go cobra en la divisa real del cliente: la conversión se
-		// resuelve ANTES de guardar nada (no hay sesión ni registro que
-		// deshacer si la divisa no se puede convertir).
-		if req.Gateway == "dlocalgo" {
-			currencyCode := req.Currency
-			if currencyCode == "" {
-				currencyCode = "USD"
-			}
-			amountLocal, convErr := convertPENToCurrency(pricePEN, currencyCode)
-			if convErr != nil {
-				slog.Error("Payment currency conversion error", "gateway", req.Gateway, "error", convErr)
-				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error creando pago: " + convErr.Error()})
-				return
-			}
-			tx.CurrencyCode = currencyCode
-			tx.AmountLocal = amountLocal
 		}
 
 		// 1) Registro local DURABLE primero (pending, sin external_id): nunca se
@@ -256,18 +230,7 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		}
 
 		// 2) Sesión externa en la pasarela.
-		var checkoutURL string
-		var externalID string
-		switch req.Gateway {
-		case "mercadopago":
-			checkoutURL, externalID, err = createMercadoPagoPreference(tx)
-		case "paypal":
-			checkoutURL, externalID, err = createPayPalOrder(tx)
-		case "nowpayments":
-			checkoutURL, externalID, err = createNOWPaymentsInvoice(tx)
-		case "dlocalgo":
-			checkoutURL, externalID, err = createDLocalGoPayment(tx)
-		}
+		checkoutURL, externalID, err := createMercadoPagoPreference(tx)
 		if err == nil && (checkoutURL == "" || externalID == "") {
 			err = fmt.Errorf("respuesta incompleta de la pasarela (sin checkout o sin ID)")
 		}
@@ -300,13 +263,16 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		tx.ExternalID = externalID
 
 		db.AddAuditLog(database, &customerID, "PAYMENT_CREATED",
-			fmt.Sprintf("pago %s via %s: %s (S/%.2f)", txID, req.Gateway, productName, pricePEN), c.ClientIP())
+			fmt.Sprintf("pago %s via %s: %s (S/%.2f + comisión S/%.2f)", txID, req.Gateway, productName, pricePEN, fee), c.ClientIP())
 
 		c.JSON(http.StatusOK, gin.H{
 			"success":      true,
 			"payment_id":   txID,
 			"checkout_url": checkoutURL,
 			"external_id":  externalID,
+			"price":        pricePEN,
+			"fee":          fee,
+			"total":        roundCents(pricePEN + fee),
 		})
 	}
 }
@@ -398,7 +364,10 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 // amount_local, ya guardados desde HandlerCreatePayment). Mostrar "S/" para
 // un cobro que en realidad fue en USD o en otra divisa es directamente
 // incorrecto, no solo impreciso.
-func ChargedAmountAndCurrency(gateway string, amountPEN, amountUSD, amountLocal float64, currencyCode string) (amount float64, currency string) {
+//
+// fee es la comisión de la pasarela que pagó el cliente encima del precio
+// (hoy solo Mercado Pago): lo cobrado es precio + comisión.
+func ChargedAmountAndCurrency(gateway string, amountPEN, amountUSD, amountLocal float64, currencyCode string, fee float64) (amount float64, currency string) {
 	switch gateway {
 	case "paypal", "nowpayments":
 		return amountUSD, "USD"
@@ -408,7 +377,7 @@ func ChargedAmountAndCurrency(gateway string, amountPEN, amountUSD, amountLocal 
 		}
 		return amountUSD, "USD"
 	default: // mercadopago, manual (yape/plin/transferencia) — siempre en soles
-		return amountPEN, "PEN"
+		return roundCents(amountPEN + fee), "PEN"
 	}
 }
 
@@ -446,7 +415,7 @@ func HandlerPaymentVoucher(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error obteniendo cliente"})
 			return
 		}
-		chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
+		chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode, tx.FeeAmount)
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"voucher": gin.H{
@@ -510,7 +479,7 @@ func HandlerRechargeVoucher(database *sql.DB) gin.HandlerFunc {
 		if r.PaymentTransactionID != nil {
 			tx, txErr := db.GetPaymentTransaction(database, *r.PaymentTransactionID)
 			if txErr == nil && tx.CustomerID == customerID {
-				chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
+				chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode, tx.FeeAmount)
 				c.JSON(http.StatusOK, gin.H{
 					"success": true,
 					"voucher": gin.H{
@@ -713,13 +682,24 @@ func createMercadoPagoPreference(tx db.PaymentTransactionInput) (string, string,
 		return "", "", fmt.Errorf("MercadoPago not configured")
 	}
 
-	payload := map[string]interface{}{
-		"items": []map[string]interface{}{{
-			"title":       tx.ProductName,
+	// El paquete y la comisión van como dos líneas: el cliente ve el mismo
+	// desglose que en la web antes de pagar.
+	items := []map[string]interface{}{{
+		"title":       tx.ProductName,
+		"quantity":    1,
+		"unit_price":  tx.AmountPEN,
+		"currency_id": "PEN",
+	}}
+	if tx.FeeAmount > 0 {
+		items = append(items, map[string]interface{}{
+			"title":       "Comisión de Mercado Pago",
 			"quantity":    1,
-			"unit_price":  tx.AmountPEN,
+			"unit_price":  tx.FeeAmount,
 			"currency_id": "PEN",
-		}},
+		})
+	}
+	payload := map[string]interface{}{
+		"items":              items,
 		"external_reference": tx.ID.String(),
 	}
 	isLocal := strings.Contains(paymentCfg.FrontendURL, "localhost")
@@ -846,68 +826,6 @@ func getPayPalAccessToken() (string, error) {
 		return "", fmt.Errorf("failed to get PayPal token")
 	}
 	return result.AccessToken, nil
-}
-
-func createPayPalOrder(tx db.PaymentTransactionInput) (string, string, error) {
-	token, err := getPayPalAccessToken()
-	if err != nil {
-		return "", "", err
-	}
-
-	baseURL := "https://api-m.sandbox.paypal.com"
-	if paymentCfg.PayPalMode == "live" {
-		baseURL = "https://api-m.paypal.com"
-	}
-
-	payload := map[string]interface{}{
-		"intent": "CAPTURE",
-		"purchase_units": []map[string]interface{}{{
-			"reference_id": tx.ID.String(),
-			"description":  tx.ProductName,
-			"amount": map[string]interface{}{
-				"currency_code": "USD",
-				"value":         fmt.Sprintf("%.2f", tx.AmountUSD),
-			},
-		}},
-		"application_context": map[string]interface{}{
-			"return_url": fmt.Sprintf("%s/payment/return?id=%s&status=success&gateway=paypal", paymentCfg.FrontendURL, tx.ID),
-			"cancel_url": fmt.Sprintf("%s/payment/return?id=%s&status=failure", paymentCfg.FrontendURL, tx.ID),
-		},
-	}
-
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", baseURL+"/v2/checkout/orders", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("PayPal request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 201 {
-		return "", "", fmt.Errorf("PayPal error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		ID    string `json:"id"`
-		Links []struct {
-			Href string `json:"href"`
-			Rel  string `json:"rel"`
-		} `json:"links"`
-	}
-	json.Unmarshal(respBody, &result)
-
-	var approveURL string
-	for _, link := range result.Links {
-		if link.Rel == "approve" {
-			approveURL = link.Href
-			break
-		}
-	}
-	return approveURL, result.ID, nil
 }
 
 // payPalOrderDetails junta todo lo que hace falta para decidir con
@@ -1104,55 +1022,10 @@ func nowPaymentsStatus(paymentID int64) (status string, orderID string, err erro
 	return result.PaymentStatus, result.OrderID, nil
 }
 
-// ==================== NOWPAYMENTS ====================
-
-func createNOWPaymentsInvoice(tx db.PaymentTransactionInput) (string, string, error) {
-	if paymentCfg.NOWPaymentsAPIKey == "" {
-		return "", "", fmt.Errorf("NOWPayments not configured")
-	}
-
-	payload := map[string]interface{}{
-		"price_amount":   tx.AmountUSD,
-		"price_currency": "usd",
-		"order_id":       tx.ID.String(),
-		"order_description": tx.ProductName,
-		"ipn_callback_url":  fmt.Sprintf("%s/store/webhook/nowpayments", paymentCfg.BackendURL),
-		"success_url":       fmt.Sprintf("%s/payment/return?id=%s&status=success", paymentCfg.FrontendURL, tx.ID),
-		"cancel_url":        fmt.Sprintf("%s/payment/return?id=%s&status=failure", paymentCfg.FrontendURL, tx.ID),
-	}
-
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", "https://api.nowpayments.io/v1/invoice", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", paymentCfg.NOWPaymentsAPIKey)
-
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("NOWPayments request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return "", "", fmt.Errorf("NOWPayments error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		ID         string `json:"id"`
-		InvoiceURL string `json:"invoice_url"`
-	}
-	json.Unmarshal(respBody, &result)
-
-	if result.InvoiceURL == "" {
-		return "", "", fmt.Errorf("NOWPayments no invoice_url: %s", string(respBody))
-	}
-
-	return result.InvoiceURL, fmt.Sprintf("%v", result.ID), nil
-}
-
 // ==================== DLOCAL GO ====================
-// Pasarela para clientes fuera de Peru — cobra tarjetas internacionales y
-// metodos locales en la divisa real del cliente (no solo PEN/USD).
+// Ya no se crean pagos nuevos con dLocal Go, PayPal ni NOWPayments (solo
+// Mercado Pago); se conserva la consulta de estado y los webhooks para que los
+// pagos antiguos que sigan pendientes se concilien y acrediten igual.
 // Docs: https://docs.dlocalgo.com/integration-api/welcome-to-dlocal-go-api
 
 func dlocalGoBaseURL() string {
@@ -1180,51 +1053,6 @@ func convertPENToCurrency(pricePEN float64, currencyCode string) (float64, error
 
 func roundCents(n float64) float64 {
 	return float64(int64(n*100+0.5)) / 100
-}
-
-func createDLocalGoPayment(tx db.PaymentTransactionInput) (string, string, error) {
-	if paymentCfg.DLocalGoAPIKey == "" || paymentCfg.DLocalGoSecretKey == "" {
-		return "", "", fmt.Errorf("dLocal Go aún no está configurado")
-	}
-
-	payload := map[string]interface{}{
-		"amount":            tx.AmountLocal,
-		"currency":          tx.CurrencyCode,
-		"order_id":          tx.ID.String(),
-		"description":       tx.ProductName,
-		"notification_url":  fmt.Sprintf("%s/store/webhook/dlocalgo", paymentCfg.BackendURL),
-		"success_url":       fmt.Sprintf("%s/payment/return?id=%s&status=success", paymentCfg.FrontendURL, tx.ID),
-		"back_url":          fmt.Sprintf("%s/payment/return?id=%s&status=failure", paymentCfg.FrontendURL, tx.ID),
-	}
-
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", dlocalGoBaseURL()+"/v1/payments", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s:%s", paymentCfg.DLocalGoAPIKey, paymentCfg.DLocalGoSecretKey))
-
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("dLocal Go request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return "", "", fmt.Errorf("dLocal Go error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		ID          string `json:"id"`
-		RedirectURL string `json:"redirect_url"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", "", fmt.Errorf("dLocal Go: respuesta inesperada: %s", string(respBody))
-	}
-	if result.RedirectURL == "" {
-		return "", "", fmt.Errorf("dLocal Go no devolvió redirect_url: %s", string(respBody))
-	}
-
-	return result.RedirectURL, result.ID, nil
 }
 
 // dlocalGoPaymentStatus consulta el estado real de un pago — se usa tras

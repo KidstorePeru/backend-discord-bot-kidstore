@@ -336,6 +336,19 @@ func CreateTables(db *sql.DB) error {
 				ALTER TABLE payment_transactions ADD COLUMN amount_local NUMERIC(14,2);
 			END IF;
 		END $$`,
+		// fee_amount: comisión de la pasarela que pagó el cliente ENCIMA del
+		// precio (amount_pen sigue siendo el precio, lo que debe recibir la
+		// tienda). net_received: lo que la pasarela depositó de verdad, para
+		// detectar si la comisión real fue mayor a la configurada.
+		`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS fee_amount NUMERIC(12,2) NOT NULL DEFAULT 0`,
+		`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS net_received NUMERIC(12,2)`,
+		// Ajustes de la tienda editables desde el panel (comisiones, etc.).
+		`CREATE TABLE IF NOT EXISTS app_settings (
+			key TEXT PRIMARY KEY,
+			value JSONB NOT NULL,
+			updated_by TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+		)`,
 		// Evita repetir el aviso de "ya cumpliste 48h de amistad" para el mismo par cliente-bot
 		`CREATE TABLE IF NOT EXISTS friendship_48h_notified (
 			customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
@@ -2140,6 +2153,7 @@ type PaymentTransactionInput struct {
 	AmountUSD    float64
 	CurrencyCode string  // divisa real cobrada por dLocal Go (vacio para las demas pasarelas)
 	AmountLocal  float64 // monto en CurrencyCode
+	FeeAmount    float64 // comisión de la pasarela que paga el cliente (en la divisa cobrada)
 	KCAmount     int
 	ExternalID   string
 }
@@ -2150,9 +2164,9 @@ func CreatePaymentTransaction(db *sql.DB, tx PaymentTransactionInput) error {
 		currencyCode = &tx.CurrencyCode
 	}
 	_, err := db.Exec(`
-		INSERT INTO payment_transactions (id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, currency_code, amount_local, kc_amount, external_id, status, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',NOW(),NOW())`,
-		tx.ID, tx.CustomerID, tx.Gateway, tx.PaymentType, tx.ProductID, tx.ProductName, tx.AmountPEN, tx.AmountUSD, currencyCode, tx.AmountLocal, tx.KCAmount, tx.ExternalID)
+		INSERT INTO payment_transactions (id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, currency_code, amount_local, fee_amount, kc_amount, external_id, status, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',NOW(),NOW())`,
+		tx.ID, tx.CustomerID, tx.Gateway, tx.PaymentType, tx.ProductID, tx.ProductName, tx.AmountPEN, tx.AmountUSD, currencyCode, tx.AmountLocal, tx.FeeAmount, tx.KCAmount, tx.ExternalID)
 	return err
 }
 
@@ -2216,9 +2230,9 @@ func GetPaymentTransaction(db *sql.DB, id uuid.UUID) (types.PaymentTransaction, 
 	var t types.PaymentTransaction
 	var currencyCode sql.NullString
 	err := db.QueryRow(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, COALESCE(external_id,''), COALESCE(provider_payment_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), fee_amount, net_received, kc_amount, COALESCE(external_id,''), COALESCE(provider_payment_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions WHERE id=$1`, id).
-		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.KCAmount, &t.ExternalID, &t.ProviderPaymentID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
+		Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.FeeAmount, &t.NetReceived, &t.KCAmount, &t.ExternalID, &t.ProviderPaymentID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt)
 	t.CurrencyCode = currencyCode.String
 	return t, err
 }
@@ -2278,11 +2292,11 @@ func CreditPaymentOnce(db *sql.DB, id uuid.UUID) (credited bool, ptx types.Payme
 	var kcCreditedAt sql.NullTime
 	err = sqlTx.QueryRow(`
 		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd,
-		       COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, COALESCE(external_id,''),
+		       COALESCE(currency_code,''), COALESCE(amount_local,0), fee_amount, kc_amount, COALESCE(external_id,''),
 		       status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at, kc_credited_at
 		FROM payment_transactions WHERE id=$1 FOR UPDATE`, id).
 		Scan(&ptx.ID, &ptx.CustomerID, &ptx.Gateway, &ptx.PaymentType, &ptx.ProductID, &ptx.ProductName,
-			&ptx.AmountPEN, &ptx.AmountUSD, &currencyCode, &ptx.AmountLocal, &ptx.KCAmount, &ptx.ExternalID,
+			&ptx.AmountPEN, &ptx.AmountUSD, &currencyCode, &ptx.AmountLocal, &ptx.FeeAmount, &ptx.KCAmount, &ptx.ExternalID,
 			&ptx.Status, &ptx.ActivationCode, &ptx.AutobuyerTaskID, &ptx.CreatedAt, &ptx.UpdatedAt, &kcCreditedAt)
 	if err != nil {
 		return false, ptx, fmt.Errorf("transacción no encontrada: %w", err)
@@ -2767,7 +2781,7 @@ func GetAllPaymentTransactions(db *sql.DB, page, limit int, status string) ([]ty
 	limitPos := fmt.Sprintf("$%d", len(args)-1)
 	offsetPos := fmt.Sprintf("$%d", len(args))
 	rows, err := db.Query(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0), fee_amount, net_received, kc_amount, COALESCE(external_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions `+where+` ORDER BY created_at DESC LIMIT `+limitPos+` OFFSET `+offsetPos, args...)
 	if err != nil { return nil, 0, err }
 	defer rows.Close()
@@ -2775,7 +2789,7 @@ func GetAllPaymentTransactions(db *sql.DB, page, limit int, status string) ([]ty
 	for rows.Next() {
 		var t types.PaymentTransaction
 		var currencyCode sql.NullString
-		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &currencyCode, &t.AmountLocal, &t.FeeAmount, &t.NetReceived, &t.KCAmount, &t.ExternalID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		t.CurrencyCode = currencyCode.String
@@ -2821,13 +2835,13 @@ func GetRechargeHistoryByCustomer(db *sql.DB, customerID uuid.UUID, page, limit 
 			SELECT 'kc' AS kind, id, amount_kc, amount_soles, method,
 			       ''::text AS gateway, ''::text AS payment_type, ''::text AS product_name,
 			       0::numeric AS amount_pen, 0::numeric AS amount_usd, ''::text AS currency_code, 0::numeric AS amount_local,
-			       ''::text AS status, created_at
+			       0::numeric AS fee_amount, ''::text AS status, created_at
 			FROM kc_recharges WHERE customer_id=$1 AND payment_transaction_id IS NULL
 			UNION ALL
 			SELECT 'pay' AS kind, id, kc_amount, NULL::numeric AS amount_soles, ''::text AS method,
 			       gateway, payment_type, product_name,
 			       amount_pen, amount_usd, COALESCE(currency_code,''), COALESCE(amount_local,0),
-			       status, created_at
+			       fee_amount, status, created_at
 			FROM payment_transactions WHERE customer_id=$1 AND payment_type='kc_recharge'
 		) combined
 		ORDER BY created_at DESC
@@ -2842,7 +2856,7 @@ func GetRechargeHistoryByCustomer(db *sql.DB, customerID uuid.UUID, page, limit 
 		if err := rows.Scan(&it.Kind, &it.ID, &it.AmountKC, &amountSoles, &it.Method,
 			&it.Gateway, &it.PaymentType, &it.ProductName,
 			&it.AmountPEN, &it.AmountUSD, &it.CurrencyCode, &it.AmountLocal,
-			&it.Status, &it.CreatedAt); err != nil {
+			&it.FeeAmount, &it.Status, &it.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		if amountSoles.Valid {
@@ -3083,6 +3097,12 @@ func AdminUpdatePaymentStatus(db *sql.DB, id uuid.UUID, status string) error {
 
 func DeletePayment(db *sql.DB, id uuid.UUID) error {
 	_, err := db.Exec(`DELETE FROM payment_transactions WHERE id=$1`, id)
+	return err
+}
+
+// SetPaymentNetReceived guarda lo que la pasarela depositó de verdad por el pago.
+func SetPaymentNetReceived(db *sql.DB, id uuid.UUID, net float64) error {
+	_, err := db.Exec(`UPDATE payment_transactions SET net_received=$2 WHERE id=$1`, id, net)
 	return err
 }
 

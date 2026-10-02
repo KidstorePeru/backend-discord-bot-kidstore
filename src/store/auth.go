@@ -702,7 +702,7 @@ func HandlerGetMyRecharges(database *sql.DB) gin.HandlerFunc {
 		itemsOut := make([]gin.H, 0, len(items))
 		for _, it := range items {
 			if it.Kind == "pay" {
-				chargedAmount, chargedCurrency := ChargedAmountAndCurrency(it.Gateway, it.AmountPEN, it.AmountUSD, it.AmountLocal, it.CurrencyCode)
+				chargedAmount, chargedCurrency := ChargedAmountAndCurrency(it.Gateway, it.AmountPEN, it.AmountUSD, it.AmountLocal, it.CurrencyCode, it.FeeAmount)
 				itemsOut = append(itemsOut, gin.H{
 					"kind": "pay", "id": it.ID, "gateway": it.Gateway, "payment_type": it.PaymentType,
 					"product_name": it.ProductName, "amount_pen": it.AmountPEN,

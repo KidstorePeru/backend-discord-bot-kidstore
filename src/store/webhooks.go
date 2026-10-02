@@ -48,6 +48,10 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 		return nil // ya se había acreditado antes (o alguien más lo está procesando ahora) — idempotente
 	}
 	slog.Info("KC credited via payment", "customer", tx.CustomerID, "kc", tx.KCAmount, "gateway", tx.Gateway)
+	if tx.Gateway == "mercadopago" {
+		// ¿Mercado Pago depositó el precio completo? (ver fees.go)
+		go safe.Run("verifyNetReceived", func() { verifyNetReceived(database, tx) })
+	}
 
 	// Send payment approved email notification — chargedAmount/chargedCurrency
 	// son el monto y la divisa REALMENTE cobrados (misma función y mismos
@@ -58,7 +62,7 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 	if customer, err := db.GetCustomerByID(database, tx.CustomerID); err == nil {
 		if customer.Email != nil && *customer.Email != "" {
 			voucherURL := fmt.Sprintf("https://www.kidstoreperu.net/dashboard/comprobantes/pago/%s", tx.ID)
-			chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
+			chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode, tx.FeeAmount)
 			go SendPaymentApprovedEmail(smtpConfig, *customer.Email, tx.ProductName, chargedAmount, chargedCurrency, tx.KCAmount, tx.Gateway, voucherURL, "es")
 		}
 		if tx.PaymentType == "kc_recharge" && tx.KCAmount > 0 {

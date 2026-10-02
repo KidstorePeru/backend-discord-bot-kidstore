@@ -15,19 +15,21 @@ func TestChargedAmountAndCurrency(t *testing.T) {
 		gateway                       string
 		amountPEN, amountUSD, amountLocal float64
 		currencyCode                  string
+		fee                           float64
 		wantAmount                    float64
 		wantCurrency                  string
 	}{
-		{"mercadopago siempre en soles", "mercadopago", 100, 27, 0, "", 100, "PEN"},
-		{"manual (yape/plin/transferencia) siempre en soles", "manual", 50, 13.5, 0, "", 50, "PEN"},
-		{"paypal cobra en USD, no en soles", "paypal", 100, 27, 0, "", 27, "USD"},
-		{"nowpayments cobra en USD, no en soles", "nowpayments", 100, 27, 0, "", 27, "USD"},
-		{"dlocalgo cobra en la divisa real del cliente", "dlocalgo", 100, 27, 30.5, "MXN", 30.5, "MXN"},
-		{"dlocalgo sin currency_code (registro antiguo) cae a USD, no inventa PEN", "dlocalgo", 100, 27, 0, "", 27, "USD"},
+		{"mercadopago siempre en soles", "mercadopago", 100, 27, 0, "", 0, 100, "PEN"},
+		{"mercadopago con comisión: el cliente pagó precio + comisión", "mercadopago", 31.20, 8.4, 0, "", 1.55, 32.75, "PEN"},
+		{"manual (yape/plin/transferencia) siempre en soles", "manual", 50, 13.5, 0, "", 0, 50, "PEN"},
+		{"paypal cobra en USD, no en soles", "paypal", 100, 27, 0, "", 0, 27, "USD"},
+		{"nowpayments cobra en USD, no en soles", "nowpayments", 100, 27, 0, "", 0, 27, "USD"},
+		{"dlocalgo cobra en la divisa real del cliente", "dlocalgo", 100, 27, 30.5, "MXN", 0, 30.5, "MXN"},
+		{"dlocalgo sin currency_code (registro antiguo) cae a USD, no inventa PEN", "dlocalgo", 100, 27, 0, "", 0, 27, "USD"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotAmount, gotCurrency := ChargedAmountAndCurrency(c.gateway, c.amountPEN, c.amountUSD, c.amountLocal, c.currencyCode)
+			gotAmount, gotCurrency := ChargedAmountAndCurrency(c.gateway, c.amountPEN, c.amountUSD, c.amountLocal, c.currencyCode, c.fee)
 			if gotAmount != c.wantAmount || gotCurrency != c.wantCurrency {
 				t.Errorf("ChargedAmountAndCurrency(%q, ...) = (%v, %v), want (%v, %v)",
 					c.gateway, gotAmount, gotCurrency, c.wantAmount, c.wantCurrency)

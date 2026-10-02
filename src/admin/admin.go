@@ -517,11 +517,12 @@ func HandlerGetAllPayments(database *sql.DB) gin.HandlerFunc {
 		// real del cliente (ver ChargedAmountAndCurrency en store/payments.go).
 		out := make([]gin.H, 0, len(payments))
 		for _, p := range payments {
-			chargedAmount, chargedCurrency := store.ChargedAmountAndCurrency(p.Gateway, p.AmountPEN, p.AmountUSD, p.AmountLocal, p.CurrencyCode)
+			chargedAmount, chargedCurrency := store.ChargedAmountAndCurrency(p.Gateway, p.AmountPEN, p.AmountUSD, p.AmountLocal, p.CurrencyCode, p.FeeAmount)
 			out = append(out, gin.H{
 				"id": p.ID, "customer_id": p.CustomerID, "gateway": p.Gateway, "payment_type": p.PaymentType,
 				"product_id": p.ProductID, "product_name": p.ProductName, "amount_pen": p.AmountPEN,
 				"charged_amount": chargedAmount, "charged_currency": chargedCurrency,
+				"fee_amount": p.FeeAmount, "net_received": p.NetReceived,
 				"kc_amount": p.KCAmount, "external_id": p.ExternalID, "status": p.Status,
 				"activation_code": p.ActivationCode, "autobuyer_task_id": p.AutobuyerTaskID,
 				"created_at": p.CreatedAt, "updated_at": p.UpdatedAt,

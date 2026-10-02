@@ -574,7 +574,7 @@ func TestComprobanteDeRecargaVinculada_UsaImporteYDivisaReales(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPaymentTransaction: %v", err)
 	}
-	chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode)
+	chargedAmount, chargedCurrency := ChargedAmountAndCurrency(tx.Gateway, tx.AmountPEN, tx.AmountUSD, tx.AmountLocal, tx.CurrencyCode, tx.FeeAmount)
 	if chargedCurrency != "MXN" {
 		t.Errorf("la divisa real cobrada era MXN, obtuve %q — nunca debería inventarse ni asumirse PEN", chargedCurrency)
 	}

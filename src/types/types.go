@@ -256,6 +256,7 @@ type RechargeHistoryItem struct {
 	AmountUSD    float64   `json:"amount_usd,omitempty"`
 	CurrencyCode string    `json:"currency_code,omitempty"`
 	AmountLocal  float64   `json:"amount_local,omitempty"`
+	FeeAmount    float64   `json:"fee_amount,omitempty"` // comisión de la pasarela pagada por el cliente
 	Status       string    `json:"status,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 }
@@ -549,6 +550,11 @@ type PaymentTransaction struct {
 	AmountUSD   float64   `json:"amount_usd"`
 	CurrencyCode string   `json:"currency_code,omitempty"` // divisa real cobrada por dLocal Go (si no es PEN/USD)
 	AmountLocal  float64  `json:"amount_local,omitempty"`  // monto en CurrencyCode
+	// FeeAmount: comisión de la pasarela que el cliente pagó ENCIMA del precio
+	// (en la divisa cobrada). AmountPEN sigue siendo el precio que recibe la tienda.
+	FeeAmount float64 `json:"fee_amount,omitempty"`
+	// NetReceived: lo que la pasarela depositó de verdad (nil si aún no se sabe).
+	NetReceived *float64 `json:"net_received,omitempty"`
 	KCAmount    int       `json:"kc_amount"`
 	ExternalID      string    `json:"external_id"`
 	// ProviderPaymentID: identificador REAL del pago en la pasarela, cuando es

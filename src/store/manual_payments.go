@@ -84,19 +84,16 @@ func manualUploadsEnabled() bool {
 
 // ==================== PRECIO (lo calcula SIEMPRE el servidor) ====================
 
-type manualMethod struct {
-	Currency   string
-	Commission float64 // sobre el precio en la divisa (Bizum 1.5%)
-}
-
-// Deben coincidir con METHODS en Recharge.tsx.
-var manualMethods = map[string]manualMethod{
-	"yape":      {Currency: "PEN"},
-	"plin":      {Currency: "PEN"},
-	"bcp":       {Currency: "PEN"},
-	"interbank": {Currency: "PEN"},
-	"bbva":      {Currency: "PEN"},
-	"bizum":     {Currency: "EUR", Commission: 0.015},
+// Deben coincidir con METHODS en Recharge.tsx. Los métodos de Perú no tienen
+// recargo (pago directo); Bizum se cobra en euros con el recargo que cubre la
+// remesa a Perú (ver bizumTotal en fees.go).
+var manualMethods = map[string]string{
+	"yape":      "PEN",
+	"plin":      "PEN",
+	"bcp":       "PEN",
+	"interbank": "PEN",
+	"bbva":      "PEN",
+	"bizum":     "EUR",
 }
 
 type manualQuote struct {
@@ -111,13 +108,13 @@ type manualQuote struct {
 var errManualInvalid = errors.New("paquete o método inválido")
 
 // quoteManual calcula el monto con las mismas reglas que la página de
-// recarga (mismo precio que el pago automático; Bizum en euros + 1.5%).
+// recarga (precio del paquete; Bizum en euros con el recargo de la remesa).
 func quoteManual(packageID string, customKC int, method string, eurRate float64) (manualQuote, error) {
-	m, ok := manualMethods[method]
+	currency, ok := manualMethods[method]
 	if !ok {
 		return manualQuote{}, errManualInvalid
 	}
-	q := manualQuote{PackageID: packageID, Currency: m.Currency}
+	q := manualQuote{PackageID: packageID, Currency: currency}
 	if packageID == "custom" {
 		if customKC < minCustomKC || customKC > maxCustomKC {
 			return manualQuote{}, errManualInvalid
@@ -135,19 +132,14 @@ func quoteManual(packageID string, customKC int, method string, eurRate float64)
 	if q.AmountPEN <= 0 {
 		return manualQuote{}, errManualInvalid
 	}
-	amount := q.AmountPEN
-	if m.Currency == "EUR" {
+	if currency == "EUR" {
 		if eurRate <= 0 {
 			return manualQuote{}, errManualInvalid
 		}
-		amount = q.AmountPEN * eurRate
+		q.Amount, _ = bizumTotal(q.AmountPEN, eurRate, CurrentPaymentFees().Bizum)
+		return q, nil
 	}
-	if m.Commission > 0 {
-		amount = math.Ceil(amount*(1+m.Commission)*100-1e-9) / 100
-	} else {
-		amount = math.Round(amount*100) / 100
-	}
-	q.Amount = amount
+	q.Amount = math.Round(q.AmountPEN*100) / 100
 	return q, nil
 }
 

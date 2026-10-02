@@ -318,6 +318,7 @@ func main() {
 	router.GET("/store/shop/bestsellers", store.HandlerGetBestSellers(database))
 	router.GET("/store/bots-status",     store.HandlerBotsStatus(database))
 	router.GET("/store/exchange-rates",  store.HandlerGetExchangeRates)
+	router.GET("/store/payment-fees",    store.HandlerGetPaymentFees)
 	router.GET("/store/stats",           store.HandlerStoreStats(database, cfg.HistoricOrdersDelivered))
 	router.GET("/store/reviews",         store.HandlerPublicReviews(database))
 	// Enlace firmado (24 h) para ver un comprobante desde el aviso de Discord.
@@ -401,6 +402,8 @@ func main() {
 		adminGroup.POST("/webhook-events/:id/retry",   admin.HandlerRetryWebhookEvent(database))
 		adminGroup.GET("/payments",         admin.HandlerGetAllPayments(database))
 		adminGroup.GET("/bot-schedule",     admin.HandlerGetBotSchedule(database))
+		adminGroup.GET("/payment-fees",     store.HandlerAdminGetPaymentFees)
+		adminGroup.PUT("/payment-fees",     store.HandlerAdminUpdatePaymentFees(database, func(c *gin.Context) string { return admin.Reviewer(c, database) }))
 		adminGroup.PUT("/bot-schedule",     admin.HandlerUpdateBotSchedule(database))
 		adminGroup.GET("/bots",             fortnite.HandlerGetBotAccounts(database))
 		adminGroup.POST("/bots/connect",    fortnite.HandlerConnectBotAccount(database))
@@ -523,6 +526,7 @@ func main() {
 
 	startDatabaseBackups(cfg, database)
 	startManualPayments(cfg, database)
+	store.LoadPaymentFees(database) // comisiones guardadas desde el panel
 
 	port := cfg.Port
 	if port == "" { port = "8081" }
