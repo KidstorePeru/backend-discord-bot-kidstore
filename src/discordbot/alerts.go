@@ -442,21 +442,21 @@ func AlertNewReview(rating int, itemName, displayName, comment string) {
 	)
 }
 
-// AlertFeeShortfall avisa que en un pago con Mercado Pago la tienda recibió
-// MENOS que el precio: la comisión real es mayor que la configurada en el
-// panel. Se avisa una vez y no se repite hasta que un pago vuelva a cubrir el
-// precio completo (ClearFeeShortfall).
-func AlertFeeShortfall(product string, price, charged, net float64) {
-	if !shouldAlert("fee_shortfall_mercadopago") {
+// AlertFeeShortfall avisa que en un pago con Mercado Pago o PayPal la tienda
+// recibió MENOS que el precio: la comisión real es mayor que la configurada en
+// el panel. Se avisa una vez por pasarela y no se repite hasta que un pago
+// vuelva a cubrir el precio completo (ClearFeeShortfall).
+func AlertFeeShortfall(gateway, symbol, product string, price, charged, net float64) {
+	if !shouldAlert("fee_shortfall_" + gateway) {
 		return
 	}
 	sendAdminAlert("💸 Recibiste menos que el precio",
-		fmt.Sprintf("En un pago de **%s** el cliente pagó **S/ %.2f** y Mercado Pago depositó **S/ %.2f**, pero el precio es **S/ %.2f** (faltaron **S/ %.2f**).\n\n"+
-			"La comisión real de tu cuenta es mayor que la configurada: revisa la tarifa en Mercado Pago y actualízala en el panel → **Pagos → Comisiones**. "+
+		fmt.Sprintf("En un pago de **%s** por %s, el cliente pagó **%s%.2f** y %s depositó **%s%.2f**, pero el precio es **%s%.2f** (faltaron **%s%.2f**).\n\n"+
+			"La comisión real de tu cuenta es mayor que la configurada: revisa la tarifa en %s y actualízala en el panel → **Pagos → Comisiones**. "+
 			"No se volverá a avisar hasta que un pago vuelva a cubrir el precio completo.",
-			product, charged, net, price, price-net),
+			product, gateway, symbol, charged, gateway, symbol, net, symbol, price, symbol, price-net, gateway),
 		colorAlert)
 }
 
-// ClearFeeShortfall: un pago volvió a cubrir el precio completo.
-func ClearFeeShortfall() { clearAlert("fee_shortfall_mercadopago") }
+// ClearFeeShortfall: un pago de esa pasarela volvió a cubrir el precio completo.
+func ClearFeeShortfall(gateway string) { clearAlert("fee_shortfall_" + gateway) }

@@ -520,7 +520,7 @@ func HandlerGetAllPayments(database *sql.DB) gin.HandlerFunc {
 			chargedAmount, chargedCurrency := store.ChargedAmountAndCurrency(p.Gateway, p.AmountPEN, p.AmountUSD, p.AmountLocal, p.CurrencyCode, p.FeeAmount)
 			out = append(out, gin.H{
 				"id": p.ID, "customer_id": p.CustomerID, "gateway": p.Gateway, "payment_type": p.PaymentType,
-				"product_id": p.ProductID, "product_name": p.ProductName, "amount_pen": p.AmountPEN,
+				"product_id": p.ProductID, "product_name": p.ProductName, "amount_pen": p.AmountPEN, "amount_usd": p.AmountUSD,
 				"charged_amount": chargedAmount, "charged_currency": chargedCurrency,
 				"fee_amount": p.FeeAmount, "net_received": p.NetReceived,
 				"kc_amount": p.KCAmount, "external_id": p.ExternalID, "status": p.Status,

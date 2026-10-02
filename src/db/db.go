@@ -2699,7 +2699,7 @@ func ConsumeOAuthLoginCode(db *sql.DB, code string) (payload string, ok bool) {
 // status, sin necesitar ningún touch aparte.
 func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
 	rows, err := db.Query(`
-		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, kc_amount, COALESCE(external_id,''), COALESCE(provider_payment_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
+		SELECT id, customer_id, gateway, payment_type, product_id, product_name, amount_pen, amount_usd, fee_amount, kc_amount, COALESCE(external_id,''), COALESCE(provider_payment_id,''), status, COALESCE(activation_code,''), COALESCE(autobuyer_task_id,''), created_at, updated_at
 		FROM payment_transactions
 		WHERE status IN ('pending','review') AND COALESCE(external_id,'') != '' AND created_at < NOW() - INTERVAL '2 minutes'
 		ORDER BY updated_at ASC LIMIT 100`)
@@ -2708,7 +2708,7 @@ func GetStalePendingPayments(db *sql.DB) ([]types.PaymentTransaction, error) {
 	var txs []types.PaymentTransaction
 	for rows.Next() {
 		var t types.PaymentTransaction
-		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.KCAmount, &t.ExternalID, &t.ProviderPaymentID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.CustomerID, &t.Gateway, &t.PaymentType, &t.ProductID, &t.ProductName, &t.AmountPEN, &t.AmountUSD, &t.FeeAmount, &t.KCAmount, &t.ExternalID, &t.ProviderPaymentID, &t.Status, &t.ActivationCode, &t.AutobuyerTaskID, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		txs = append(txs, t)

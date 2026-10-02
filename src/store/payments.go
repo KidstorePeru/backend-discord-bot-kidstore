@@ -142,10 +142,11 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Única pasarela automática: Mercado Pago (acepta tarjetas de Perú y
-		// del extranjero). dLocal Go, PayPal y NOWPayments ya no crean pagos.
-		if req.Gateway != "mercadopago" {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "por ahora solo aceptamos pagos automáticos con Mercado Pago"})
+		// Pasarelas automáticas: Mercado Pago (tarjetas de Perú y del
+		// extranjero), PayPal y cripto (NOWPayments). dLocal Go ya no crea pagos
+		// nuevos (Mercado Pago cubre las tarjetas internacionales).
+		if req.Gateway != "mercadopago" && req.Gateway != "paypal" && req.Gateway != "nowpayments" {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "pasarela no disponible: usa Mercado Pago, PayPal o cripto"})
 			return
 		}
 
@@ -192,15 +193,28 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 			kcAmount = product.KCAmount
 		}
 
-		// La comisión de Mercado Pago la paga el cliente ENCIMA del precio: la
-		// tienda recibe exactamente pricePEN (ver fees.go). amount_pen sigue
-		// siendo el precio; fee_amount, lo que se suma por la pasarela.
-		_, fee := gatewayTotal(pricePEN, CurrentPaymentFees().MercadoPago)
-
-		// Equivalente en USD solo como referencia (Mercado Pago cobra en soles).
+		// Precio en USD (PayPal y NOWPayments cobran en dólares; para Mercado
+		// Pago es solo una referencia).
 		amountUSD, err := convertPENToCurrency(pricePEN, "USD")
 		if err != nil {
 			amountUSD = pricePEN * defaultUSDRate
+		}
+		amountUSD = roundCents(amountUSD)
+
+		// La comisión de la pasarela la paga el cliente ENCIMA del precio: la
+		// tienda recibe exactamente el precio (ver fees.go). amount_pen y
+		// amount_usd siguen siendo el precio; fee_amount es lo que se suma, en
+		// la divisa en que cobra la pasarela (soles en Mercado Pago, dólares en
+		// PayPal y NOWPayments).
+		fees := CurrentPaymentFees()
+		var fee float64
+		switch req.Gateway {
+		case "mercadopago":
+			_, fee = gatewayTotal(pricePEN, fees.MercadoPago)
+		case "paypal":
+			_, fee = gatewayTotal(amountUSD, fees.PayPal)
+		case "nowpayments":
+			_, fee = gatewayTotal(amountUSD, fees.NOWPayments)
 		}
 
 		txID := uuid.New()
@@ -230,7 +244,15 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		}
 
 		// 2) Sesión externa en la pasarela.
-		checkoutURL, externalID, err := createMercadoPagoPreference(tx)
+		var checkoutURL, externalID string
+		switch req.Gateway {
+		case "mercadopago":
+			checkoutURL, externalID, err = createMercadoPagoPreference(tx)
+		case "paypal":
+			checkoutURL, externalID, err = createPayPalOrder(tx)
+		case "nowpayments":
+			checkoutURL, externalID, err = createNOWPaymentsInvoice(tx)
+		}
 		if err == nil && (checkoutURL == "" || externalID == "") {
 			err = fmt.Errorf("respuesta incompleta de la pasarela (sin checkout o sin ID)")
 		}
@@ -262,17 +284,22 @@ func HandlerCreatePayment(database *sql.DB) gin.HandlerFunc {
 		}
 		tx.ExternalID = externalID
 
+		price, currency := pricePEN, "PEN"
+		if req.Gateway != "mercadopago" {
+			price, currency = amountUSD, "USD"
+		}
 		db.AddAuditLog(database, &customerID, "PAYMENT_CREATED",
-			fmt.Sprintf("pago %s via %s: %s (S/%.2f + comisión S/%.2f)", txID, req.Gateway, productName, pricePEN, fee), c.ClientIP())
+			fmt.Sprintf("pago %s via %s: %s (%s %.2f + comisión %.2f)", txID, req.Gateway, productName, currency, price, fee), c.ClientIP())
 
 		c.JSON(http.StatusOK, gin.H{
 			"success":      true,
 			"payment_id":   txID,
 			"checkout_url": checkoutURL,
 			"external_id":  externalID,
-			"price":        pricePEN,
+			"price":        price,
 			"fee":          fee,
-			"total":        roundCents(pricePEN + fee),
+			"total":        roundCents(price + fee),
+			"currency":     currency,
 		})
 	}
 }
@@ -365,12 +392,15 @@ func HandlerPaymentStatus(database *sql.DB) gin.HandlerFunc {
 // un cobro que en realidad fue en USD o en otra divisa es directamente
 // incorrecto, no solo impreciso.
 //
-// fee es la comisión de la pasarela que pagó el cliente encima del precio
-// (hoy solo Mercado Pago): lo cobrado es precio + comisión.
+// fee es la comisión de la pasarela que pagó el cliente encima del precio, en
+// la divisa cobrada: lo cobrado es precio + comisión.
+// chargedUSD: lo que se le cobra en dólares (PayPal/NOWPayments): precio + comisión.
+func chargedUSD(amountUSD, fee float64) float64 { return roundCents(amountUSD + fee) }
+
 func ChargedAmountAndCurrency(gateway string, amountPEN, amountUSD, amountLocal float64, currencyCode string, fee float64) (amount float64, currency string) {
 	switch gateway {
 	case "paypal", "nowpayments":
-		return amountUSD, "USD"
+		return chargedUSD(amountUSD, fee), "USD"
 	case "dlocalgo":
 		if currencyCode != "" {
 			return amountLocal, currencyCode
@@ -828,6 +858,76 @@ func getPayPalAccessToken() (string, error) {
 	return result.AccessToken, nil
 }
 
+// payPalDescription: el paquete y, si la hay, la comisión de PayPal incluida.
+func payPalDescription(tx db.PaymentTransactionInput) string {
+	if tx.FeeAmount > 0 {
+		return fmt.Sprintf("%s (incluye comisión de PayPal US$%.2f)", tx.ProductName, tx.FeeAmount)
+	}
+	return tx.ProductName
+}
+
+func createPayPalOrder(tx db.PaymentTransactionInput) (string, string, error) {
+	token, err := getPayPalAccessToken()
+	if err != nil {
+		return "", "", err
+	}
+
+	baseURL := "https://api-m.sandbox.paypal.com"
+	if paymentCfg.PayPalMode == "live" {
+		baseURL = "https://api-m.paypal.com"
+	}
+
+	payload := map[string]interface{}{
+		"intent": "CAPTURE",
+		"purchase_units": []map[string]interface{}{{
+			"reference_id": tx.ID.String(),
+			"description":  payPalDescription(tx),
+			"amount": map[string]interface{}{
+				"currency_code": "USD",
+				"value":         fmt.Sprintf("%.2f", chargedUSD(tx.AmountUSD, tx.FeeAmount)),
+			},
+		}},
+		"application_context": map[string]interface{}{
+			"return_url": fmt.Sprintf("%s/payment/return?id=%s&status=success&gateway=paypal", paymentCfg.FrontendURL, tx.ID),
+			"cancel_url": fmt.Sprintf("%s/payment/return?id=%s&status=failure", paymentCfg.FrontendURL, tx.ID),
+		},
+	}
+
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", baseURL+"/v2/checkout/orders", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("PayPal request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 201 {
+		return "", "", fmt.Errorf("PayPal error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		ID    string `json:"id"`
+		Links []struct {
+			Href string `json:"href"`
+			Rel  string `json:"rel"`
+		} `json:"links"`
+	}
+	json.Unmarshal(respBody, &result)
+
+	var approveURL string
+	for _, link := range result.Links {
+		if link.Rel == "approve" {
+			approveURL = link.Href
+			break
+		}
+	}
+	return approveURL, result.ID, nil
+}
+
 // payPalOrderDetails junta todo lo que hace falta para decidir con
 // confianza si una orden de PayPal realmente pagó lo que esperábamos — el
 // status de la orden por sí solo no alcanza: dice si el flujo de checkout
@@ -840,6 +940,7 @@ type payPalOrderDetails struct {
 	AmountValue   string // importe realmente capturado (o, a falta de captura, el autorizado)
 	CurrencyCode  string // divisa del importe de arriba
 	CaptureStatus string // status de la captura más reciente: COMPLETED, DECLINED, PENDING… ("" si aún no hay ninguna)
+	NetAmount     string // lo que PayPal deposita tras su comisión (seller_receivable_breakdown)
 }
 
 // getPayPalOrder consulta el estado real de una orden directamente en la API
@@ -895,6 +996,11 @@ func getPayPalOrder(orderID string) (payPalOrderDetails, error) {
 						Value        string `json:"value"`
 						CurrencyCode string `json:"currency_code"`
 					} `json:"amount"`
+					SellerReceivableBreakdown struct {
+						NetAmount struct {
+							Value string `json:"value"`
+						} `json:"net_amount"`
+					} `json:"seller_receivable_breakdown"`
 				} `json:"captures"`
 			} `json:"payments"`
 		} `json:"purchase_units"`
@@ -917,6 +1023,7 @@ func getPayPalOrder(orderID string) (payPalOrderDetails, error) {
 		// no cuesta nada ser explícitos sobre cuál se usa).
 		cap := pu.Payments.Captures[n-1]
 		details.CaptureStatus = cap.Status
+		details.NetAmount = cap.SellerReceivableBreakdown.NetAmount.Value
 		// El importe de la CAPTURA es lo que PayPal realmente cobró — más
 		// confiable que el importe autorizado en la orden, que es lo único
 		// que queda si todavía no hay ninguna captura.
@@ -1022,10 +1129,60 @@ func nowPaymentsStatus(paymentID int64) (status string, orderID string, err erro
 	return result.PaymentStatus, result.OrderID, nil
 }
 
+// ==================== NOWPAYMENTS ====================
+
+func createNOWPaymentsInvoice(tx db.PaymentTransactionInput) (string, string, error) {
+	if paymentCfg.NOWPaymentsAPIKey == "" {
+		return "", "", fmt.Errorf("NOWPayments not configured")
+	}
+
+	payload := map[string]interface{}{
+		"price_amount":   chargedUSD(tx.AmountUSD, tx.FeeAmount),
+		"price_currency": "usd",
+		// "Fee Paid by User": la comisión de NOWPayments y de la red la paga el
+		// cliente encima del precio (NOWPayments fija el tipo de cambio mientras
+		// paga), así la tienda recibe el monto completo.
+		"is_fee_paid_by_user": true,
+		"order_id":       tx.ID.String(),
+		"order_description": tx.ProductName,
+		"ipn_callback_url":  fmt.Sprintf("%s/store/webhook/nowpayments", paymentCfg.BackendURL),
+		"success_url":       fmt.Sprintf("%s/payment/return?id=%s&status=success", paymentCfg.FrontendURL, tx.ID),
+		"cancel_url":        fmt.Sprintf("%s/payment/return?id=%s&status=failure", paymentCfg.FrontendURL, tx.ID),
+	}
+
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", "https://api.nowpayments.io/v1/invoice", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", paymentCfg.NOWPaymentsAPIKey)
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("NOWPayments request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		return "", "", fmt.Errorf("NOWPayments error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		ID         string `json:"id"`
+		InvoiceURL string `json:"invoice_url"`
+	}
+	json.Unmarshal(respBody, &result)
+
+	if result.InvoiceURL == "" {
+		return "", "", fmt.Errorf("NOWPayments no invoice_url: %s", string(respBody))
+	}
+
+	return result.InvoiceURL, fmt.Sprintf("%v", result.ID), nil
+}
+
 // ==================== DLOCAL GO ====================
-// Ya no se crean pagos nuevos con dLocal Go, PayPal ni NOWPayments (solo
-// Mercado Pago); se conserva la consulta de estado y los webhooks para que los
-// pagos antiguos que sigan pendientes se concilien y acrediten igual.
+// Ya no se crean pagos nuevos con dLocal Go (Mercado Pago cubre las tarjetas
+// internacionales); se conserva la consulta de estado y el webhook para que
+// los pagos antiguos que sigan pendientes se concilien y acrediten igual.
 // Docs: https://docs.dlocalgo.com/integration-api/welcome-to-dlocal-go-api
 
 func dlocalGoBaseURL() string {

@@ -23,8 +23,14 @@ func TestComision_MercadoPago_SiempreQuedaElPrecioExacto(t *testing.T) {
 		t.Errorf("Gamer: total %.2f, comisión %.2f (se esperaba 33.78 y 2.58)", total, fee)
 	}
 
+	// PayPal: Gamer = US$8.42 con 6.9% + US$0.30 → el cliente paga US$9.37.
+	if total, fee := gatewayTotal(8.42, defaultPaymentFees.PayPal); total != 9.37 || fee != 0.95 {
+		t.Errorf("PayPal Gamer: total %.2f, comisión %.2f (se esperaba 9.37 y 0.95)", total, fee)
+	}
+
 	tarifas := []GatewayFee{
 		defaultPaymentFees.MercadoPago,
+		defaultPaymentFees.PayPal,
 		{Percent: 3.29, Fixed: 1, Tax: 18},
 		{Percent: 4.99, Fixed: 1, Tax: 18},
 		{Percent: 3.99, Tax: 18},
@@ -87,6 +93,8 @@ func TestComision_Validacion(t *testing.T) {
 		{MercadoPago: GatewayFee{Percent: 25}},
 		{MercadoPago: GatewayFee{Tax: 50}},
 		{MercadoPago: GatewayFee{Fixed: 100}},
+		{PayPal: GatewayFee{Percent: 30}},
+		{NOWPayments: GatewayFee{Margin: 50}},
 		{Bizum: RemittanceFee{FXMargin: 40}},
 		{Bizum: RemittanceFee{Percent: 99}},
 	}

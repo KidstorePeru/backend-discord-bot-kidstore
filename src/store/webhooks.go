@@ -48,8 +48,8 @@ func processApprovedPayment(database *sql.DB, txID uuid.UUID) error {
 		return nil // ya se había acreditado antes (o alguien más lo está procesando ahora) — idempotente
 	}
 	slog.Info("KC credited via payment", "customer", tx.CustomerID, "kc", tx.KCAmount, "gateway", tx.Gateway)
-	if tx.Gateway == "mercadopago" {
-		// ¿Mercado Pago depositó el precio completo? (ver fees.go)
+	if tx.Gateway == "mercadopago" || tx.Gateway == "paypal" {
+		// ¿La pasarela depositó el precio completo? (ver fees.go)
 		go safe.Run("verifyNetReceived", func() { verifyNetReceived(database, tx) })
 	}
 
@@ -202,7 +202,7 @@ func checkGatewayOutcome(p types.PaymentTransaction) (gatewayOutcome, error) {
 			return gatewayStillPending, err
 		}
 		outcome := classifyPayPalStatus(order.Status)
-		if outcome == gatewayApproved && !payPalOrderMatchesTx(order, p.AmountUSD) {
+		if outcome == gatewayApproved && !payPalOrderMatchesTx(order, chargedUSD(p.AmountUSD, p.FeeAmount)) {
 			// La orden dice COMPLETED, pero la captura real y/o el importe
 			// cobrado no coinciden con lo que esta transacción esperaba —
 			// nunca se acredita a ciegas solo por el status de la orden (ver
@@ -211,7 +211,7 @@ func checkGatewayOutcome(p types.PaymentTransaction) (gatewayOutcome, error) {
 			// captura aún no propagó su status.
 			slog.Warn("PayPal: orden COMPLETED pero no coincide con la transacción, no se acredita",
 				"txID", p.ID, "orderID", p.ExternalID, "orderAmount", order.AmountValue,
-				"orderCurrency", order.CurrencyCode, "captureStatus", order.CaptureStatus, "expectedUSD", p.AmountUSD)
+				"orderCurrency", order.CurrencyCode, "captureStatus", order.CaptureStatus, "expectedUSD", chargedUSD(p.AmountUSD, p.FeeAmount))
 			return gatewayStillPending, nil
 		}
 		return outcome, nil
@@ -695,11 +695,11 @@ func HandlerPayPalWebhook(database *sql.DB) gin.HandlerFunc {
 				outcome = "error: transaction not found"
 				return
 			}
-			if tx.ExternalID != orderID || !payPalOrderMatchesTx(order, tx.AmountUSD) {
+			if tx.ExternalID != orderID || !payPalOrderMatchesTx(order, chargedUSD(tx.AmountUSD, tx.FeeAmount)) {
 				slog.Warn("PayPal webhook: la orden no corresponde a la transacción esperada, no se acredita",
 					"txID", txID, "orderID", orderID, "txExternalID", tx.ExternalID,
 					"orderAmount", order.AmountValue, "orderCurrency", order.CurrencyCode,
-					"captureStatus", order.CaptureStatus, "expectedUSD", tx.AmountUSD)
+					"captureStatus", order.CaptureStatus, "expectedUSD", chargedUSD(tx.AmountUSD, tx.FeeAmount))
 				outcome = "ignored: amount or reference mismatch"
 				return
 			}
@@ -767,11 +767,11 @@ func HandlerPayPalCapture(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "transacción no encontrada"})
 			return
 		}
-		if tx.ExternalID != paypalToken || !payPalOrderMatchesTx(order, tx.AmountUSD) {
+		if tx.ExternalID != paypalToken || !payPalOrderMatchesTx(order, chargedUSD(tx.AmountUSD, tx.FeeAmount)) {
 			slog.Warn("PayPal return: la orden no corresponde a la transacción esperada, no se acredita",
 				"txID", txID, "orderID", paypalToken, "txExternalID", tx.ExternalID,
 				"orderAmount", order.AmountValue, "orderCurrency", order.CurrencyCode,
-				"captureStatus", order.CaptureStatus, "expectedUSD", tx.AmountUSD)
+				"captureStatus", order.CaptureStatus, "expectedUSD", chargedUSD(tx.AmountUSD, tx.FeeAmount))
 			c.JSON(http.StatusOK, gin.H{"success": false, "error": "no se pudo verificar el pago, contacta soporte"})
 			return
 		}
