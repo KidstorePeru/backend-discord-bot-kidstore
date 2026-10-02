@@ -915,27 +915,34 @@ func SendManualPaymentRejectedEmail(cfg types.EnvConfig, toEmail string, m db.Ma
 	}
 	es := m.Lang != "en"
 	reason = esc(reason)
-	subject, eyebrow, intro, btnText := "", "", "", ""
-	amountLabel, methodLbl, reasonLabel, kcLabel := "", "", "", ""
+	code := ManualSupportCode(m.ID)
+	subject, eyebrow, intro, support, btnText, retry := "", "", "", "", "", ""
+	amountLabel, methodLbl, reasonLabel, kcLabel, codeLabel := "", "", "", "", ""
 	if es {
 		subject = "KidStorePeru — No pudimos acreditar tu pago"
 		eyebrow = "Comprobante rechazado"
-		intro = "Revisamos el comprobante que enviaste y no pudimos acreditar tus KC. Si ya pagaste, vuelve a subir un comprobante claro desde la página de Recargar o escríbenos y lo revisamos contigo."
-		btnText = "Volver a subir comprobante"
-		amountLabel, methodLbl, reasonLabel, kcLabel = "Monto", "Método", "Motivo", "KC"
+		intro = "Revisamos el comprobante que enviaste y no pudimos acreditar tus KC."
+		support = fmt.Sprintf("<strong>¿Crees que es un error?</strong> Comunícate con soporte por WhatsApp o Discord e indica el código <strong>%s</strong>. Lo revisamos contigo y, si tu pago llegó, acreditamos tus KC.", code)
+		btnText = "Contactar a soporte por WhatsApp"
+		retry = `Si el comprobante no se veía bien, también puedes <a href="https://www.kidstoreperu.net/recharge" style="color:#33396b;font-weight:600;">volver a subirlo desde Recargar</a>.`
+		amountLabel, methodLbl, reasonLabel, kcLabel, codeLabel = "Monto", "Método", "Motivo", "KC", "Código"
 	} else {
 		subject = "KidStorePeru — We couldn't credit your payment"
 		eyebrow = "Payment proof rejected"
-		intro = "We reviewed the payment proof you sent and couldn't credit your KC. If you already paid, upload a clear proof again from the Recharge page or message us and we'll review it with you."
-		btnText = "Upload proof again"
-		amountLabel, methodLbl, reasonLabel, kcLabel = "Amount", "Method", "Reason", "KC"
+		intro = "We reviewed the payment proof you sent and couldn't credit your KC."
+		support = fmt.Sprintf("<strong>Think this is a mistake?</strong> Contact support on WhatsApp or Discord and mention the code <strong>%s</strong>. We'll review it with you and, if your payment arrived, credit your KC.", code)
+		btnText = "Contact support on WhatsApp"
+		retry = `If the proof wasn't clear, you can also <a href="https://www.kidstoreperu.net/recharge" style="color:#33396b;font-weight:600;">upload it again from Recharge</a>.`
+		amountLabel, methodLbl, reasonLabel, kcLabel, codeLabel = "Amount", "Method", "Reason", "KC", "Code"
 	}
 	rows := emailRow(reasonLabel, reason)
 	rows += emailRow(amountLabel, esc(formatMoney(m.Amount, m.Currency)))
 	rows += emailRow(methodLbl, esc(methodLabel(m.Method)))
 	rows += emailRow(kcLabel, emailKCIcon(14)+fmt.Sprintf("%d KC", m.KCAmount))
+	rows += emailRow(codeLabel, code)
 	body := emailEyebrow(eyebrow) + emailCopy(intro) + emailRows(rows) +
-		emailButton(btnText, "https://www.kidstoreperu.net/recharge")
+		emailButton(btnText, manualSupportWhatsApp(m.ID, es)) +
+		emailNotice("", support+"<br/><br/>"+retry)
 	htmlBody := emailShell(subject, intro, fmtDateEs(), body)
 	if err := sendEmail(cfg, toEmail, subject, htmlBody); err != nil {
 		slog.Error("Email: manual payment rejected send error", "to", toEmail, "error", err)

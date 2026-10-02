@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -489,13 +490,16 @@ func formatMoney(amount float64, currency string) string {
 
 // ApproveManualPayment acredita los KC (una sola vez) y avisa al cliente por la
 // campana, por correo y en el canal de recargas de Discord.
-func ApproveManualPayment(database *sql.DB, id uuid.UUID, reviewer string) (db.ManualPaymentRequest, error) {
-	m, rechargeID, err := db.ApproveManualPayment(database, id, reviewer)
+func ApproveManualPayment(database *sql.DB, id uuid.UUID, reviewer string, afterReject bool) (db.ManualPaymentRequest, error) {
+	m, rechargeID, err := db.ApproveManualPayment(database, id, reviewer, afterReject)
 	if err != nil {
 		return m, err
 	}
-	db.AddAuditLog(database, &m.CustomerID, "MANUAL_PAYMENT_APPROVED",
-		fmt.Sprintf("comprobante %s aprobado por %s: +%d KC", id, reviewer, m.KCAmount), "admin")
+	detail := fmt.Sprintf("comprobante %s aprobado por %s: +%d KC", id, reviewer, m.KCAmount)
+	if m.RejectReason != nil && *m.RejectReason != "" {
+		detail += " (tras haberse rechazado: " + *m.RejectReason + ")"
+	}
+	db.AddAuditLog(database, &m.CustomerID, "MANUAL_PAYMENT_APPROVED", detail, "admin")
 	db.AddNotification(database, m.CustomerID, db.NotifKCCredited, map[string]any{"amount_kc": m.KCAmount, "method": m.Method})
 	if customer, err := db.GetCustomerByID(database, m.CustomerID); err == nil {
 		discordbot.NotifyRecharge(customer, m.KCAmount, customer.KCBalance, "Comprobante ("+methodLabel(m.Method)+")")
@@ -533,7 +537,7 @@ func RejectManualPayment(database *sql.DB, id uuid.UUID, reason, reviewer string
 // ManualPaymentDiscordActions — lo que hacen los botones del aviso de Discord.
 func ManualPaymentDiscordActions(database *sql.DB) (approve, reject func(uuid.UUID, string, string) (string, error)) {
 	approve = func(id uuid.UUID, _ string, reviewer string) (string, error) {
-		m, err := ApproveManualPayment(database, id, reviewer)
+		m, err := ApproveManualPayment(database, id, reviewer, false)
 		if err != nil {
 			return "", err
 		}
@@ -547,6 +551,22 @@ func ManualPaymentDiscordActions(database *sql.DB) (approve, reject func(uuid.UU
 		return fmt.Sprintf("❌ Rechazado por %s — %s", reviewer, cleanText(reason, 300)), nil
 	}
 	return approve, reject
+}
+
+// ManualSupportCode es el código corto con el que el cliente y soporte
+// identifican la solicitud (es el mismo que muestra el panel admin).
+func ManualSupportCode(id uuid.UUID) string {
+	return strings.ToUpper(id.String()[:8])
+}
+
+// manualSupportWhatsApp abre WhatsApp con el mensaje ya escrito para que el
+// cliente reclame un rechazo indicando el código de la solicitud.
+func manualSupportWhatsApp(id uuid.UUID, es bool) string {
+	text := fmt.Sprintf("Hola, mi comprobante de pago %s fue rechazado y creo que es un error.", ManualSupportCode(id))
+	if !es {
+		text = fmt.Sprintf("Hi, my payment proof %s was rejected and I think it's a mistake.", ManualSupportCode(id))
+	}
+	return "https://wa.me/51983454837?text=" + strings.ReplaceAll(url.QueryEscape(text), "+", "%20")
 }
 
 // ==================== BORRADO AUTOMÁTICO (1 mes) ====================

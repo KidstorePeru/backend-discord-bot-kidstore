@@ -178,7 +178,11 @@ func OperationNumberUses(db *sql.DB, operation string, exclude uuid.UUID) (int, 
 // ApproveManualPayment acredita los KC y marca la solicitud como aprobada en
 // UNA transacción: si dos personas la aprueban a la vez (panel y Discord),
 // solo una acredita; la otra recibe ErrManualAlreadyReviewed.
-func ApproveManualPayment(db *sql.DB, id uuid.UUID, reviewer string) (ManualPaymentRequest, uuid.UUID, error) {
+//
+// allowRejected permite aprobar una solicitud que se rechazó por error (el
+// cliente habló con soporte); solo el panel admin lo pide explícitamente. Una
+// aprobada nunca se vuelve a acreditar.
+func ApproveManualPayment(db *sql.DB, id uuid.UUID, reviewer string, allowRejected bool) (ManualPaymentRequest, uuid.UUID, error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return ManualPaymentRequest{}, uuid.Nil, err
@@ -188,7 +192,7 @@ func ApproveManualPayment(db *sql.DB, id uuid.UUID, reviewer string) (ManualPaym
 	if err != nil {
 		return m, uuid.Nil, err
 	}
-	if m.Status != "pending" {
+	if m.Status != "pending" && !(allowRejected && m.Status == "rejected") {
 		return m, uuid.Nil, ErrManualAlreadyReviewed
 	}
 	res, err := tx.Exec(`UPDATE customers SET kc_balance = kc_balance + $1, updated_at = NOW() WHERE id = $2 AND is_active = true`,
@@ -204,6 +208,9 @@ func ApproveManualPayment(db *sql.DB, id uuid.UUID, reviewer string) (ManualPaym
 	if m.OperationNumber != "" {
 		note += " · op. " + m.OperationNumber
 	}
+	if m.Status == "rejected" {
+		note += " · aprobado tras rechazo"
+	}
 	if _, err := tx.Exec(`INSERT INTO kc_recharges (id, customer_id, amount_kc, amount_soles, method, note, approved_by, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
 		rechargeID, m.CustomerID, m.KCAmount, m.AmountPEN, m.Method, note, reviewer); err != nil {
@@ -216,7 +223,7 @@ func ApproveManualPayment(db *sql.DB, id uuid.UUID, reviewer string) (ManualPaym
 	if err := tx.Commit(); err != nil {
 		return m, uuid.Nil, err
 	}
-	m.Status, m.RechargeID = "approved", &rechargeID
+	m.Status, m.RechargeID, m.ReviewedBy = "approved", &rechargeID, &reviewer
 	return m, rechargeID, nil
 }
 

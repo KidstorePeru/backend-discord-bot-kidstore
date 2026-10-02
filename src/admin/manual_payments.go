@@ -93,7 +93,12 @@ func HandlerApproveManualPayment(database *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "ID inválido"})
 			return
 		}
-		m, err := store.ApproveManualPayment(database, id, adminReviewer(c, database))
+		// after_reject: el cliente reclamó un rechazo y soporte confirmó el pago.
+		var req struct {
+			AfterReject bool `json:"after_reject"`
+		}
+		_ = c.ShouldBindJSON(&req) // el cuerpo es opcional
+		m, err := store.ApproveManualPayment(database, id, adminReviewer(c, database), req.AfterReject)
 		if err != nil {
 			respondManualError(c, err)
 			return

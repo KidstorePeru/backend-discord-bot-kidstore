@@ -157,3 +157,21 @@ func TestComprobante_CifradoYEnlaceFirmado(t *testing.T) {
 		t.Error("un enlace con otro ID o firma alterada no debe valer")
 	}
 }
+
+func TestSoporteRechazo_CodigoYWhatsApp(t *testing.T) {
+	id := uuid.MustParse("a1b2c3d4-0000-4000-8000-000000000001")
+	if got := ManualSupportCode(id); got != "A1B2C3D4" {
+		t.Errorf("código = %q", got)
+	}
+	es := manualSupportWhatsApp(id, true)
+	if !strings.HasPrefix(es, "https://wa.me/51983454837?text=") || !strings.Contains(es, "A1B2C3D4") {
+		t.Errorf("enlace ES = %q", es)
+	}
+	// Los espacios van como %20 (no '+') para que WhatsApp los muestre bien.
+	if strings.Contains(es, "+") || !strings.Contains(es, "Hola%2C%20mi%20comprobante") {
+		t.Errorf("texto mal codificado: %q", es)
+	}
+	if en := manualSupportWhatsApp(id, false); !strings.Contains(en, "was%20rejected") {
+		t.Errorf("enlace EN = %q", en)
+	}
+}

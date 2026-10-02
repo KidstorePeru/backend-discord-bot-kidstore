@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -169,7 +170,7 @@ func TestPagoManual_FlujoCompleto(t *testing.T) {
 	results := make(chan error, 2)
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); _, err := ApproveManualPayment(conn, first.ID, "test"); results <- err }()
+		go func() { defer wg.Done(); _, err := ApproveManualPayment(conn, first.ID, "test", false); results <- err }()
 	}
 	wg.Wait()
 	close(results)
@@ -208,6 +209,29 @@ func TestPagoManual_FlujoCompleto(t *testing.T) {
 	}
 	if countNotifications(t, custID, db.NotifManualRejected) != 1 || countNotifications(t, custID, db.NotifKCCredited) != 1 {
 		t.Error("el cliente debería tener un aviso de acreditación y otro de rechazo")
+	}
+
+	// Si el rechazo fue un error (el cliente habló con soporte), solo se aprueba
+	// pidiéndolo explícitamente desde el panel, y se acredita una sola vez.
+	if _, err := ApproveManualPayment(conn, second.ID, "test", false); !errors.Is(err, db.ErrManualAlreadyReviewed) {
+		t.Errorf("aprobar un rechazado sin pedirlo: %v", err)
+	}
+	fixed, err := ApproveManualPayment(conn, second.ID, "Panel: soporte", true)
+	if err != nil || fixed.Status != "approved" || fixed.RechargeID == nil {
+		t.Fatalf("aprobar tras rechazo = %+v %v", fixed, err)
+	}
+	if _, err := ApproveManualPayment(conn, second.ID, "test", true); !errors.Is(err, db.ErrManualAlreadyReviewed) {
+		t.Errorf("una aprobada no debe acreditarse otra vez: %v", err)
+	}
+	conn.QueryRow(`SELECT kc_balance FROM customers WHERE id=$1`, custID).Scan(&balance)
+	conn.QueryRow(`SELECT COUNT(*) FROM kc_recharges WHERE customer_id=$1`, custID).Scan(&recharges)
+	if balance != 2500+second.KCAmount || recharges != 2 {
+		t.Errorf("tras aprobar el rechazado: saldo = %d, recargas = %d", balance, recharges)
+	}
+	var note string
+	conn.QueryRow(`SELECT note FROM kc_recharges WHERE id=$1`, *fixed.RechargeID).Scan(&note)
+	if !strings.Contains(note, "aprobado tras rechazo") {
+		t.Errorf("la recarga debería indicar que se aprobó tras un rechazo: %q", note)
 	}
 
 	// A los 30 días se borran las imágenes (el registro queda).
