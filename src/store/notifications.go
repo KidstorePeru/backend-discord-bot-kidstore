@@ -98,7 +98,15 @@ func HandlerGetUnreadNotifications(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 		c.Header("Cache-Control", "no-store")
-		c.JSON(http.StatusOK, gin.H{"success": true, "unread": unread})
+		resp := gin.H{"success": true, "unread": unread}
+		// Con el contador va el saldo y si hay comprobantes en revisión: la web
+		// actualiza los KC apenas se acreditan, sin recargar la página, y consulta
+		// más seguido solo mientras el cliente espera una revisión.
+		if balance, pending, err := db.AccountPulse(database, customerID); err == nil {
+			resp["kc_balance"] = balance
+			resp["pending_manual"] = pending
+		}
+		c.JSON(http.StatusOK, resp)
 	}
 }
 

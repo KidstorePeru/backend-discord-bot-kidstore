@@ -17,10 +17,10 @@ import (
 // Tipos de aviso. El frontend arma el texto de cada uno en el idioma del
 // cliente a partir de Data.
 const (
-	NotifWishlistBack = "wishlist_back" // volvió a la tienda un objeto de la lista de deseos
-	NotifOrderSent    = "order_sent"    // pedido entregado
-	NotifOrderFailed  = "order_failed"  // pedido no entregado (refunded indica si ya se devolvieron los KC)
-	NotifKCCredited   = "kc_credited"   // recarga de KC acreditada
+	NotifWishlistBack   = "wishlist_back"           // volvió a la tienda un objeto de la lista de deseos
+	NotifOrderSent      = "order_sent"              // pedido entregado
+	NotifOrderFailed    = "order_failed"            // pedido no entregado (refunded indica si ya se devolvieron los KC)
+	NotifKCCredited     = "kc_credited"             // recarga de KC acreditada
 	NotifManualRejected = "manual_payment_rejected" // comprobante de pago manual rechazado (con motivo)
 )
 
@@ -82,6 +82,16 @@ func CountUnreadNotifications(db *sql.DB, customerID uuid.UUID) (int, error) {
 	var n int
 	err := db.QueryRow(`SELECT COUNT(*) FROM notifications WHERE customer_id = $1 AND read_at IS NULL`, customerID).Scan(&n)
 	return n, err
+}
+
+// AccountPulse devuelve el saldo actual del cliente y cuántos comprobantes de
+// pago manual tiene en revisión, en una sola consulta liviana: la web la pide
+// junto con el contador de avisos para mostrar los KC apenas se acreditan.
+func AccountPulse(db *sql.DB, customerID uuid.UUID) (balance int, pendingManual int, err error) {
+	err = db.QueryRow(`SELECT c.kc_balance,
+		(SELECT COUNT(*) FROM manual_payment_requests m WHERE m.customer_id = c.id AND m.status = 'pending')
+		FROM customers c WHERE c.id = $1`, customerID).Scan(&balance, &pendingManual)
+	return balance, pendingManual, err
 }
 
 // MarkNotificationsRead marca como leídos todos los avisos del cliente.

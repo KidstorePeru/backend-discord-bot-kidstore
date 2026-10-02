@@ -90,6 +90,26 @@ func uploadProof(t *testing.T, conn interface{}, customerID uuid.UUID, fields ma
 	return rec
 }
 
+// accountPulse consulta lo mismo que la campana de la web cada pocos segundos.
+func accountPulse(t *testing.T, customerID uuid.UUID) (unread, balance, pending int) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("customer_id", customerID.String()); c.Next() })
+	r.GET("/store/notifications/unread", HandlerGetUnreadNotifications(shopTestDB))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/store/notifications/unread", nil))
+	var body struct {
+		Unread        int  `json:"unread"`
+		KCBalance     *int `json:"kc_balance"`
+		PendingManual *int `json:"pending_manual"`
+	}
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &body) != nil || body.KCBalance == nil || body.PendingManual == nil {
+		t.Fatalf("pulso de la cuenta: %d %s", rec.Code, rec.Body.String())
+	}
+	return body.Unread, *body.KCBalance, *body.PendingManual
+}
+
 func TestPagoManual_FlujoCompleto(t *testing.T) {
 	conn := setupShopTestDB(t)
 	mem, alerts := setupManualPayments(t)
@@ -165,6 +185,11 @@ func TestPagoManual_FlujoCompleto(t *testing.T) {
 		t.Errorf("archivos guardados = %d, se esperaban 2", mem.count())
 	}
 
+	// La web ve los dos comprobantes en revisión (y consulta más seguido).
+	if _, bal, pending := accountPulse(t, custID); bal != 100 || pending != 2 {
+		t.Errorf("antes de aprobar: saldo = %d, en revisión = %d", bal, pending)
+	}
+
 	// Aprobar dos veces a la vez: se acredita UNA sola vez.
 	var wg sync.WaitGroup
 	results := make(chan error, 2)
@@ -193,6 +218,10 @@ func TestPagoManual_FlujoCompleto(t *testing.T) {
 	}
 	if _, err := RejectManualPayment(conn, first.ID, "x", "test"); !errors.Is(err, db.ErrManualAlreadyReviewed) {
 		t.Errorf("rechazar una aprobada: %v", err)
+	}
+	// Apenas se aprueba, la siguiente consulta de la web trae el saldo nuevo.
+	if unread, bal, pending := accountPulse(t, custID); bal != 2500 || pending != 1 || unread != 1 {
+		t.Errorf("después de aprobar: saldo = %d, en revisión = %d, avisos = %d", bal, pending, unread)
 	}
 
 	// Rechazar la otra con motivo: el cliente recibe el aviso.
