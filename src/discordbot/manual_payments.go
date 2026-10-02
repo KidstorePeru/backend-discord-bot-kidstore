@@ -1,7 +1,9 @@
 package discordbot
 
-// Aviso al admin de un comprobante de pago manual nuevo, con botones para
-// verlo, aprobarlo o rechazarlo directamente desde Discord.
+// Aviso al equipo de un comprobante de pago manual nuevo, con botones para
+// verlo, aprobarlo o rechazarlo directamente desde Discord. Cada admin recibe
+// su copia; cuando alguien lo revisa (en Discord o en el panel) se actualizan
+// todas, para que nadie lo vuelva a revisar.
 
 import (
 	"errors"
@@ -103,22 +105,86 @@ func manualPaymentButtons(a ManualPaymentAlert) []discordgo.MessageComponent {
 	}
 }
 
-// AlertManualPayment manda el aviso por mensaje privado al admin.
+// Copias enviadas de cada aviso, para actualizarlas todas al revisarlo. Vive
+// en memoria: tras un reinicio, un botón viejo responde "ya fue revisado".
+type manualCopy struct{ channelID, messageID string }
+
+var (
+	manualCopiesMu sync.Mutex
+	manualAlerts   = map[uuid.UUID]ManualPaymentAlert{}
+	manualCopies   = map[uuid.UUID][]manualCopy{}
+)
+
+// AlertManualPayment manda el aviso por mensaje privado a cada admin.
 func AlertManualPayment(a ManualPaymentAlert) {
-	if !Enabled() || session == nil || cfg.DiscordAdminUserID == "" {
+	if !Enabled() || session == nil {
 		return
 	}
-	dm, err := session.UserChannelCreate(cfg.DiscordAdminUserID)
-	if err != nil {
-		slog.Warn("Discord: no se pudo abrir el DM del admin para un comprobante", "error", err)
+	for _, adminID := range adminDiscordIDs() {
+		dm, err := session.UserChannelCreate(adminID)
+		if err != nil {
+			slog.Warn("Discord: no se pudo abrir el DM de un admin para un comprobante", "user", adminID, "error", err)
+			continue
+		}
+		msg, err := session.ChannelMessageSendComplex(dm.ID, &discordgo.MessageSend{
+			Embeds:     []*discordgo.MessageEmbed{brand(manualPaymentEmbed(a))},
+			Components: manualPaymentButtons(a),
+		})
+		if err != nil {
+			slog.Warn("Discord: no se pudo enviar el aviso de comprobante", "user", adminID, "error", err)
+			continue
+		}
+		manualCopiesMu.Lock()
+		manualAlerts[a.ID] = a
+		manualCopies[a.ID] = append(manualCopies[a.ID], manualCopy{channelID: dm.ID, messageID: msg.ID})
+		manualCopiesMu.Unlock()
+	}
+}
+
+// reviewedManualEmbed: el aviso original con el resultado y sin color de pendiente.
+func reviewedManualEmbed(base *discordgo.MessageEmbed, result string) *discordgo.MessageEmbed {
+	e := *base
+	e.Fields = append(append([]*discordgo.MessageEmbedField{}, e.Fields...), &discordgo.MessageEmbedField{Name: "Resultado", Value: result})
+	switch {
+	case strings.HasPrefix(result, "✅"):
+		e.Color = colorSuccess
+	case strings.HasPrefix(result, "❌"):
+		e.Color = colorAlert
+	default:
+		e.Color = colorWarnSoft
+	}
+	return &e
+}
+
+// viewOnlyButtons: solo queda "Ver comprobante" (sin aprobar ni rechazar).
+func viewOnlyButtons(a ManualPaymentAlert) []discordgo.MessageComponent {
+	return []discordgo.MessageComponent{
+		discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+			discordgo.Button{Label: "Ver comprobante", Style: discordgo.LinkButton, URL: a.ViewURL},
+		}},
+	}
+}
+
+// ManualReviewDone actualiza todas las copias del aviso con el resultado. La
+// tienda la llama al aprobar o rechazar, se haga desde Discord o desde el panel.
+func ManualReviewDone(id uuid.UUID, result string) {
+	manualCopiesMu.Lock()
+	a, ok := manualAlerts[id]
+	copies := manualCopies[id]
+	delete(manualAlerts, id)
+	delete(manualCopies, id)
+	manualCopiesMu.Unlock()
+	if !ok || session == nil {
 		return
 	}
-	_, err = session.ChannelMessageSendComplex(dm.ID, &discordgo.MessageSend{
-		Embeds:     []*discordgo.MessageEmbed{brand(manualPaymentEmbed(a))},
-		Components: manualPaymentButtons(a),
-	})
-	if err != nil {
-		slog.Warn("Discord: no se pudo enviar el aviso de comprobante", "error", err)
+	embeds := []*discordgo.MessageEmbed{reviewedManualEmbed(brand(manualPaymentEmbed(a)), result)}
+	components := viewOnlyButtons(a)
+	for _, c := range copies {
+		if _, err := session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+			Channel: c.channelID, ID: c.messageID, Embeds: &embeds, Components: &components,
+		}); err != nil {
+			slog.Warn("Discord: no se pudo actualizar una copia del aviso de comprobante", "error", err)
+		}
 	}
 }
 
@@ -151,7 +217,7 @@ func handleManualPaymentInteraction(s *discordgo.Session, i *discordgo.Interacti
 	}
 	user := interactionUser(i)
 	if user == nil || !isAdmin(user.ID) {
-		respondEphemeral(s, i, "⛔ Solo el administrador puede revisar comprobantes.")
+		respondEphemeral(s, i, "⛔ Solo el equipo de administración puede revisar comprobantes.")
 		return true
 	}
 	manualActionsMu.RLock()
@@ -202,16 +268,17 @@ func handleManualPaymentInteraction(s *discordgo.Session, i *discordgo.Interacti
 	return true
 }
 
-// finishManualReview actualiza el aviso original: sin botones de acción y con
-// el resultado, para que no se vuelva a revisar por error.
+// finishManualReview actualiza el aviso pulsado: sin botones de acción y con
+// el resultado, para que no se vuelva a revisar por error (las copias de los
+// demás admins las actualiza ManualReviewDone).
 func finishManualReview(s *discordgo.Session, i *discordgo.InteractionCreate, result string, err error) {
 	if err != nil {
-		msg := "⚠️ No se pudo completar: " + err.Error()
-		if errors.Is(err, ErrManualReviewed) || strings.Contains(err.Error(), "ya fue revisada") {
-			msg = "ℹ️ Este comprobante ya fue revisado (quizás desde el panel)."
+		if !errors.Is(err, ErrManualReviewed) && !strings.Contains(err.Error(), "ya fue revisada") {
+			respondEphemeral(s, i, "⚠️ No se pudo completar: "+err.Error())
+			return
 		}
-		respondEphemeral(s, i, msg)
-		return
+		// Ya la revisó otra persona del equipo (o el panel): se quitan los botones.
+		result = "ℹ️ Ya fue revisado por otra persona del equipo o desde el panel."
 	}
 	var embeds []*discordgo.MessageEmbed
 	var keep []discordgo.MessageComponent
@@ -233,14 +300,7 @@ func finishManualReview(s *discordgo.Session, i *discordgo.InteractionCreate, re
 		}
 	}
 	if len(embeds) > 0 {
-		e := *embeds[0]
-		e.Fields = append(append([]*discordgo.MessageEmbedField{}, e.Fields...), &discordgo.MessageEmbedField{Name: "Resultado", Value: result})
-		if strings.HasPrefix(result, "✅") {
-			e.Color = colorSuccess
-		} else {
-			e.Color = colorAlert
-		}
-		embeds = []*discordgo.MessageEmbed{&e}
+		embeds = []*discordgo.MessageEmbed{reviewedManualEmbed(embeds[0], result)}
 	}
 	if keep == nil {
 		keep = []discordgo.MessageComponent{}

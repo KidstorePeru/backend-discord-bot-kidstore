@@ -14,7 +14,8 @@ import (
 // ==================== ALERTAS OPERATIVAS AL ADMIN ====================
 //
 // A diferencia de las notificaciones normales (bienvenida, compra, recarga),
-// estas van por DM directo a DISCORD_ADMIN_USER_ID — son avisos de "algo
+// estas van por DM directo al equipo (el dueño, DISCORD_ADMIN_USER_ID, y los
+// admins del panel con Discord vinculado, ver team.go) — son avisos de "algo
 // necesita tu atención" (un bot se cayó, se quedó sin fondos, o ya no hay
 // ninguno disponible para procesar pedidos). Antes de esto, la única forma
 // de enterarse era revisar el panel admin manualmente.
@@ -55,15 +56,14 @@ func clearAlert(key string) {
 }
 
 func sendAdminAlert(title, description string, color int) {
-	if !Enabled() || session == nil || cfg.DiscordAdminUserID == "" {
+	if !Enabled() || session == nil {
 		return
 	}
-	embed := &discordgo.MessageEmbed{
+	sendToAdmins(&discordgo.MessageEmbed{
 		Title:       title,
 		Description: description,
 		Color:       color,
-	}
-	sendDM(cfg.DiscordAdminUserID, embed)
+	})
 }
 
 // AlertBotDeactivated se llama cuando una cuenta bot se marca inactiva (el

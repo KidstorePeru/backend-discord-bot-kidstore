@@ -500,6 +500,7 @@ func ApproveManualPayment(database *sql.DB, id uuid.UUID, reviewer string, after
 		detail += " (tras haberse rechazado: " + *m.RejectReason + ")"
 	}
 	db.AddAuditLog(database, &m.CustomerID, "MANUAL_PAYMENT_APPROVED", detail, "admin")
+	go discordbot.ManualReviewDone(id, approvedSummary(reviewer, m.KCAmount)) // copias del aviso en Discord
 	db.AddNotification(database, m.CustomerID, db.NotifKCCredited, map[string]any{"amount_kc": m.KCAmount, "method": m.Method})
 	if customer, err := db.GetCustomerByID(database, m.CustomerID); err == nil {
 		discordbot.NotifyRecharge(customer, m.KCAmount, customer.KCBalance, "Comprobante ("+methodLabel(m.Method)+")")
@@ -524,6 +525,7 @@ func RejectManualPayment(database *sql.DB, id uuid.UUID, reason, reviewer string
 	}
 	db.AddAuditLog(database, &m.CustomerID, "MANUAL_PAYMENT_REJECTED",
 		fmt.Sprintf("comprobante %s rechazado por %s: %s", id, reviewer, reason), "admin")
+	go discordbot.ManualReviewDone(id, rejectedSummary(reviewer, reason))
 	db.AddNotification(database, m.CustomerID, db.NotifManualRejected, map[string]any{
 		"amount_kc": m.KCAmount, "method": m.Method, "reason": reason,
 		"amount": formatMoney(m.Amount, m.Currency),
@@ -534,6 +536,15 @@ func RejectManualPayment(database *sql.DB, id uuid.UUID, reason, reviewer string
 	return m, nil
 }
 
+// Texto del resultado en el aviso de Discord (igual en todas sus copias).
+func approvedSummary(reviewer string, kc int) string {
+	return fmt.Sprintf("✅ Aprobado por %s — +%d KC acreditados", reviewer, kc)
+}
+
+func rejectedSummary(reviewer, reason string) string {
+	return fmt.Sprintf("❌ Rechazado por %s — %s", reviewer, reason)
+}
+
 // ManualPaymentDiscordActions — lo que hacen los botones del aviso de Discord.
 func ManualPaymentDiscordActions(database *sql.DB) (approve, reject func(uuid.UUID, string, string) (string, error)) {
 	approve = func(id uuid.UUID, _ string, reviewer string) (string, error) {
@@ -541,14 +552,18 @@ func ManualPaymentDiscordActions(database *sql.DB) (approve, reject func(uuid.UU
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("✅ Aprobado por %s — +%d KC acreditados", reviewer, m.KCAmount), nil
+		return approvedSummary(reviewer, m.KCAmount), nil
 	}
 	reject = func(id uuid.UUID, reason, reviewer string) (string, error) {
-		_, err := RejectManualPayment(database, id, reason, reviewer)
+		m, err := RejectManualPayment(database, id, reason, reviewer)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("❌ Rechazado por %s — %s", reviewer, cleanText(reason, 300)), nil
+		saved := "" // el motivo tal como quedó guardado (limpio, o el de por defecto)
+		if m.RejectReason != nil {
+			saved = *m.RejectReason
+		}
+		return rejectedSummary(reviewer, saved), nil
 	}
 	return approve, reject
 }

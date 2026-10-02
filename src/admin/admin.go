@@ -308,6 +308,7 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 		// así era fácil crear en silencio un segundo acceso permanente que
 		// sobrevive aunque se rote la clave filtrada. Ahora queda su propia
 		// entrada de auditoría, inconfundible.
+		resp := gin.H{"success": true, "message": "cliente actualizado correctamente"}
 		if req.IsAdmin != nil && *req.IsAdmin != customer.IsAdmin {
 			if err := db.SetCustomerAdmin(database, id, *req.IsAdmin); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "error actualizando rol"})
@@ -321,9 +322,18 @@ func HandlerUpdateCustomer(database *sql.DB) gin.HandlerFunc {
 			}
 			db.AddAuditLog(database, &id, action,
 				fmt.Sprintf("%s %s el rol de administrador a %s", actor, verb, customer.EpicUsername), c.ClientIP())
+			// Con Discord vinculado pasa a recibir los avisos del bot y a poder
+			// aprobar comprobantes desde ahí (ver discordbot/team.go).
+			if *req.IsAdmin {
+				linked := customer.DiscordID != nil && *customer.DiscordID != ""
+				resp["discord_linked"] = linked
+				if linked {
+					resp["discord_welcome_sent"] = discordbot.NotifyNewAdmin(*customer.DiscordID, customer.EpicUsername)
+				}
+			}
 		}
 
-		c.JSON(http.StatusOK, gin.H{"success": true, "message": "cliente actualizado correctamente"})
+		c.JSON(http.StatusOK, resp)
 	}
 }
 

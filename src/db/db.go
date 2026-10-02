@@ -3101,6 +3101,36 @@ func SetCustomerAdmin(db *sql.DB, customerID uuid.UUID, isAdmin bool) error {
 	return err
 }
 
+// AdminDiscordIDs devuelve el Discord vinculado de las cuentas admin activas:
+// el equipo que, además del dueño, recibe los avisos del bot y puede aprobar
+// comprobantes o usar /kc desde Discord.
+func AdminDiscordIDs(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`SELECT discord_id FROM customers
+		WHERE is_admin = true AND is_active = true AND discord_id IS NOT NULL AND discord_id <> ''
+		ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// IsAdminDiscordID: ¿ese usuario de Discord está vinculado a una cuenta admin activa?
+func IsAdminDiscordID(db *sql.DB, discordID string) (bool, error) {
+	var ok bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM customers
+		WHERE discord_id = $1 AND is_admin = true AND is_active = true)`, discordID).Scan(&ok)
+	return ok, err
+}
+
 // ==================== 2FA (TOTP) ====================
 
 // SetPendingTOTPSecret guarda un secreto TOTP recién generado, todavía sin

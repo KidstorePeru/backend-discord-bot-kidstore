@@ -10,13 +10,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// isAdmin solo autoriza al Discord ID configurado como administrador — se
-// revisa aquí además de los permisos de Discord (DefaultMemberPermissions)
-// por si el rol de administrador del servidor cambia o se asigna mal.
-func isAdmin(userID string) bool {
-	return cfg.DiscordAdminUserID != "" && userID == cfg.DiscordAdminUserID
-}
-
 func adminPermission() *int64 {
 	perm := int64(discordgo.PermissionAdministrator)
 	return &perm
