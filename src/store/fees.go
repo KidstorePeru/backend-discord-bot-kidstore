@@ -65,12 +65,12 @@ const paymentFeesKey = "payment_fees"
 
 // Tarifas públicas: Mercado Pago Perú con dinero disponible al instante
 // (3.49% + S/1 + IGV; 3.99% + S/1 por encima de S/25,000 cobrados en el mes)
-// y PayPal Perú para cobros del extranjero (5.4% + 1.5% internacional +
-// US$0.30). El admin las ajusta en el panel con las de su cuenta.
+// y PayPal Perú (5.4% + US$0.30, igual para cobros nacionales e
+// internacionales). El admin las ajusta en el panel con las de su cuenta.
 // NOWPayments: su comisión ya la paga el cliente (0 = nada extra).
 var defaultPaymentFees = PaymentFees{
 	MercadoPago: GatewayFee{Percent: 3.49, Fixed: 1.00, Tax: 18, VolumeThreshold: 25000, VolumePercent: 3.99},
-	PayPal:      GatewayFee{Percent: 6.9, Fixed: 0.30},
+	PayPal:      GatewayFee{Percent: 5.4, Fixed: 0.30},
 	Bizum:       RemittanceFee{Percent: 1.5},
 }
 
